@@ -56,7 +56,6 @@ def get_pulsar_timespan(psr):
 
 
 # Matrix utilities--------------------------------------------------------------
-
 def stabilize_covariance_matrix(C, n=1e-6):
     """Stabilize a covariance matrix by adding jitter.
 

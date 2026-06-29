@@ -8,6 +8,90 @@ import jax.random as jrandom
 
 
 # Model utilities---------------------------------------------------------------
+def build_basis(signal_helper):
+    """
+    Build the combined Fourier basis matrix and a dict mapping each signal
+    name to its column slice in the final F-matrix (and therefore in FNF).
+
+    Parameters
+    ----------
+    signal_helper : dict with keys
+        'shared_basis' : {
+            'signal_list': [...] or None,
+            'index_of_signal_used_for_basis': int
+        }  or None
+        'separate' : {
+            'signal_list': [...] or None
+        }  or None
+        'order' : comma-separated signal names, e.g. 'dm,unc,cor'
+
+    Returns
+    -------
+    Fmat : jnp.ndarray, shape (n_toas, total_basis_cols)
+    signal_indices : dict[str, slice]
+        Maps each signal name to its column slice in Fmat / FNF.
+    """
+    if not signal_helper['order'].endswith('cor'):
+        raise ValueError(
+            f"`cor` MUST be the last signal."
+        )
+
+    shared_cfg   = signal_helper.get('shared_basis') or {}
+    separate_cfg = signal_helper.get('separate') or {}
+    order = [s.strip() for s in signal_helper['order'].split(',')]
+
+    # --- Shared group ---
+    shared_signals = shared_cfg.get('signal_list') or []
+    shared_idx     = shared_cfg.get('index_of_signal_used_for_basis', 0)
+    shared_names   = {sig.name for sig in shared_signals}
+
+    shared_Fmat = (
+        jnp.concat(shared_signals[shared_idx].get_basis())
+        if shared_signals else None
+    )
+
+    # --- Separate signals ---
+    separate_signals = separate_cfg.get('signal_list') or []
+    separate_map = {
+        sig.name: jnp.concat(sig.get_basis())
+        for sig in separate_signals
+    }
+
+    # --- Validate order covers exactly the declared signals ---
+    declared = shared_names | set(separate_map)
+    if set(order) != declared:
+        raise ValueError(
+            f"'order' signals {set(order)} do not match declared signals {declared}"
+        )
+
+    # --- Assemble columns in user-specified order ---
+    Fmats          = []
+    signal_indices = {}
+    col            = 0
+
+    shared_block_placed = False
+    shared_start        = None
+    shared_signal_ct = 0
+    for name in order:
+        if name in shared_names:
+            if not shared_block_placed:
+                n_cols = shared_Fmat.shape[1]
+                Fmats.append(shared_Fmat)
+                shared_start        = col
+                shared_block_placed = True
+                col += n_cols
+            signal_indices[name] = slice(shared_start, shared_start + shared_signals[shared_signal_ct].nmodes)
+            shared_signal_ct+=1
+        else:
+            F      = separate_map[name]
+            n_cols = F.shape[1]
+            Fmats.append(F)
+            signal_indices[name] = slice(col, col + n_cols)
+            col += n_cols
+
+    Fmat = jnp.concat(Fmats, axis=1)
+
+    return Fmat, signal_indices
 
 def get_harmonic_frequencies(nfreqs, tspan):
     """Get the lowest `nfreqs` harmonic frequencies from 1/`tspan` to nfreqs/`tspan`.

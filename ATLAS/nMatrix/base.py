@@ -834,6 +834,7 @@ class WhiteCov:
         diag_white_cov : bool
             do you want simple no backend diagonal white noise?
         """
+        self.data = data
         self.npulsars = len(psrs)
 
         self.cov_matrices = []
@@ -854,7 +855,8 @@ class WhiteCov:
                 self.cov_matrices.append(DiagSinglePulsarWhiteCov(psr, 
                                                             marg = marg
                                                             ))
-        
+        self.data.add_white_noise_cov(self.cov_matrices)
+
         self.ntoas_per_psr = tuple(len(psr.toas) for psr in psrs)
         self.total_ntoas = sum(self.ntoas_per_psr)
         # Precompute static slice boundaries for each pulsar in the global array.

@@ -1,28 +1,21 @@
 
-from Atlas.utils import jit, jit_method
-from Atlas.signals import signals_utils as sutils
-from Atlas.signals import orf_functions as orf_funcs
-from Atlas.signals.base import Signal_Base
-
-from functools import cached_property
+from ATLAS.utils import jit_method
+from ATLAS.signals import signals_utils as sutils
+from ATLAS.signals.base import Signal_Base
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 import jax.random as jrandom
-from jax import vmap
 
-class Uncorrelated(Signal_Base):
-    """A signal class for a pulsar-independent free spectrum red noise (IRN) signal.
+from functools import partial
 
-    This signal models the intrinsic red noise as a pulsar-independent signal
-    in each pulsar. The power spectrum is modeled as a free spectrum with nfreqs 
-    frequency bins. The parameters are given as halflog10_rho, which is defined as
-    - <a^T a> = rho^2 -> halflog10_rho = 0.5 * log10(<a^T a>)
-    This means that the units are log(seconds).
+class Red(Signal_Base):
+    """A signal class for a factorized likelihood (not prior).
 
     The frequencies are the first `nfreqs` harmonics of 1/Tspan. Tspan could either
-    be the PTA timespan or the individual pulsar timespans.
+    be the PTA timespan or the individual pulsar timespans. Supplying `user_freqs`
+    overwrites this.
 
     Attributes
     ----------
@@ -65,12 +58,15 @@ class Uncorrelated(Signal_Base):
     _diag_idx : array
         An array of diagonal indices for the Sigma matrix, used for efficient updates.
     """
-    def __init__(self, name='unc', 
-                nfreqs=10, 
-                halflog10_rho_range=(-9,-2), 
-                use_pulsar_tspan=False,
-                posterior_draw_ndraws = 1,
-                data=None):
+    def __init__(self,
+                 name,
+                 data, 
+                 nfreqs=10, 
+                 halflog10_rho_range=(-9,-2), 
+                 use_pulsar_tspan=False,
+                 posterior_draw_ndraws = 1,
+                 user_freqs = jnp.array([False]),
+                ):
         """The constructor for the IRN_Freespectrum signal class.
 
         This signal models the intrinsic red noise as a pulsar-independent signal 
@@ -88,8 +84,10 @@ class Uncorrelated(Signal_Base):
 
         Parameters
         ----------
-        name : str, optional
-            The name of the signal, by default 'IRN_Freespectrum'.
+        name : str
+            The name of the signal.
+        data : Atlas.data.Data.PTA_Data
+            Atlas data object.
         nfreqs : int, optional
             The number of frequency bins in the free spectrum, by default 10.
         halflog10_rho_range : tuple, optional
@@ -97,100 +95,61 @@ class Uncorrelated(Signal_Base):
         use_pulsar_tspan : bool, optional
             Whether to use individual pulsar timespans for frequency calculation, 
             or the PTA timespan, by default False.
-        sampling_method : str, optional
-            The sampling method to use for the signal. Should be one of the allowed methods
-            in SAMPLING_METHODS from Atlas.samplers.CaneToadRacing.
-            Default = 'posterior_draws'
-        reparam : bool, optional
-            Whether to use the reparameterized version of the signal, which can improve sampling efficiency.
-        data : Atlas.data.Data.PTA_Data, optional
-            The PTA data, by default None
+        user_freqs: arr, optional
+            Frequency bins provided by user to use instead of i/T harmonics.
         """
         self.name = name
+        self.data = data
         self.ndraws = posterior_draw_ndraws # Number of posterior draws to run in parallel when sampling_method is 'posterior_draws'
 
-        par = []
-        for p in data.psr_names:
-            par.extend([f'{p}_{self.name}_halflog10_rho_F{i}' for i in range(nfreqs)])
-        self.n_parameters = len(par) # Number of parameters
-        par_range = jnp.ones((self.n_parameters, 2)) * jnp.array(halflog10_rho_range)[None,:]
-        self.parameter_range = par_range # Range for each parameter, shape (n_parameters, 2)
-
         # Helper attributes needed for the rest of the class--------------------
-        self.psr_toas = data.toas # Reference to a list of TOA arrays for each pulsar [npsr, npsr_toas]
+        self.psr_toas = self.data.toas # Reference to a list of TOA arrays for each pulsar [npsr, npsr_toas]
         self.nfreqs = nfreqs
         self.nmodes = 2*nfreqs # Sine and cosine modes per frequency
-        self.npsrs = data.npsrs 
+        self.npsrs = self.data.npsrs 
 
         self.use_pulsar_tspan = use_pulsar_tspan # Use pulsar tspan, or PTA tspan?
-        if use_pulsar_tspan:
-            self.tspans = data.psr_tspans # Array of individual pulsar timespans [npsrs]
-            # Frequencies for this signal (Different frequencies for each pulsar)
-            self.freqs = []
-            for i in range(self.npsrs):
-                f = sutils.get_harmonic_frequencies(self.nfreqs, self.tspans[i]) # [nfreqs]
-                self.freqs.append(f)
-            self.freqs = jnp.array(self.freqs) # [npsrs, nfreqs]
-        else:
-            self.tspans = data.pta_tspan
-            # Frequencies for this signal (Same frequencies for all pulsars)
-            self.freqs = sutils.get_harmonic_frequencies(self.nfreqs, self.tspans) # [nfreqs]  
+        if user_freqs.any():
+            self.freqs = user_freqs
+            self.nfreqs = len(self.freqs)
+            self.nmodes = 2 * self.nfreqs
+        else:    
+            if use_pulsar_tspan:
+                self.tspans = data.psr_tspans # Array of individual pulsar timespans [npsrs]
+                # Frequencies for this signal (Different frequencies for each pulsar)
+                self.freqs = []
+                for i in range(self.npsrs):
+                    f = sutils.get_harmonic_frequencies(self.nfreqs, self.tspans[i]) # [nfreqs]
+                    self.freqs.append(f)
+                self.freqs = jnp.array(self.freqs) # [npsrs, nfreqs]
+            else:
+                self.tspans = data.pta_tspan
+                # Frequencies for this signal (Same frequencies for all pulsars)
+                self.freqs = sutils.get_harmonic_frequencies(self.nfreqs, self.tspans) # [nfreqs]  
+
+        # length of parameters
+        self.n_parameters = len(self.freqs) # Number of parameters
+        par_range = jnp.ones((self.n_parameters, 2)) * jnp.array(halflog10_rho_range)[None,:]
+        self.parameter_range = par_range # Range for each parameter, shape (n_parameters, 2)
 
         # Uniform prior volume
         diff = par_range[:,1] - par_range[:,0] # high - low
         self.log_prior_volume = jnp.sum( jnp.log(diff) ) 
-
+        
+        # extract data analysis settings from data object
         self.fixed_wn = data.fixed_wn
         self.fixed_res = data.fixed_res
         self.linear_timing = data.linear_timing
-        self.Mmat = data.Mmat
 
-        if self.fixed_wn and not self.fixed_res: # TODO: Fix the multi-get-helper thing
-            @jax.jit
-            def get_helpers(reff):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = data.fixed_white_noise_params,   # closed over as constant
-                    reff = reff,
-                )
-
-        elif not self.fixed_wn and not self.fixed_res:
-            @jax.jit
-            def get_helpers(reff, white_noise_params):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = white_noise_params,   # closed over as constant
-                    reff = reff,
-                )
-
-        elif not self.fixed_wn and self.fixed_res:
-            @jax.jit
-            def get_helpers(white_noise_params):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = white_noise_params,   # closed over as constant
-                    reff = jnp.concat(data.raw_residuals)[:, None],
-                )
-
-        elif self.fixed_wn and self.fixed_res:
-            @jax.jit
-            def get_helpers():
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = data.white_noise_params,   # closed over as constant
-                    reff = jnp.concat(data.raw_residuals)[:, None],
-                )
-        self.get_helpers = get_helpers
+        # function to get helper objects for likelihood
+        self.get_helpers = self._get_helpers()
 
         # Hidden attributes if needed-------------------------------------------
         # PSD range in linear space for computations.
         self._psd_range = 10**(2*jnp.array(halflog10_rho_range, dtype=float)) 
         self._diag_idx = jnp.arange(self.nmodes)
         
-        self.get_Fmat_concat = jnp.concat(self.get_basis()) # [n_toas, nmodes]
-
-    def add_model(self, model): #TODO: Change to add_parameterization()
-        self.model = model
+        self.get_red_basis = jnp.concat(self.get_basis()) # [n_toas, nmodes]
 
     # Helper methods------------------------------------------------------------
     @jit_method
@@ -216,6 +175,45 @@ class Uncorrelated(Signal_Base):
             T = [sutils.get_fourier_design_matrix(t, self.freqs, microseconds=False)
                  for t in self.psr_toas] # List of [npsr_toas, nmodes]
         return T # [npsr, npsr_toas, nmodes]
+    
+    @jit_method
+    def _get_helpers(self):
+        """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
+        needed for likelihood evaluation. Data analysis settings are extracted from the
+        data object.
+
+        Returns
+        -------
+        new_func: callable
+            Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
+        """
+
+        if self.fixed_wn and not self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               white_noise_params = self.data.fixed_white_noise_params,
+                               )
+            return jit_method(new_func)
+
+        elif not self.fixed_wn and not self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               )
+            return jit_method(new_func)
+
+        elif not self.fixed_wn and self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               reff = jnp.concat(self.data.raw_residuals)[:, None],
+                               )
+            return jit_method(new_func)
+
+        elif self.fixed_wn and self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               white_noise_params = self.data.fixed_white_noise_params,
+                               reff = jnp.concat(self.data.raw_residuals)[:, None],)
+            return jit_method(new_func)
 
     @jit_method
     def get_phi_diag(self, params):
@@ -304,7 +302,7 @@ class Uncorrelated(Signal_Base):
         """Get a realization of all pulsar fourier coefficients. [npsr, nmodes]
 
         This helper method generates a random realization of the pulsar fourier 
-        coefficients given the helpers (TNT and TNr), the parameters (halflog10_rhos),
+        coefficients given the helpers (TNT, TNr, rNr, and logdet_N), the parameters (halflog10_rhos),
         and a random key. The realization is drawn from a multivariate normal
         distribution such that:
         - covariance -> Sigma = TNT + phi^{-1} 
@@ -313,7 +311,7 @@ class Uncorrelated(Signal_Base):
         Parameters
         ----------
         helpers : tuple
-            The helpers (TNT and TNr). [npsr, nmodes, nmodes], [npsr, nmodes]
+            The helpers (TNT, TNr, rNr, and logdet_N). [npsr, nmodes, nmodes], [npsr, nmodes]
         params : array
             The input parameters for the signal [npsr*nfreqs]
         key : jax.random.PRNGKey
@@ -324,7 +322,7 @@ class Uncorrelated(Signal_Base):
         array
             A realization of the fourier coefficients for each pulsar. [npsr, nmodes]
         """
-        TNT, TNr = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode]
+        TNT, TNr, rNr, logdet_N = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode]
         phi_diag = self.get_phi_diag(params) # Get phi diagonal from params [npsr, nfreqs]
         
         Sigma = self.get_sigma(TNT, phi_diag) # [npsr, nmode, nmode]
@@ -343,8 +341,8 @@ class Uncorrelated(Signal_Base):
     def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
-        This method computes the helper objects TNT and TNr for each pulsar, which are
-        needed for the likelihood evaluation and posterior drawing. The TNT and TNr
+        This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
+        needed for the likelihood evaluation and posterior drawing. The TNT, TNr, rNr, and logdet_N
         are computed as:
         - TNT = T^T N^{-1} T
         - TNr = T^T N^{-1} r
@@ -361,99 +359,14 @@ class Uncorrelated(Signal_Base):
         Returns
         -------
         tuple
-            The helper objects (TNT and TNr) for each pulsar. 
+            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
         """
-        if not self.linear_timing:
-            return N_list.get_red_helpers(red_noise_basis = self.get_Fmat_concat, 
-                                        residuals = reff, 
-                                        white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
-        else:
-            return N_list.get_red_and_timing_helpers(red_noise_basis = self.get_Fmat_concat,
-                                                    timing_model_basis = self.Mmat, 
-                                                    residuals = reff, 
-                                                    white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN], [MNM, MNr]
+        return N_list.get_red_helpers(red_noise_basis = self.get_red_basis, 
+                                      residuals = reff, 
+                                      white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
 
     # Required methods----------------------------------------------------------
-    @jit_method
-    def get_delta_t(self, helpers, params, key):
-        """Get the residual contributions from the IRN signal. [npsr, npsr_toas]
-
-        This method computes the contributions to the residuals from this IRN signal
-        given the parameters. Since the fourier coefficients are marginalized over,
-        we need to draw a random realization of the coefficients and then project them
-        into the residual space using the Fourier design matrix. 
-
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        params : array
-            The input parameters, which are halflog10_rhos for each frequency. [nfreqs]
-        key : jax.random.PRNGKey
-            The random key for generating the realization.
-
-        Returns
-        -------
-        List of arrays
-            The contributions to the residuals from the IRN signal for each pulsar. [npsr, npsr_toas]
-        """
-        coef = self._get_coefficient_realization(helpers, params, key)[..., -1] # [npsr, nmodes, ndraws]
-
-        delta_t = []
-        Ts = self.get_basis() # [npsr_toas, nmodes]
-        for i in range(self.npsrs):
-            c = coef[i] # [nmodes]
-            delta_t.append(Ts[i] @ c) # [npsr_toas]
-        
-        return delta_t # List of arrays [npsr_toas]
-    
-
-    def ln_likelihood_curn(self, params, helpers, model):
-        """Get the Fourier coefficient marginalized likelihood function for 
-        CURN + IRN (i.e., joint correlated and uncorrelated) signal.
-
-        This method computes the log-likelihood contribution from the IRN signal given
-        the parameters. This likelihood is marginalized over the fourier coefficients
-        and is given by:
-        lnlike = (rN^{-1}T)Sigma^{-1}(T^TN^{-1}r) - logdet(Sigma) - logdet(phi))
-        
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        params : array
-            The input parameters, which describe both IRN and GWB
-        model: object
-            The model object that knows how to turn `params` into 
-            red noise covaraince matricies. Adopted from `pandora`.
-
-        Returns
-        -------
-        float
-            The log-likelihood contribution from the IRN signal. [1]
-        """
-        TNT, TNr = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode]
-
-        phi, psd_common = model.get_phi_mat_CURN(params) #[nfreq,npsrs]
-        phiinv = jnp.repeat(1/phi.T, 2, axis = 1)
-        logdet_phis = 2 * jnp.sum(jnp.log(phi), axis = 0)
-
-        Sigma = self.get_sigma_from_phiinv(TNT, phiinv) # [npsr, nmode, nmode]
-        cfs = jsl.cho_factor(Sigma) # Cholesky for each psr [npsr, nmodes, nmodes]
-
-        # Log determinant of phi
-        diags = jnp.diagonal(cfs[0], axis1=1, axis2=2) # [npsr, nmodes]
-        logdet_Sigma = 2*jnp.sum(jnp.log(diags)) # scalar
-
-        # rNT(Sigma^{-1})TNr
-        expvals = jnp.sum(TNr[:,:,None] * jsl.cho_solve(cfs, TNr[:,:,None])) # [npsr, nmodes, 1] -> scalar
-        lnlike = 0.5 * (expvals - logdet_Sigma - logdet_phis.sum()) # scalar
-        return lnlike # scalar
-
-
     @jit_method
     def ln_prior_freespec(self, params):
         """Compute the log-prior for the IRN signal parameters.
@@ -497,7 +410,7 @@ class Uncorrelated(Signal_Base):
         array
             The drawn parameters. [n_parameters]
         """
-        params = jrandom.uniform(key, shape=(self.n_parameters), 
+        params = jrandom.uniform(key, shape=(self.n_parameters,), 
                                  minval=self.parameter_range[:,0], 
                                  maxval=self.parameter_range[:,1]) # [n_parameters]
         return params # [n_parameters]
@@ -518,7 +431,7 @@ class Uncorrelated(Signal_Base):
         Parameters
         ----------
         helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
+            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
         params : array
              The current parameters, which are halflog10_rhos for each frequency
@@ -569,7 +482,7 @@ class Uncorrelated(Signal_Base):
         Parameters
         ----------
         helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
+            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
         params : array
              The current parameters, which are halflog10_rhos for each frequency
@@ -604,69 +517,6 @@ class Uncorrelated(Signal_Base):
         halflog10_rho = 0.5*jnp.log10(new_params).reshape(-1, self.ndraws) # [npsr*nfreqs, nfreqs]
         return halflog10_rho.T # [ndraws, nfreqs*npsrs]
         
-    #@jit_method
-    def lnposterior_reparam(self, helpers, red_params, z):
-        """
-        This method evaluates the posterior under a reparameterization of the Fourier
-        coefficients. The coefficients represent Gaussian processes described by phi_cube.
-        Call this method within gradient-based samplers.
-        NOTE: the reparameterization is based on the posterior of the coeffcients.
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        red_noise_cov : array
-            The red noise covaraince matrix
-            over FREQUENCY! [nfreqs, npsr, npsr]
-        z : array
-            "Whitened coefficients", [npsr, nmode]
-        Returns
-        -------
-        tuple
-            Fourier coefficients with variance imposed by spectral model [npsr, nmodes] and
-            the log-determinant of the Jacobian of the coordinate transformation [float].
-        """
-        TNT, TNr = helpers
-        red_noise_cov = 10**(2 * red_params)
-        if self.npsrs == 1:
-            # TODO: Single pulsar is always assumed freespec?
-            phiinvs_diags = jnp.repeat(1/red_noise_cov, 2, axis = 1) #[nmodes, npsrs]
-            logdet_phimat = 2 * jnp.sum(jnp.log(red_noise_cov)) #2 is to account for 2*nfreq=nmodes
-        else:
-            phiinvs, logdet_phimat = self.model.get_phi_mat_inv(red_noise_cov)
-            phiinvs_diags = phiinvs.diagonal(axis1 = -2, axis2 = -1) #[nmodes, npsrs]
-        
-        # Posterior precision Cholesky (cho_factor equivalent), batched over pulsars
-        Sigma_inv = TNT.at[:, self._diag_idx , self._diag_idx ].add(phiinvs_diags)     # [npsr, nmodes, nmodes]
-        Sigma_inv_L = jsl.cho_factor(Sigma_inv, lower = True)  # [npsr, nmodes, nmodes]
-
-
-        # MAP coefficients via cho_solve pattern: forward then back substitution
-        a_hat = jsl.cho_solve(Sigma_inv_L, TNr[..., None])
-
-        # Standardizing transform via back substitution
-        Lz = jax.lax.linalg.triangular_solve(
-            Sigma_inv_L[0], z[..., None], left_side=True, lower=True, transpose_a=True,
-        )  # L^T Lz = z
-
-        coeff = a_hat + Lz  # [npsr, nmodes, 1]
-
-        lndet_Jac = -jnp.sum(jnp.log(Sigma_inv_L[0].diagonal(axis1=-2, axis2=-1)))
-
-        # Log-likelihood
-        aFNr      = jnp.sum(coeff[..., 0] * TNr)
-        aFNFa     = jnp.sum(coeff.mT @ TNT @ coeff)
-        lnlike_value = aFNr - 0.5 * aFNFa
-
-        if self.npsrs == 1:
-            lnprior_value = -0.5 * ((coeff[..., 0]**2 * phiinvs_diags.T).sum() + logdet_phimat)
-        else:
-            lnprior_value = -0.5 * ((coeff.transpose(1, 2, 0) @ phiinvs @ coeff.transpose(1, 0, 2)).sum() + logdet_phimat)
-
-        # TODO: We removed the subtraciton of the prior here
-        return lnlike_value + lnprior_value + lndet_Jac, coeff[..., 0]
-
 
 class SuperSignal:
     """A signal class for a pulsar-independent free spectrum red noise (IRN) signal.
@@ -723,8 +573,7 @@ class SuperSignal:
     """
     def __init__(self,
                 signal_helper,
-                model = None,
-                data=None,
+                data,
                 ):
         """The constructor for the IRN_Freespectrum signal class.
 
@@ -745,12 +594,14 @@ class SuperSignal:
         ----------
         signal_list : list,
             List of signal components.
-        model: object
-            the parameterized psd object
+        data : Atlas.data
+            Atlas data object.
         """
-        self.model = model
+        self.data = data
 
-        self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(signal_helper)
+        self.get_Fmat_concat, self.signal_comb_idxs = sutils.build_basis(signal_helper)
+
+        # getting ways to slice TNT and TNr
         self.gwb_idxs = self.signal_comb_idxs['cor']
 
         if 'cor' in [x.name for x in signal_helper['shared_basis']['signal_list']]:
@@ -758,151 +609,84 @@ class SuperSignal:
         else:
             self.non_gwb_idxs = slice(0, self.gwb_idxs.start  , None)
 
-        self.nongwb_idxs = self.signal_comb_idxs['cor']
-
         self.nmodes = self.get_Fmat_concat.shape[-1]
-        self.nfreqs = int(self.nmodes/2) # Sine and cosine modes per frequency
-        self.npsrs = data.npsrs
+        self.npsrs = self.data.npsrs
         
-        self.fixed_wn = data.fixed_wn
-        self.fixed_res = data.fixed_res
+        # extract data anlaysis settings from data object
+        self.fixed_wn = self.data.fixed_wn
+        self.fixed_res = self.data.fixed_res
+        self.linear_timing = self.data.linear_timing
+        self.Mmat = self.data.Mmat
+
+        # get helper arrays for likelihood
+        self.get_helpers = self._get_helpers()
+
+        # linear timing model attributes
+        self.linear_timing_model_size = max([x.shape[-1] for x in self.Mmat]) if self.linear_timing else 0
         self.linear_timing = data.linear_timing
-        self.Mmat = data.Mmat
+        self.lowest_value_eq_to_zero = 1e-24
 
-        if self.fixed_wn and not self.fixed_res: # TODO: Fix the multi-get-helper thing
-            @jax.jit
-            def get_helpers(reff):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = data.fixed_white_noise_params,   # closed over as constant
-                    reff = reff,
-                )
-
-        elif not self.fixed_wn and not self.fixed_res:
-            @jax.jit
-            def get_helpers(reff, white_noise_params):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = white_noise_params,   # closed over as constant
-                    reff = reff,
-                )
-
-        elif not self.fixed_wn and self.fixed_res:
-            @jax.jit
-            def get_helpers(white_noise_params):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = white_noise_params,   # closed over as constant
-                    reff = jnp.concat(data.raw_residuals)[:, None],
-                )
-
-        elif self.fixed_wn and self.fixed_res:
-            @jax.jit
-            def get_helpers():
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = data.white_noise_params,   # closed over as constant
-                    reff = jnp.concat(data.raw_residuals)[:, None],
-                )
-        self.get_helpers = get_helpers
+        # number of frequency bins for NumPyro interface
+        self.nfreqs = int((self.nmodes - self.linear_timing_model_size)/2) # Sine and cosine modes per frequency
 
         # Hidden attributes if needed-------------------------------------------
-
         self._diag_idx = jnp.arange(self.nmodes)
 
-    def add_model(self, model):
-        self.model = model
-
-    def build_basis(self, signal_helper):
-        """
-        Build the combined Fourier basis matrix and a dict mapping each signal
-        name to its column slice in the final F-matrix (and therefore in FNF).
-
-        Parameters
-        ----------
-        signal_helper : dict with keys
-            'shared_basis' : {
-                'signal_list': [...] or None,
-                'index_of_signal_used_for_basis': int
-            }  or None
-            'separate' : {
-                'signal_list': [...] or None
-            }  or None
-            'order' : comma-separated signal names, e.g. 'dm,unc,cor'
+    @jit_method
+    def _get_helpers(self):
+        """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
+        needed for likelihood evaluation. Data analysis settings are extracted from the
+        data object.
 
         Returns
         -------
-        Fmat : jnp.ndarray, shape (n_toas, total_basis_cols)
-        signal_indices : dict[str, slice]
-            Maps each signal name to its column slice in Fmat / FNF.
+        new_func: callable
+            Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
         """
-        if not signal_helper['order'].endswith('cor'):
-            raise ValueError(
-                f"`cor` MUST be the last signal."
-            )
 
-        shared_cfg   = signal_helper.get('shared_basis') or {}
-        separate_cfg = signal_helper.get('separate') or {}
-        order = [s.strip() for s in signal_helper['order'].split(',')]
+        if self.fixed_wn and not self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               white_noise_params = self.data.fixed_white_noise_params,
+                               )
+            return jit_method(new_func)
 
-        # --- Shared group ---
-        shared_signals = shared_cfg.get('signal_list') or []
-        shared_idx     = shared_cfg.get('index_of_signal_used_for_basis', 0)
-        shared_names   = {sig.name for sig in shared_signals}
+        elif not self.fixed_wn and not self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               )
+            return jit_method(new_func)
 
-        shared_Fmat = (
-            jnp.concat(shared_signals[shared_idx].get_basis())
-            if shared_signals else None
-        )
+        elif not self.fixed_wn and self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               reff = jnp.concat(self.data.raw_residuals)[:, None],
+                               )
+            return jit_method(new_func)
 
-        # --- Separate signals ---
-        separate_signals = separate_cfg.get('signal_list') or []
-        separate_map = {
-            sig.name: jnp.concat(sig.get_basis())
-            for sig in separate_signals
-        }
+        elif self.fixed_wn and self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               white_noise_params = self.data.fixed_white_noise_params,
+                               reff = jnp.concat(self.data.raw_residuals)[:, None],)
+            return jit_method(new_func)
 
-        # --- Validate order covers exactly the declared signals ---
-        declared = shared_names | set(separate_map)
-        if set(order) != declared:
-            raise ValueError(
-                f"'order' signals {set(order)} do not match declared signals {declared}"
-            )
+    def add_parameterization(self, model):
+        """Add a specific parameterization of the power spectral density based
+        on Atlas' `parameterized.py`.
 
-        # --- Assemble columns in user-specified order ---
-        Fmats          = []
-        signal_indices = {}
-        col            = 0
-
-        shared_block_placed = False
-        shared_start        = None
-        shared_signal_ct = 0
-        for name in order:
-            if name in shared_names:
-                if not shared_block_placed:
-                    n_cols = shared_Fmat.shape[1]
-                    Fmats.append(shared_Fmat)
-                    shared_start        = col
-                    shared_block_placed = True
-                    col += n_cols
-                signal_indices[name] = slice(shared_start, shared_start + shared_signals[shared_signal_ct].nmodes)
-                shared_signal_ct+=1
-            else:
-                F      = separate_map[name]
-                n_cols = F.shape[1]
-                Fmats.append(F)
-                signal_indices[name] = slice(col, col + n_cols)
-                col += n_cols
-
-        Fmat = jnp.concat(Fmats, axis=1)
-
-        return Fmat, signal_indices
+        Parameters
+        ----------
+        model: Atlas.parameterized object.
+            An instantiation of a parameterized object.
+        """
+        self.model = model
 
     def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
-        This method computes the helper objects TNT and TNr for each pulsar, which are
-        needed for the likelihood evaluation and posterior drawing. The TNT and TNr
+        This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
+        needed for the likelihood evaluation and posterior drawing. The TNT, TNr, rNr, and logdet_N
         are computed as:
         - TNT = T^T N^{-1} T
         - TNr = T^T N^{-1} r
@@ -919,18 +703,12 @@ class SuperSignal:
         Returns
         -------
         tuple
-            The helper objects (TNT and TNr) for each pulsar. 
+            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
         """
-        if not self.linear_timing:
-            return N_list.get_red_helpers(red_noise_basis = self.get_Fmat_concat, 
-                                        residuals = reff, 
-                                        white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
-        else:
-            return N_list.get_red_and_timing_helpers(red_noise_basis = self.get_Fmat_concat,
-                                                    timing_model_basis = self.Mmat, 
-                                                    residuals = reff, 
-                                                    white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN], [MNM, MNr]
+        return N_list.get_red_helpers(red_noise_basis = self.get_Fmat_concat, 
+                                      residuals = reff, 
+                                      white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
 
                                         
     @jit_method
@@ -1000,7 +778,7 @@ class SuperSignal:
         Parameters
         ----------
         helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
+            The helper objects (TNT, TNr, rNr, logdet_N) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
         red_noise_cov : array
             The red noise covaraince matrix
@@ -1013,7 +791,7 @@ class SuperSignal:
             Fourier coefficients with variance imposed by spectral model [npsr, nmodes] and
             the log-determinant of the Jacobian of the coordinate transformation [float].
         """
-        TNT, TNr = helpers
+        TNT, TNr, rNr, logdet_N = helpers
         red_noise_cov = self.model.get_phi_mat_full(red_params)
         if self.npsrs == 1:
             phiinvs_diags = jnp.repeat(1/red_noise_cov, 2, axis = 0) #[nmodes, npsrs]
@@ -1021,6 +799,10 @@ class SuperSignal:
         else:
             phiinvs, logdet_phimat = self.model.get_phi_mat_inv(red_noise_cov)
             phiinvs_diags = phiinvs.diagonal(axis1 = -2, axis2 = -1) #[nmodes, npsrs]
+
+        if self.linear_timing:
+            phiinvs_diags_ltm = jnp.full(shape = (self.nmodes, self.npsrs), fill_value = self.lowest_value_eq_to_zero)
+            phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
 
         # Posterior precision Cholesky (cho_factor equivalent), batched over pulsars
         Sigma_inv = TNT.at[:, self._diag_idx , self._diag_idx ].add(phiinvs_diags.T)     # [npsr, nmodes, nmodes]
@@ -1044,42 +826,37 @@ class SuperSignal:
         lnlike_value = aFNr - 0.5 * aFNFa
 
         if self.npsrs == 1:
-            lnprior_value = -0.5 * ((coeff[..., 0]**2 * phiinvs_diags.T).sum() + logdet_phimat)
+            lnprior_value = -0.5 * ((coeff[:, self.linear_timing_model_size:, 0]**2 * phiinvs_diags[self.linear_timing_model_size:, :].T).sum() + logdet_phimat)
         else:
-            lnprior_value = -0.5 * ((coeff.transpose(1, 2, 0) @ phiinvs @ coeff.transpose(1, 0, 2)).sum() + logdet_phimat)
+            aG = coeff[:, self.linear_timing_model_size:]
+            lnprior_value = -0.5 * ((aG.transpose(1, 2, 0) @ phiinvs @ aG.transpose(1, 0, 2)).sum() + logdet_phimat)
 
-        # TODO: We removed the subtraciton of the prior here
-        return lnlike_value + lnprior_value + lndet_Jac, coeff[..., 0]
-        
+        return lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N), coeff[..., 0]
 
-    def ln_likelihood_joint_marg_curn(self, params, helpers, model):
+    def ln_likelihood_curn(self, helpers, params):
         """Get the Fourier coefficient marginalized likelihood function for 
-        CURN + IRN (i.e., joint correlated and uncorrelated) signal.
+        CURN + IRN (i.e., joint common and uncommon) signal.
 
-        This method computes the log-likelihood contribution from the IRN signal given
-        the parameters. This likelihood is marginalized over the fourier coefficients
+        This likelihood is marginalized over the fourier coefficients
         and is given by:
         lnlike = (rN^{-1}T)Sigma^{-1}(T^TN^{-1}r) - logdet(Sigma) - logdet(phi))
         
         Parameters
         ----------
         helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
+            The helper objects (TNT, TNr, rNr, logdet_N) for each pulsar. 
+            [npsr, nmode, nmode], [npsr, nmode], [0], [0]
         params : array
             The input parameters, which describe both IRN and GWB
-        model: object
-            The model object that knows how to turn `params` into 
-            red noise covaraince matricies. Adopted from `pandora`.
 
         Returns
         -------
         float
             The log-likelihood contribution from the IRN signal. [1]
         """
-        TNT, TNr = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode]
+        TNT, TNr, rNr, logdet_N = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode], [0], [0]
 
-        phi, psd_common = model.get_phi_mat_CURN(params) #[nfreq,npsrs]
+        phi, psd_common = self.model.get_phi_mat_CURN(params) #[nfreq,npsrs]
         phiinv = jnp.repeat(1/phi.T, 2, axis = 1)
         logdet_phis = 2 * jnp.sum(jnp.log(phi), axis = 0)
 
@@ -1093,7 +870,135 @@ class SuperSignal:
         # rNT(Sigma^{-1})TNr
         expvals = jnp.sum(TNr[:,:,None] * jsl.cho_solve(cfs, TNr[:,:,None])) # [npsr, nmodes, 1] -> scalar
         lnlike = 0.5 * (expvals - logdet_Sigma - logdet_phis.sum()) # scalar
-        return lnlike # scalar
+        return lnlike - 0.5 * (rNr + logdet_N)
+    
+
+    @jit_method
+    def lnposterior_partial_marg_reparam(self,
+                                        helpers,
+                                        red_params,
+                                        z):
+
+        """
+        This method evaluates the partially marginalized posterior under a reparameterization of the Fourier
+        coefficients.
+        Call this method within gradient-based samplers.
+        NOTE: the reparameterization is based on the posterior of the coeffcients.
+        Parameters
+        ----------
+        helpers : tuple
+            The helper objects (TNT and TNr) for each pulsar. 
+            [npsr, nmode, nmode], [npsr, nmode]
+        red_noise_cov : array
+            The red noise covaraince matrix
+            over FREQUENCY! [nfreqs, npsr, npsr]
+        z : array
+            "Whitened coefficients", [npsr, nmode]
+        Returns
+        -------
+        tuple
+            Fourier coefficients with variance imposed by spectral model [npsr, nmodes] and
+            the log-determinant of the Jacobian of the coordinate transformation [float].
+        """ 
+        # ── Slice TNT/TNr into GWB and IRN blocks ────────────────────────────────
+        TNT, TNr, rNr, logdet_N = helpers
+        full_gwb_phi, gwb_phi_diag, psr_phi_diags = self.model.partial_reparam_helper(red_params)
+        gwb_phi_diag = jnp.repeat(gwb_phi_diag, 2, axis = 0)[:, 0] #[nmode_b]
+        psr_phi_diags = jnp.repeat(psr_phi_diags.T, 2, axis = 1) #[npsr, nmode_p]
+
+        LG = jsl.cho_factor(full_gwb_phi, lower=True)                     #[nfreqs,npsrs,npsrs]
+        gwb_phi_inv = jnp.repeat(jsl.cho_solve(LG, self.model._eye), 2, axis = 0)
+
+
+        # TODO: CHECK THESE SLICINGS!!!
+        TNT_b = TNT[:, self.gwb_idxs, self.gwb_idxs]  # [npsr, nmode_b, nmode_b], [npsr, nmode_b]
+        TNr_b = TNr[:, self.gwb_idxs] 
+        TNT_p = TNT[:, self.non_gwb_idxs, self.non_gwb_idxs]  # [npsr, nmode_p, nmode_p], [npsr, nmode_p]
+        TNr_p = TNr[:, self.non_gwb_idxs]
+        T_bp = TNT[:, self.gwb_idxs, self.non_gwb_idxs]         # [npsr, nmode_b, nmode_p]
+
+        (npsrs, nmodes_b, nmodes_p) = T_bp.shape
+
+        # -------------------------------------------------------------------------
+        # Pulsar RN block: invert Sigma_p = (T_pp + phi_p_inv)^{-1} per pulsar
+        # Block-diagonal across pulsars [npsr, nmode_p, nmode_p]
+        # -------------------------------------------------------------------------
+        psr_sigma_p_inv = TNT_p + jnp.einsum('pi,ij->pij', 1. / psr_phi_diags, jnp.eye(nmodes_p))
+        psr_phi_p_ln_det = jnp.sum(jnp.log(psr_phi_diags))
+
+        psr_sigma_p_inv_chol = jnp.linalg.cholesky(psr_sigma_p_inv)  # [npsr, nmode_p, nmode_p]
+        psr_sigma_p_inv_ln_dets = 2 * jnp.sum(
+            jnp.log(jnp.diagonal(psr_sigma_p_inv_chol, axis1=1, axis2=2)), axis=1
+        )  # [npsr]
+
+        # -------------------------------------------------------------------------
+        # inner products needed for likelihood / standardizing transformation
+        # -------------------------------------------------------------------------
+        # L^{-1} T_bp^T
+        Linv_T_bpT = jax.lax.linalg.triangular_solve(
+            psr_sigma_p_inv_chol, T_bp.mT, left_side=True, lower=True
+        )  # [npsr, nmode_p, nmode_b]
+
+        # L^{-1} r_p
+        Linv_r_p = jax.lax.linalg.triangular_solve(
+            psr_sigma_p_inv_chol, TNr_p[:, :, None], left_side=True, lower=True
+        )  # [npsr, nmode_p, 1]
+
+        # T_bp Sigma_p T_bp^T = (L^{-1} T_bp^T)^T (L^{-1} T_bp^T)
+        T_bp_Sigma_p_T_bpT = Linv_T_bpT.mT @ Linv_T_bpT  # [npsr, nmode_b, nmode_b]
+
+        # T_bp Sigma_p r_p = (L^{-1} T_bp^T)^T (L^{-1} r_p)
+        T_bp_Sigma_p_r_p = (Linv_T_bpT.mT @ Linv_r_p)[:, :, 0]  # [npsr, nmode_b]
+
+        # r_p^T Sigma_p r_p = (L^{-1} r_p)^T (L^{-1} r_p)
+        r_p_Sigma_p_r_p = Linv_r_p.mT @ Linv_r_p  # [npsr, 1, 1]
+
+        # -------------------------------------------------------------------------
+        # GWB block: build Sigma_b_inv and GWB prior arrays
+        # -------------------------------------------------------------------------
+        gwb_phi_inv_spec = jnp.diag(1. / gwb_phi_diag)                          # [nmode_b, nmode_b]
+        gwb_sigma_b_inv = TNT_b + gwb_phi_inv_spec[None] - T_bp_Sigma_p_T_bpT         # [npsr, nmode_b, nmode_b]
+
+        # Effective GWB data vector: w_b = r_b - T_bp Sigma_p r_p
+        w_b = TNr_b - T_bp_Sigma_p_r_p  # [npsr, nmode_b]
+
+        # -------------------------------------------------------------------------
+        # Standardizing transformation: a_b = a_hat_b + L_b z
+        # -------------------------------------------------------------------------
+        Sigma_b_inv_L = jnp.linalg.cholesky(gwb_sigma_b_inv)  # [npsr, nmode_b, nmode_b]
+
+        # L y = w_b
+        y_b = jax.lax.linalg.triangular_solve(
+            Sigma_b_inv_L, w_b[:, :, None], left_side=True, lower=True
+        )
+        # L^T a_hat_b = y_b
+        a_hat_b = jax.lax.linalg.triangular_solve(
+            Sigma_b_inv_L, y_b, left_side=True, lower=True, transpose_a=True
+        )
+        # L^T (L_b z) = z
+        Lz = jax.lax.linalg.triangular_solve(
+            Sigma_b_inv_L, z[:, :, None], left_side=True, lower=True, transpose_a=True
+        )
+        a_b = a_hat_b + Lz  # [npsr, nmode_b, 1]
+
+        lndet_Jac = -jnp.sum(jnp.log(jnp.diagonal(Sigma_b_inv_L, axis1=1, axis2=2)))
+
+        # -------------------------------------------------------------------------
+        # Log-likelihood (marginalised over a_p)
+        # -------------------------------------------------------------------------
+        ln_likelihood_val  = -0.5 * jnp.sum(a_b.mT @ (gwb_sigma_b_inv - gwb_phi_inv_spec[None]) @ a_b)
+        ln_likelihood_val +=        jnp.sum(a_b[..., 0] * w_b)
+        ln_likelihood_val +=  0.5 * jnp.sum(r_p_Sigma_p_r_p)
+        ln_likelihood_val += -0.5 * psr_phi_p_ln_det - 0.5 * jnp.sum(psr_sigma_p_inv_ln_dets)
+
+        # -------------------------------------------------------------------------
+        # Log-prior on GWB coefficients: -1/2 a_b^T phi_b_inv a_b - 1/2 ln|phi_b|
+        # -------------------------------------------------------------------------
+        aG = a_b.transpose((1, 0, 2)) #[npsrs,nmodes,1]-->[nmodes,npsrs,1]
+        logdet_phi_gwb = 4 * jnp.sum(jnp.log(LG[0].diagonal(axis1=-2, axis2=-1))) #LG is not repeated hence the 4 not 2
+        ln_prior_val = -0.5 * jnp.sum(aG.mT @ gwb_phi_inv @ aG + logdet_phi_gwb)
+
+        return ln_likelihood_val + ln_prior_val + lndet_Jac + 0.5 * jnp.sum(z**2), a_b
 
 
     

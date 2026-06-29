@@ -4,7 +4,7 @@ from Atlas.signals import signals_utils as sutils
 from Atlas.signals import orf_functions as orf_funcs
 from Atlas.signals.base import Signal_Base
 
-from functools import cached_property
+from functools import cached_property, partial
 
 import jax
 import jax.numpy as jnp
@@ -70,11 +70,15 @@ class Correlated(Signal_Base):
         The log-determinant of the overlap reduction function matrix.
     """
 
-    def __init__(self, name='GWB', orf='hd', nfreqs=10, 
+    def __init__(self,
+                 data,
+                 name,
+                 orf='hd',
+                 nfreqs=10, 
                  halflog10_rho_range=(-9,-2), 
-                 sampling_method='posterior_draws',
                  posterior_draw_ndraws = 1,
-                 data=None):
+                 user_freqs=jnp.array([False])
+                 ):
         """The constructor for the GWB_Freespectrum signal class.
 
         This signal models the GWB as a pulsar-correlated common signal in all
@@ -116,27 +120,34 @@ class Correlated(Signal_Base):
         """
         # Simple initialization-------------------------------------------------
         self.name = name
+        self.data = data
         self.ndraws = posterior_draw_ndraws # Number of posterior draws to run in parallel when sampling_method is 'posterior_draws'
-        if data is None: # Guard clause to initialize without data.
-            return 
-        # Data is present, we can fully initialize the signal-------------------
         # Required attributes:      parameter_names, n_parameters, 
         # parameter_range, allow_posterior_draw, sampling_methods, initialized
-        par = [f'{self.name}_halflog10_rho_F{i}' for i in range(nfreqs)]
-        self.n_parameters = len(par) # Number of parameters
-        par_range = jnp.ones((self.n_parameters, 2)) * jnp.array(halflog10_rho_range)[None,:]
-        self.parameter_range = par_range # Range for each parameter, shape (n_parameters, 2)
 
         # Helper attributes needed for the rest of the class--------------------
-        self.psr_toas = data.toas # Reference to a list of TOA arrays for each pulsar [npsr, npsr_toas]
+        self.psr_toas = self.data.toas # Reference to a list of TOA arrays for each pulsar [npsr, npsr_toas]
         self.nfreqs = nfreqs
         self.nmodes = 2*nfreqs # Sine and cosine modes per frequency
         self.orf = orf # string for orf function, e.g. 'hd'
-        self.npsrs = data.npsrs
-        self.npairs = data.npairs
-        self.tspan = data.pta_tspan
-        # GW Frequencies for this signal
-        self.freqs = sutils.get_harmonic_frequencies(self.nfreqs, self.tspan)
+        self.npsrs = self.data.npsrs
+        self.npairs = self.data.npairs
+        self.tspan = self.data.pta_tspan
+        
+        if user_freqs.any():
+            self.freqs = user_freqs
+            self.nfreqs = len(self.freqs)
+            self.nmodes = 2 * self.nfreqs
+        else:    
+            self.tspans = data.pta_tspan
+            # Frequencies for this signal (Same frequencies for all pulsars)
+            self.freqs = sutils.get_harmonic_frequencies(self.nfreqs, self.tspans) # [nfreqs]  
+
+        # Number of parameters and range
+        self.n_parameters = len(self.freqs)
+        par_range = jnp.ones((self.n_parameters, 2)) * jnp.array(halflog10_rho_range)[None,:]
+        self.parameter_range = par_range # Range for each parameter, shape (n_parameters, 2)
+
         # No need to pre-compute the basis matrices, compute them on the fly instead.
         #self.basis = None # List of basis matrices for each pulsar [npsr, npsr_toas, nmodes]
         # Uniform prior volume
@@ -153,47 +164,52 @@ class Correlated(Signal_Base):
         assert ~jnp.isnan(self.Gamma_inv).any(), "Gamma_inv contains NaNs"
         assert ~jnp.isnan(self.logdet_Gamma), "logdet_Gamma is NaN"
         
-        self.fixed_wn = data.fixed_wn
-        self.fixed_res = data.fixed_res
+        self.fixed_wn = self.data.fixed_wn
+        self.fixed_res = self.data.fixed_res
 
-        if self.fixed_wn and not self.fixed_res:
-            @jax.jit
-            def get_helpers(reff):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = data.fixed_white_noise_params,   # closed over as constant
-                    reff = reff,
-                )
-
-        elif not self.fixed_wn and not self.fixed_res:
-            @jax.jit
-            def get_helpers(reff, white_noise_params):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = white_noise_params,   # closed over as constant
-                    reff = reff,
-                )
-
-        elif not self.fixed_wn and self.fixed_res:
-            @jax.jit
-            def get_helpers(white_noise_params):
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = white_noise_params,   # closed over as constant
-                    reff = jnp.concat(data.raw_residuals)[:, None],
-                )
-
-        elif self.fixed_wn and self.fixed_res:
-            @jax.jit
-            def get_helpers():
-                return self.update_white_matrix_products_unjitted(
-                    N_list = data.Nmat,
-                    white_noise_params = data.white_noise_params,   # closed over as constant
-                    reff = jnp.concat(data.raw_residuals)[:, None],
-                )
-        self.get_helpers = get_helpers
+        # get helper arrays for likelihood evaluation
+        self.get_helpers = self._get_helpers()
 
     # Helper methods------------------------------------------------------------
+    @jit_method
+    def _get_helpers(self):
+        """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
+        needed for likelihood evaluation. Data analysis settings are extracted from the
+        data object.
+
+        Returns
+        -------
+        new_func: callable
+            Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
+        """
+
+        if self.fixed_wn and not self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               white_noise_params = self.data.fixed_white_noise_params,
+                               )
+            return jit_method(new_func)
+
+        elif not self.fixed_wn and not self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               )
+            return jit_method(new_func)
+
+        elif not self.fixed_wn and self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               reff = jnp.concat(self.data.raw_residuals)[:, None],
+                               )
+            return jit_method(new_func)
+
+        elif self.fixed_wn and self.fixed_res:
+            new_func = partial(self.update_white_matrix_products_unjitted,
+                               N_list = self.data.Nmat,
+                               white_noise_params = self.data.fixed_white_noise_params,
+                               reff = jnp.concat(self.data.raw_residuals)[:, None],)
+            return jit_method(new_func)
+
     @jit_method
     def get_basis(self):
         """Get the list Fourier design matrix for all pulsars. [npsr, npsr_toas, nmodes]
@@ -241,12 +257,16 @@ class Correlated(Signal_Base):
     @jit_method
     def get_phi(self, phi_diag):
         """
+        Get red noise covariance matrix for Fourier
+        coefficients from diagonal elements.
         """
         return phi_diag[:,None,None] * self.Gamma[None,:,:]
 
     @jit_method
     def get_phiinv(self, phi_diag):
         """
+        Get inverse red noise covariance matrix for Fourier
+        coefficients from diagonal elements.
         """
         return 1/phi_diag[:,None,None] * self.Gamma_inv[None,:,:]
 
@@ -387,124 +407,7 @@ class Correlated(Signal_Base):
         Up = (mean + jsl.solve_triangular(cf[0], U)) # [npsr*nmodes, ndraws]
         coef = Up.reshape(self.npsrs, self.nmodes, self.ndraws)# [npsr*nmodes, ndraws] -> [npsr, nmodes, ndraws]
         return coef # [npsr, nmodes, ndraws]
-
-    @jit_method
-    def get_delta_t(self, helpers, params, key):
-        """Get the residual contributions from the GWB signal. [npsr, npsr_toas]
-
-        This method computes the contributions to the residuals from this GWB signal
-        given the parameters. Since the fourier coefficients are marginalized over,
-        we need to draw a random realization of the coefficients and then project them
-        into the residual space using the Fourier design matrix. 
-
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        params : array
-            The input parameters, which are halflog10_rhos for each frequency. [nfreqs]
-        key : jax.random.PRNGKey
-            The random key for generating the realization.
-
-        Returns
-        -------
-        List of arrays
-            The contributions to the residuals from the GWB signal for each pulsar. [npsr, npsr_toas]
-        """
-        coef = self._get_coefficient_realization(helpers, params, key)[..., -1] # [npsr, nmodes]
-
-        delta_t = []
-        Ts = self.get_basis() # [npsr_toas, nmodes]
-        for i in range(self.npsrs):
-            c = coef[i] # [nmodes]
-            delta_t.append(Ts[i] @ c) # [npsr_toas]
-        
-        return delta_t # List of arrays [npsr_toas]
     
-    # TODO: Probably remove the ability to calculate likelihoods?
-    @jit_method
-    def ln_likelihood_marg(self, helpers, params):
-        """Get the log-likelihood contribution from the GWB signal.
-
-        This method computes the log-likelihood contribution from the GWB signal given
-        the parameters. This likelihood is marginalized over the fourier coefficients
-        and is given by:
-        lnlike = (rN^{-1}T)Sigma^{-1}(T^TN^{-1}r) - logdet(Sigma) - logdet(phi))
-        
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        params : array
-             The input parameters, which are halflog10_rhos for each frequency. [nfreqs]
-
-        Returns
-        -------
-        float
-            The log-likelihood contribution from the GWB signal. [1]
-        """
-        TNT, TNr = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode]
-        phi = self.get_phi_diag(params) # [nmode]
-
-        Sigma = self.get_sigma(TNT, phi) # [npsr*nmodes, npsr*nmodes]
-        cf = jsl.cho_factor(Sigma) # [npsr*nmodes, npsr*nmodes]
-
-        TNr_flat = sutils.blockVec2sigmaVec(TNr)[:,None] # [npsr, nmode] -> [npsr*nmodes, 1]
-
-        # Get the log determinant of the phi matrix
-        logdet_phi = self.npsrs*jnp.sum(jnp.log(phi)) + self.nmodes*self.logdet_Gamma # scalar
-        logdet_sigma = 2*jnp.sum(jnp.log(jnp.diag(cf[0]))) # scalar
-
-        # rNT(Sigma^-1)TNr - scalar
-        expvals = jnp.sum(TNr_flat * jsl.cho_solve(cf, TNr_flat))
-        lnlike = 0.5 * (expvals - logdet_sigma - logdet_phi) # scalar
-        return lnlike # scalar
-    
-    def ln_likelihood_joint(self, params, helpers, model):
-        """Get the Fourier coefficient marginalized likelihood function for 
-        GWB + IRN (i.e., joint correlated and uncorrelated) signal.
-
-        This method computes the log-likelihood contribution from the IRN signal given
-        the parameters. This likelihood is marginalized over the fourier coefficients
-        and is given by:
-        lnlike = (rN^{-1}T)Sigma^{-1}(T^TN^{-1}r) - logdet(Sigma) - logdet(phi))
-        
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        params : array
-            The input parameters, which describe both IRN and GWB
-        model: object
-            The model object that knows how to turn `params` into 
-            red noise covaraince matricies. Adopted from `pandora`.
-
-        Returns
-        -------
-        float
-            The log-likelihood contribution from the IRN signal. [1]
-        """
-        TNT, TNr = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode]
-
-        phi = model.get_phi_mat(params)
-        phiinv, logdet_phi = model.get_phi_mat_inv(phi)
-
-        Sigma = self.get_sigma_from_phiinv(TNT, phiinv) # [npsr*nmodes, npsr*nmodes]
-        cf = jsl.cho_factor(Sigma) # [npsr*nmodes, npsr*nmodes]
-
-        TNr_flat = sutils.blockVec2sigmaVec(TNr)[:,None] # [npsr, nmode] -> [npsr*nmodes, 1]
-
-        # Get the log determinant of the phi matrix
-        logdet_sigma = 2*jnp.sum(jnp.log(jnp.diag(cf[0]))) # scalar
-
-        # rNT(Sigma^-1)TNr - scalar
-        expvals = jnp.sum(TNr_flat * jsl.cho_solve(cf, TNr_flat))
-        lnlike = 0.5 * (expvals - logdet_sigma - logdet_phi) # scalar
-        return lnlike # scalar
-
     @jit_method
     def ln_prior(self, params):
         """Compute the log-prior for the GWB signal parameters.
