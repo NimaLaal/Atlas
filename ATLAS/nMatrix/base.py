@@ -41,7 +41,7 @@ def _timing_model_svd(M):
         The left singular vectors of the design matrix M, which can be used as a more
         stable basis for timing model marginalization. [ntoas, nparams]
     """
-    U,C,V = jnp.linalg.svd(np.array(M), full_matrices=False)
+    U,C,V = jnp.linalg.svd(M, full_matrices=False)
     # Return just the left singular vector.
     # The singular values are a weighting factor that isn't important when marginalizing.
     # the right singular vectors are used to project into the original basis, which isn't
@@ -421,7 +421,7 @@ class SinglePulsarWhiteCov:
 
         self.marg = marg
 
-        self.Mmat = psr.Mmat
+        self.Mmat = _timing_model_svd(psr.Mmat)
         self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
 
         # Static attributes ----------------------------------------------------

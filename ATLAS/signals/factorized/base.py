@@ -615,13 +615,17 @@ class SuperSignal:
         self.fixed_wn = self.data.fixed_wn
         self.fixed_res = self.data.fixed_res
         self.linear_timing = self.data.linear_timing
+        self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
 
         # get helper arrays for likelihood
         self.get_helpers = self._get_helpers()
 
         # linear timing model attributes
-        self.linear_timing_model_size = max([x.shape[-1] for x in self.Mmat]) if self.linear_timing else 0
+        if self.marg_tm:
+            self.linear_timing_model_size = 0
+        else:
+            self.linear_timing_model_size = max([x.shape[-1] for x in self.Mmat]) if self.linear_timing else 0
         self.linear_timing = data.linear_timing
         self.lowest_value_eq_to_zero = 1e-24
 
@@ -798,7 +802,7 @@ class SuperSignal:
             phiinvs, logdet_phimat = self.model.get_phi_mat_inv(red_noise_cov)
             phiinvs_diags = phiinvs.diagonal(axis1 = -2, axis2 = -1) #[nmodes, npsrs]
 
-        if self.linear_timing:
+        if self.linear_timing and not self.marg_tm:
             phiinvs_diags_ltm = jnp.full(shape = (self.nmodes, self.npsrs), fill_value = self.lowest_value_eq_to_zero)
             phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
 
@@ -870,7 +874,6 @@ class SuperSignal:
         lnlike = 0.5 * (expvals - logdet_Sigma - logdet_phis.sum()) # scalar
         return lnlike - 0.5 * (rNr + logdet_N)
     
-
     @jit_method
     def lnposterior_partial_marg_reparam(self,
                                         helpers,
