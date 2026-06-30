@@ -1,6 +1,7 @@
 
 from ATLAS.utils import get_pulsar_timespan
 from ATLAS.utils import jit, jit_method
+from ATLAS.signals.signals_utils import _timing_model_svd
 
 import jax.numpy as jnp
 
@@ -73,7 +74,7 @@ class PTA_Data:
         self.raw_residuals = [jnp.array(p.residuals) for p in psrs]
 
         # Linear Timing Design Matrix
-        self.Mmat = [psr.Mmat for psr in psrs]
+        self.Mmat = [_timing_model_svd(psr.Mmat) for psr in psrs]
 
         ######################PTA Data Analysis General Settings######################
         # Whether the white noise matrices are fixed (bool)

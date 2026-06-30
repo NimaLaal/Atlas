@@ -8,6 +8,7 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 
 from functools import partial
+import random
 
 class Red:
     """A signal class for a factorized likelihood (not prior).
@@ -597,8 +598,22 @@ class SuperSignal:
             Atlas data object.
         """
         self.data = data
+        # extract data anlaysis settings from data object
+        self.fixed_wn = self.data.fixed_wn
+        self.fixed_res = self.data.fixed_res
+        self.linear_timing = self.data.linear_timing
+        self.marg_tm = self.data.marg
+        self.Mmat = self.data.Mmat
 
-        self.get_Fmat_concat, self.signal_comb_idxs = sutils.build_basis(signal_helper)
+        # linear timing model attributes
+        if self.marg_tm:
+            self.linear_timing_model_size = 0
+        else:
+            self.linear_timing_model_size = max([x.shape[-1] for x in self.Mmat]) if self.linear_timing else 0
+        self.linear_timing = data.linear_timing
+        self.lowest_value_eq_to_zero = 1e-40
+
+        self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(signal_helper)
 
         # getting ways to slice TNT and TNr
         self.gwb_idxs = self.signal_comb_idxs['cor']
@@ -610,30 +625,137 @@ class SuperSignal:
 
         self.nmodes = self.get_Fmat_concat.shape[-1]
         self.npsrs = self.data.npsrs
-        
-        # extract data anlaysis settings from data object
-        self.fixed_wn = self.data.fixed_wn
-        self.fixed_res = self.data.fixed_res
-        self.linear_timing = self.data.linear_timing
-        self.marg_tm = self.data.marg
-        self.Mmat = self.data.Mmat
 
         # get helper arrays for likelihood
         self.get_helpers = self._get_helpers()
-
-        # linear timing model attributes
-        if self.marg_tm:
-            self.linear_timing_model_size = 0
-        else:
-            self.linear_timing_model_size = max([x.shape[-1] for x in self.Mmat]) if self.linear_timing else 0
-        self.linear_timing = data.linear_timing
-        self.lowest_value_eq_to_zero = 1e-24
 
         # number of frequency bins for NumPyro interface
         self.nfreqs = int((self.nmodes - self.linear_timing_model_size)/2) # Sine and cosine modes per frequency
 
         # Hidden attributes if needed-------------------------------------------
         self._diag_idx = jnp.arange(self.nmodes)
+
+    def padd_tm_design_matrix(self):
+
+        padded_list = []
+        for M in self.Mmat:
+            # padded = jnp.zeros((M.shape[0], self.linear_timing_model_size))
+            padded = jrandom.normal(jrandom.key(random.randint(0, 10_000)), (M.shape[0], self.linear_timing_model_size)) * 1e-30
+            padded = padded.at[:, :M.shape[1]].set(M)
+            padded_list.append(padded)
+
+        return padded_list
+    
+    def Tmaker(self, 
+                Fmats, 
+                padd_tm_design_matrix = True, 
+                padd_value = 0):
+
+        if padd_tm_design_matrix:
+            Mmats  = self.padd_tm_design_matrix()
+        else:
+            Mmats = self.Mmat
+        T = []
+        for F, M in zip(Fmats, Mmats):
+            T.append(jnp.concat((M, F), axis = -1))
+        return T
+
+    def build_basis(self, signal_helper):
+        """
+        Build the combined Fourier basis matrix and a dict mapping each signal
+        name to its column slice in the final F-matrix (and therefore in FNF).
+
+        Parameters
+        ----------
+        signal_helper : dict with keys
+            'shared_basis' : {
+                'signal_list': [...] or None,
+                'index_of_signal_used_for_basis': int
+            }  or None
+            'separate' : {
+                'signal_list': [...] or None
+            }  or None
+            'order' : comma-separated signal names, e.g. 'dm,unc,cor'
+
+        Returns
+        -------
+        Fmat : jnp.ndarray, shape (n_toas, total_basis_cols)
+        signal_indices : dict[str, slice]
+            Maps each signal name to its column slice in Fmat / FNF.
+        """
+        if not signal_helper['order'].endswith('cor'):
+            raise ValueError(
+                f"`cor` MUST be the last signal."
+            )
+
+        shared_cfg   = signal_helper.get('shared_basis') or {}
+        separate_cfg = signal_helper.get('separate') or {}
+        order = [s.strip() for s in signal_helper['order'].split(',')]
+
+        # --- Shared group ---
+        shared_signals = shared_cfg.get('signal_list') or []
+        shared_idx     = shared_cfg.get('index_of_signal_used_for_basis', 0)
+        shared_names   = {sig.name for sig in shared_signals}
+
+        if self.linear_timing:
+            T = self.Tmaker(Fmats = shared_signals[shared_idx].get_basis(), 
+                padd_tm_design_matrix = True, 
+                padd_value = 0)
+        else:
+            T = shared_signals[shared_idx].get_basis()
+        shared_Fmat = (
+            jnp.concat(T)
+            if shared_signals else None
+        )
+
+        # --- Separate signals ---
+        separate_signals = separate_cfg.get('signal_list') or []
+        separate_map = {}
+        for sig in separate_signals:
+            if self.linear_timing:
+                T_sig = self.Tmaker(Fmats = sig.get_basis(), 
+                                    padd_tm_design_matrix = True, 
+                                    padd_value = 0)
+            else:
+                T_sig = sig.get_basis()
+
+            separate_map.update({sig.name: jnp.concat(T_sig)})
+
+        # --- Validate order covers exactly the declared signals ---
+        declared = shared_names | set(separate_map)
+        if set(order) != declared:
+            raise ValueError(
+                f"'order' signals {set(order)} do not match declared signals {declared}"
+            )
+
+        # --- Assemble columns in user-specified order ---
+        Fmats          = []
+        signal_indices = {}
+        col            = 0
+
+        shared_block_placed = False
+        shared_start        = None
+        shared_signal_ct = 0
+        for name in order:
+            if name in shared_names:
+                if not shared_block_placed:
+                    n_cols = shared_Fmat.shape[1]
+                    Fmats.append(shared_Fmat)
+                    shared_start        = col
+                    shared_block_placed = True
+                    col += n_cols
+                signal_indices[name] = slice(shared_start, shared_start + shared_signals[shared_signal_ct].nmodes)
+                shared_signal_ct+=1
+            else:
+                F      = separate_map[name]
+                n_cols = F.shape[1]
+                Fmats.append(F)
+                signal_indices[name] = slice(col, col + n_cols)
+                col += n_cols
+
+        Fmat = jnp.concat(Fmats, axis=1)
+
+        return Fmat, signal_indices
 
     def _get_helpers(self):
         """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
@@ -830,7 +952,7 @@ class SuperSignal:
         if self.npsrs == 1:
             lnprior_value = -0.5 * ((coeff[:, self.linear_timing_model_size:, 0]**2 * phiinvs_diags[self.linear_timing_model_size:, :].T).sum() + logdet_phimat)
         else:
-            aG = coeff[:, self.linear_timing_model_size:]
+            aG = coeff[:, self.linear_timing_model_size:] #[npsr, 2 * nfreq, 1]
             lnprior_value = -0.5 * ((aG.transpose(1, 2, 0) @ phiinvs @ aG.transpose(1, 0, 2)).sum() + logdet_phimat)
 
         return lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N), coeff[..., 0]
