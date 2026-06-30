@@ -1,7 +1,6 @@
 
-from ATLAS.utils import jit_method
+from ATLAS.utils import jit_method, jit
 from ATLAS.signals import signals_utils as sutils
-from ATLAS.signals.base import Signal_Base
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +9,7 @@ import jax.random as jrandom
 
 from functools import partial
 
-class Red(Signal_Base):
+class Red:
     """A signal class for a factorized likelihood (not prior).
 
     The frequencies are the first `nfreqs` harmonics of 1/Tspan. Tspan could either
@@ -176,7 +175,7 @@ class Red(Signal_Base):
                  for t in self.psr_toas] # List of [npsr_toas, nmodes]
         return T # [npsr, npsr_toas, nmodes]
     
-    @jit_method
+
     def _get_helpers(self):
         """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
         needed for likelihood evaluation. Data analysis settings are extracted from the
@@ -193,27 +192,27 @@ class Red(Signal_Base):
                                N_list = self.data.Nmat,
                                white_noise_params = self.data.fixed_white_noise_params,
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif not self.fixed_wn and not self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif not self.fixed_wn and self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                reff = jnp.concat(self.data.raw_residuals)[:, None],
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif self.fixed_wn and self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                white_noise_params = self.data.fixed_white_noise_params,
                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-            return jit_method(new_func)
+            return jit(new_func)
 
     @jit_method
     def get_phi_diag(self, params):
@@ -632,7 +631,6 @@ class SuperSignal:
         # Hidden attributes if needed-------------------------------------------
         self._diag_idx = jnp.arange(self.nmodes)
 
-    @jit_method
     def _get_helpers(self):
         """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
         needed for likelihood evaluation. Data analysis settings are extracted from the
@@ -649,27 +647,27 @@ class SuperSignal:
                                N_list = self.data.Nmat,
                                white_noise_params = self.data.fixed_white_noise_params,
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif not self.fixed_wn and not self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif not self.fixed_wn and self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                reff = jnp.concat(self.data.raw_residuals)[:, None],
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif self.fixed_wn and self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                white_noise_params = self.data.fixed_white_noise_params,
                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-            return jit_method(new_func)
+            return jit(new_func)
 
     def add_parameterization(self, model):
         """Add a specific parameterization of the power spectral density based

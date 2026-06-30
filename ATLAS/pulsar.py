@@ -1,5 +1,5 @@
 
-from Atlas.utils import jit, jit_method
+from ATLAS.utils import jit, jit_method
 
 import jax.numpy as jnp
 
@@ -14,6 +14,42 @@ import logging
 
 LINEAR_PARAMS = ['offset','f','dm','fd','jump'] # Matt also said NE_SW, but I dunno what that is
 
+def load_pulsars(par, tim, use_enterprise=True):
+    # par could be a list of par files, a directory string, or a single par file string
+    if isinstance(par, list): # list of par file strings
+        par_files = par
+    elif isinstance(par, str): # Could be a directory string or a single par file string
+        if par.endswith('.par'):
+            par_files = [par] # single par file string
+        else: # directory string
+            par_files = sorted(glob(f'{par}/*.par'))
+    else:
+        raise ValueError('Unrecognized par file input')
+    
+    # tim could be a list of tim files, a directory string, or a single tim file string
+    if isinstance(tim, list): # list of tim file strings
+        tim_files = tim
+    elif isinstance(tim, str): # Could be a directory string or a single tim file string
+        if tim.endswith('.tim'):
+            tim_files = [tim] # single tim file string
+        else: # directory string
+            tim_files = sorted(glob(f'{tim}/*.tim'))
+    else:
+        raise ValueError('Unrecognized tim file input')
+    
+    # Ensure that the pars have corresponding tim files
+    assert len(par_files) == len(tim_files), 'Number of par files must match number of tim files'
+
+    psrs = []
+    for p,t in tqdm(zip(par_files, tim_files), total=len(par_files), desc='Loading pulsars'):
+        pname = p.split('/')[-1].split('_')[0]
+        tname = t.split('/')[-1].split('_')[0]
+        assert pname == tname, f'Par file {p} and tim file {t} do not match'
+
+        psr = Pulsar(p, t, use_enterprise=use_enterprise)
+        psrs.append(psr)
+    
+    return psrs
 
 class Pulsar:
     def __init__(self, par, tim, use_enterprise=True):
@@ -91,46 +127,7 @@ class Pulsar:
     def Mmat_linear_labels(self):
         return [l for l, is_lin in zip(self.Mmat_labels, self.Mmat_is_linear) if is_lin]
 
-    
 
-            
-
-def load_pulsars(par, tim, use_enterprise=True):
-    # par could be a list of par files, a directory string, or a single par file string
-    if isinstance(par, list): # list of par file strings
-        par_files = par
-    elif isinstance(par, str): # Could be a directory string or a single par file string
-        if par.endswith('.par'):
-            par_files = [par] # single par file string
-        else: # directory string
-            par_files = sorted(glob(f'{par}/*.par'))
-    else:
-        raise ValueError('Unrecognized par file input')
-    
-    # tim could be a list of tim files, a directory string, or a single tim file string
-    if isinstance(tim, list): # list of tim file strings
-        tim_files = tim
-    elif isinstance(tim, str): # Could be a directory string or a single tim file string
-        if tim.endswith('.tim'):
-            tim_files = [tim] # single tim file string
-        else: # directory string
-            tim_files = sorted(glob(f'{tim}/*.tim'))
-    else:
-        raise ValueError('Unrecognized tim file input')
-    
-    # Ensure that the pars have corresponding tim files
-    assert len(par_files) == len(tim_files), 'Number of par files must match number of tim files'
-
-    psrs = []
-    for p,t in tqdm(zip(par_files, tim_files), total=len(par_files), desc='Loading pulsars'):
-        pname = p.split('/')[-1].split('_')[0]
-        tname = t.split('/')[-1].split('_')[0]
-        assert pname == tname, f'Par file {p} and tim file {t} do not match'
-
-        psr = Pulsar(p, t, use_enterprise=use_enterprise)
-        psrs.append(psr)
-    
-    return psrs
 
 
 

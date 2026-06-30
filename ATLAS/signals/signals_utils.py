@@ -1,6 +1,6 @@
 
-from Atlas.utils import jit
-from Atlas.utils import F_YEAR_HZ
+from ATLAS.utils import jit
+from ATLAS.utils import F_YEAR_HZ
 
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl

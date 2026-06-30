@@ -8,7 +8,7 @@ import numpy as np
 import jax
 import jax.scipy.linalg as jsl
 import jax.random as jrandom
-from Atlas.utils import jit, jit_method
+from ATLAS.utils import jit, jit_method
 
 jax.config.update('jax_enable_x64', True)
 

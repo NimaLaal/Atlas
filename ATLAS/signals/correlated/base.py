@@ -1,8 +1,7 @@
 
-from Atlas.utils import jit, jit_method
-from Atlas.signals import signals_utils as sutils
-from Atlas.signals import orf_functions as orf_funcs
-from Atlas.signals.base import Signal_Base
+from ATLAS.utils import jit, jit_method
+from ATLAS.signals import signals_utils as sutils
+from ATLAS.signals import orf_functions as orf_funcs
 
 from functools import cached_property, partial
 
@@ -12,7 +11,7 @@ import jax.scipy.linalg as jsl
 import jax.scipy as jsp
 import jax.random as jrandom
 
-class Correlated(Signal_Base):
+class Correlated:
     """A signal class for a common-correlated GWB modeled as a free spectrum.
 
     This signal models the gravitational wave background as a pulsar-correlated 
@@ -171,7 +170,7 @@ class Correlated(Signal_Base):
         self.get_helpers = self._get_helpers()
 
     # Helper methods------------------------------------------------------------
-    @jit_method
+    
     def _get_helpers(self):
         """This helper method returns a jit-ed function to calculate TNT, TNr, rNr, logdet_N objects
         needed for likelihood evaluation. Data analysis settings are extracted from the
@@ -188,27 +187,27 @@ class Correlated(Signal_Base):
                                N_list = self.data.Nmat,
                                white_noise_params = self.data.fixed_white_noise_params,
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif not self.fixed_wn and not self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif not self.fixed_wn and self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                reff = jnp.concat(self.data.raw_residuals)[:, None],
                                )
-            return jit_method(new_func)
+            return jit(new_func)
 
         elif self.fixed_wn and self.fixed_res:
             new_func = partial(self.update_white_matrix_products_unjitted,
                                N_list = self.data.Nmat,
                                white_noise_params = self.data.fixed_white_noise_params,
                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-            return jit_method(new_func)
+            return jit(new_func)
 
     @jit_method
     def get_basis(self):
@@ -230,6 +229,34 @@ class Correlated(Signal_Base):
 
     # Helper methods------------------------------------------------------------
 
+    def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
+        """Get the helper objects for likelihood evaluation.
+
+        This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
+        needed for the likelihood evaluation and posterior drawing. The TNT, TNr, rNr, and logdet_N
+        are computed as:
+        - TNT = T^T N^{-1} T
+        - TNr = T^T N^{-1} r
+        where T is the Fourier design matrix for each pulsar, N is the white noise
+        covariance matrix for each pulsar, and r is the effective residuals.
+
+        Parameters
+        ----------
+        N_list : list of Atlas.nMatrix.base.Base_TOA_cov
+            The white noise covariance matrices for each pulsar.
+        reff : list of arrays
+            The effective residuals for each pulsar. [npsr, npsr_toas]
+
+        Returns
+        -------
+        tuple
+            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
+            [npsr, nmode, nmode], [npsr, nmode]
+        """
+        return N_list.get_red_helpers(red_noise_basis = self.get_Fmat_concat, 
+                                      residuals = reff, 
+                                      white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
+                                      
     @jit_method
     def get_phi_diag(self, params):
         """Get the diagonal of the phi matrix from the parameters. [nmodes]

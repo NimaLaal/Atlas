@@ -1,7 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 import inspect
-import Atlas.psd_functions as psd_functions
+import ATLAS.psd_functions as psd_functions
 
 # non-GWB Model Definition Utilities--------------------------------------------------------------
 

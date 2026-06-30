@@ -1,6 +1,6 @@
 
-from Atlas.utils import get_pulsar_timespan
-from Atlas.utils import jit, jit_method
+from ATLAS.utils import get_pulsar_timespan
+from ATLAS.utils import jit, jit_method
 
 import jax.numpy as jnp
 
@@ -35,9 +35,12 @@ class PTA_Data:
         as the difference between the maximum and minimum TOAs for each pulsar. [npsrs]
     """
 
-    def __init__(self, psrs, fixed_wn=False, 
-                fixed_white_noise_params = None,
-                linear_timing = False, # Linearized M matrix
+    def __init__(self, 
+                psrs, 
+                fixed_white_noise_params = jnp.array([False]),
+                linear_timing = False,
+                marg_timing = False,
+                diag_white_cov = False,
                 fixed_res = False): 
         """The constructor for the PTA_Data class
 
@@ -55,8 +58,7 @@ class PTA_Data:
         self.npsrs = len(psrs) # Number of pulsars
         self.npairs = self.npsrs * (self.npsrs - 1) // 2 # Number of unique pulsar pairs
         self.psr_names = [p.name for p in psrs] # List of pulsar names
-        self.fixed_wn = fixed_wn # Whether the white noise matrices are fixed (bool)
-        self.fixed_white_noise_params = fixed_white_noise_params
+
         # (jagged) List of each pulsar's TOAs (npsrs, ntoas)
         self.toas = [jnp.array(p.toas) for p in psrs]
         # Array of pulsar positions in unit-Cartesian coordinates (npsrs, 3)
@@ -69,10 +71,21 @@ class PTA_Data:
 
         # Raw residuals - List of each pulsar's residuals (npsrs, npsr_toas)
         self.raw_residuals = [jnp.array(p.residuals) for p in psrs]
-        self.fixed_res = fixed_res
-        
-        self.linear_timing = linear_timing
 
+        # Linear Timing Design Matrix
+        self.Mmat = [psr.Mmat for psr in psrs]
+
+        ######################PTA Data Analysis General Settings######################
+        # Whether the white noise matrices are fixed (bool)
+        self.fixed_wn = True if fixed_white_noise_params.any() else False 
+        self.fixed_white_noise_params = fixed_white_noise_params
+        # No residual subtraction?
+        self.fixed_res = fixed_res
+        # Linear (M \epsilon) appraoch to modeling the timing model errors
+        self.linear_timing = linear_timing
+        self.diag_white_cov = diag_white_cov
+        self.marg = marg_timing
+        
     def add_white_noise_cov(self, white_noise_cov):
         self.Nmat = white_noise_cov
 

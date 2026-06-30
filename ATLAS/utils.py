@@ -5,7 +5,7 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 import jax
 import inspect
-import Atlas.psd_functions as psd_functions
+import ATLAS.psd_functions as psd_functions
 
 # This file contains utility functions that are used across the entire codebase.
 # Utility functions which are used withiin models are instead located in 

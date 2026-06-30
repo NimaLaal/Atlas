@@ -1,13 +1,15 @@
-from Atlas.utils import jagged2padded
-from Atlas.utils import jit
+from ATLAS.utils import jagged2padded, jit_method
+from ATLAS.utils import jit
 
 import numpy as np
 import itertools
 from tqdm import tqdm
+from tqdm.auto import trange
 
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
 import jax.scipy.linalg as jsl
+from functools import partial
 
 import numpyro
 import numpyro.distributions as dist
@@ -204,8 +206,16 @@ class DiagSinglePulsarWhiteCov:
         self.toaerrs = psr.toaerrs
         self.marg = marg
         self.Mmat = _timing_model_svd(psr.Mmat)
+        self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
 
-    @jit
+        #jitted function that returns (left.T N right)
+        self.solve = self._solve_func_maker(return_logdet = False)
+        #unmarg solver to be used within marg solver function later
+        self.solve_unmarg = partial(self._solve_unmarg, return_logdet = False) 
+        #jitted function that returns (left.T N right, logDetN)
+        self.solve_with_logdet = self._solve_func_maker(return_logdet = True)
+
+    @jit_method
     def get_nvec_jvec(self):
         """Compute nvec.
 
@@ -222,8 +232,7 @@ class DiagSinglePulsarWhiteCov:
         jvec = None
         return nvec, jvec
 
-    @jit
-    def solve(self, white_noise_helpers, left, right):
+    def _solve_func_maker(self, return_logdet):
         """Solve the linear system left^T N^{-1} right.
 
         This method implements the solution to the linear system left^T N^{-1} right
@@ -247,12 +256,14 @@ class DiagSinglePulsarWhiteCov:
             The solution to the linear system. [N, M]
         """
         if self.marg:
-            return self.solve_marg(white_noise_helpers, left, right)
+            new_func = partial(self._solve_marg, return_logdet = return_logdet)
+            return jit(new_func)
         else:
-            return self.solve_unmarg(white_noise_helpers, left, right)
+            new_func = partial(self._solve_unmarg, return_logdet = return_logdet)
+            return jit(new_func)
 
-    @jit
-    def solve_unmarg(self, white_noise_helpers, left, right):
+
+    def _solve_unmarg(self, white_noise_helpers, left, right, return_logdet):
         """Solve the linear system left^T N^{-1} right.
 
         This method implements the solution to the linear system left^T N^{-1} right
@@ -279,10 +290,13 @@ class DiagSinglePulsarWhiteCov:
         # Only the diagonal! (L^T Ainv R)
         LNR = left.T @ (1/nvec[:,None] * right) # (N, M)
 
-        return LNR
+        if return_logdet:
+            return LNR, self.logdet_unmarg(white_noise_helpers)
+        else:
+            return LNR
 
-    @jit
-    def solve_marg(self, white_noise_helpers, left, right):
+
+    def _solve_marg(self, white_noise_helpers, left, right, return_logdet):
         """Solve the linear system left^T D^{-1} right. 
 
         This method solves the linear equation (left).T @ D^{-1} @ right, where
@@ -307,18 +321,39 @@ class DiagSinglePulsarWhiteCov:
         """
         # Solve L^T N^{-1} R - L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
         # Term1 = L^T N^{-1} R
-        term1 = self.solve(white_noise_helpers, left, right)
+        term1 = self.solve_unmarg(white_noise_helpers, left, right)
 
         # Term2 = L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
-        MNM = self.solve(white_noise_helpers, self.Mmat, self.Mmat)
-        LNM = self.solve(white_noise_helpers, left, self.Mmat)
-        MNR = self.solve(white_noise_helpers, self.Mmat, right)
+        MNM = self.solve_unmarg(white_noise_helpers, self.Mmat, self.Mmat)
+        LNM = self.solve_unmarg(white_noise_helpers, left, self.Mmat)
+        MNR = self.solve_unmarg(white_noise_helpers, self.Mmat, right)
             
         cf = jsl.cho_factor(MNM)
         term2 = LNM @ jsl.cho_solve(cf, MNR)
 
-        return term1 - term2
+        if not return_logdet:
+            return term1 - term2
+        else:
+            return term1 - term2, self.logdet_unmarg(white_noise_helpers)\
+                                 + 2 * jnp.sum(jnp.log(cf[0].diagonal())) + self.Mprior
 
+    @jit_method
+    def logdet_unmarg(self, white_noise_helpers):
+        """Compute the log-determinant of the white-noise covariance matrix.
+
+        Parameters
+        ----------
+        helpers : tuple
+            Tuple ``(nvec, jvec)`` containing the diagonal and ECORR
+            covariance components.
+
+        Returns
+        -------
+        float
+            The log-determinant of the covariance matrix.
+        """
+        nvec, jvec = white_noise_helpers
+        return jnp.sum(jnp.log(nvec))
 
 class SinglePulsarWhiteCov:
     """A complete TOA covariance matrix with EFAC, EQUAD, and ECORR.
@@ -412,6 +447,12 @@ class SinglePulsarWhiteCov:
         self.lower_log10ecorr = log10ecorr_prior_bounds[0]
         self.upper_log10ecorr = log10ecorr_prior_bounds[1]
 
+        #jitted function that returns (left.T N right)
+        self.solve = self._solve_func_maker(return_logdet = False)
+        #unmarg solver to be used within marg solver function later
+        self.solve_unmarg = partial(self._solve_unmarg, return_logdet = False) 
+        #jitted function that returns (left.T N right, logDetN)
+        self.solve_with_logdet = self._solve_func_maker(return_logdet = True)
 
     def params_dict_to_vector(self, params):
         """Extract white noise params from a dict into a flat JAX array.
@@ -434,7 +475,6 @@ class SinglePulsarWhiteCov:
         v = jnp.array([params[n] for n in names])
         return v
     
-
     def make_numpyro_prior(self, uniform_efac = False):
         """Sample white-noise parameters using NumPyro priors.
 
@@ -497,7 +537,6 @@ class SinglePulsarWhiteCov:
             [self.upper_log10ecorr] * len(self.backends)
         )
         return low, high
-
 
     def prior_draw(self, uniform_efac = True):
         """Draw white-noise parameters from the prior distribution.
@@ -628,8 +667,7 @@ class SinglePulsarWhiteCov:
 
         return nvec, jvec
 
-    @jit
-    def solve(self, white_noise_helpers, left, right):
+    def _solve_func_maker(self, return_logdet):
         """Solve the linear system left^T N^{-1} right.
 
         This method implements the solution to the linear system left^T N^{-1} right
@@ -653,12 +691,13 @@ class SinglePulsarWhiteCov:
             The solution to the linear system. [N, M]
         """
         if self.marg:
-            return self.solve_marg(white_noise_helpers, left, right)
+            new_func = partial(self._solve_marg, return_logdet = return_logdet)
+            return jit(new_func)
         else:
-            return self.solve_unmarg(white_noise_helpers, left, right)
+            new_func = partial(self._solve_unmarg, return_logdet = return_logdet)
+            return jit(new_func)
 
-    @jit(static_argnums = 0)
-    def solve_unmarg(self, white_noise_helpers, left, right):
+    def _solve_unmarg(self, white_noise_helpers, left, right, return_logdet):
         """Solve the linear system ``left^T N^{-1} right``.
 
         This method evaluates
@@ -703,10 +742,12 @@ class SinglePulsarWhiteCov:
         
         solve_result = term1 - term2
 
-        return solve_result, self.logdet_unmarg(white_noise_helpers)
-
-    @jit
-    def solve_marg(self, white_noise_helpers, left, right):
+        if return_logdet:
+            return solve_result, self.logdet_unmarg(white_noise_helpers)
+        else:
+            return solve_result
+   
+    def _solve_marg(self, white_noise_helpers, left, right, return_logdet):
         """Solve a linear equation (left).T @ D^{-1} @ right.
 
         This method solves the linear equation (left).T @ D^{-1} @ right, where
@@ -731,22 +772,25 @@ class SinglePulsarWhiteCov:
         """
         # Solve L^T N^{-1} R - L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
         # Term1 = L^T N^{-1} R
-        term1 = self.solve(white_noise_helpers, left, right)
+        term1 = self.solve_unmarg(white_noise_helpers, left, right)
 
         # Term2 = L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
-        MNM = self.solve(white_noise_helpers, self.Mmat, self.Mmat)
-        LNM = self.solve(white_noise_helpers, left, self.Mmat)
-        MNR = self.solve(white_noise_helpers, self.Mmat, right)
+        MNM = self.solve_unmarg(white_noise_helpers, self.Mmat, self.Mmat)
+        LNM = self.solve_unmarg(white_noise_helpers, left, self.Mmat)
+        MNR = self.solve_unmarg(white_noise_helpers, self.Mmat, right)
 
         # The covariance matrix MNM can be ill-conditioned, we should stabilize it
         cf = jsl.cho_factor(MNM)
         term2 = LNM @ jsl.cho_solve(cf, MNR)
 
-        logdet = self.logdet_unmarg(white_noise_helpers) + 2 * jnp.sum(jnp.log(cf[0].diagonal())) + self.Mprior
+        if return_logdet:
+            logdet = self.logdet_unmarg(white_noise_helpers)\
+                 + 2 * jnp.sum(jnp.log(cf[0].diagonal())) + self.Mprior
+            return term1 - term2, logdet
+        else:
+            return term1 - term2
 
-        return term1 - term2, logdet
-
-    @jit(static_argnums = 0)
+    @jit_method
     def logdet_unmarg(self, white_noise_helpers):
         """Compute the log-determinant of the white-noise covariance matrix.
 
@@ -780,8 +824,6 @@ class SinglePulsarWhiteCov:
 
         return logdet_D + logdet_corr
 
-
-@register_pytree_node_class
 class WhiteCov:
     """The Multi-pulsar white noise covariance matrix handler (also works with one pulsar!).
 
@@ -815,7 +857,8 @@ class WhiteCov:
         Per-pulsar covariance matrix objects (each itself a pytree).
     """
 
-    def __init__(self, psrs, data, marg = False, diag_white_cov = False,
+    def __init__(self, 
+                data,
                 efac_prior_bounds = (0.01, 10), # (low, high)
                 efac_prior_normal = (1., 0.25), # (mean, std)
                 log10equad_prior_bounds = (-9, -5), # (low, high)
@@ -834,18 +877,21 @@ class WhiteCov:
         diag_white_cov : bool
             do you want simple no backend diagonal white noise?
         """
+        # Extracting the data analysis settings
         self.data = data
-        self.npulsars = len(psrs)
+        self.diag_white_cov = self.data.diag_white_cov
+        self.marg = self.data.marg
+        self.npulsars = self.data.npsrs
 
         self.cov_matrices = []
-        pbar = tqdm(range(self.npulsars))
+        pbar = trange(self.npulsars)
         for pidx in pbar:
-            psr = data.psrs[pidx]
+            psr = self.data.psrs[pidx]
             pbar.set_description(f"Construncting the white noise cov matrix for {psr.name}")
-            if not diag_white_cov:
+            if not self.diag_white_cov:
                 self.cov_matrices.append(SinglePulsarWhiteCov(
                                                             psr, 
-                                                            marg = marg, 
+                                                            marg = self.marg, 
                                                             efac_prior_bounds = efac_prior_bounds,
                                                             efac_prior_normal = efac_prior_normal,
                                                             log10equad_prior_bounds = log10equad_prior_bounds,
@@ -853,17 +899,18 @@ class WhiteCov:
                                                             ))
             else:
                 self.cov_matrices.append(DiagSinglePulsarWhiteCov(psr, 
-                                                            marg = marg
+                                                            marg = self.marg
                                                             ))
-        self.data.add_white_noise_cov(self.cov_matrices)
 
-        self.ntoas_per_psr = tuple(len(psr.toas) for psr in psrs)
+        self.ntoas_per_psr = tuple(len(psr.toas) for psr in self.data.psrs)
         self.total_ntoas = sum(self.ntoas_per_psr)
         # Precompute static slice boundaries for each pulsar in the global array.
         cumulative = np.cumsum([0] + list(self.ntoas_per_psr))
         self.toa_starts = tuple(int(c) for c in cumulative[:-1])
         self.toa_ends   = tuple(int(c) for c in cumulative[1:])
         self.pulsar_idxs = jnp.arange(self.npulsars)
+
+        self.data.add_white_noise_cov(self)
 
     # ------------------------------------------------------------------
     # Parameter interface
@@ -997,59 +1044,51 @@ class WhiteCov:
         log_det_N = 0
         rNr = 0
         wn_params_start_idx = 0
-        for pidx, cov, start, end in zip(self.pulsar_idxs, 
-                                        self.cov_matrices, 
-                                        self.toa_starts, 
-                                        self.toa_ends):
 
-            wn_params_end_idx = wn_params_start_idx + 3 * cov.n_backends
-            wn_params = white_noise_params[wn_params_start_idx: wn_params_end_idx]
-            wn_params_start_idx = wn_params_end_idx
+        if self.diag_white_cov:
+            for pidx, cov, start, end in zip(self.pulsar_idxs, 
+                                            self.cov_matrices, 
+                                            self.toa_starts, 
+                                            self.toa_ends):
 
-            white_noise_helper = cov.get_nvec_jvec(wn_params)
-            F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
-            r_p  = residuals[start:end]                             # [n_p]
-            # One solve per pulsar: right = [T_p | r_p]
-            Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
-            res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
+                white_noise_helper = cov.get_nvec_jvec()
+                F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
+                r_p  = residuals[start:end]                             # [n_p]
+                # One solve per pulsar: right = [T_p | r_p]
+                Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
+                res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
 
-            FNF = FNF.at[pidx].set(res[:, :N_basis])
-            FNr = FNr.at[pidx].set(res[:, N_basis])
+                FNF = FNF.at[pidx].set(res[:, :N_basis])
+                FNr = FNr.at[pidx].set(res[:, N_basis])
 
-            x, y = cov.solve(white_noise_helper, r_p[:, None], r_p[:, None])
-            rNr += x
-            log_det_N += y
-        
-        return FNF, FNr, rNr[0, 0], log_det_N
+                x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
+                rNr += x
+                log_det_N += y
+            
+            return FNF, FNr, rNr[0, 0], log_det_N
 
+        else:
+            for pidx, cov, start, end in zip(self.pulsar_idxs, 
+                                            self.cov_matrices, 
+                                            self.toa_starts, 
+                                            self.toa_ends):
 
-    # ------------------------------------------------------------------
-    # JAX pytree interface
-    # ------------------------------------------------------------------
+                wn_params_end_idx = wn_params_start_idx + 3 * cov.n_backends
+                wn_params = white_noise_params[wn_params_start_idx: wn_params_end_idx]
+                wn_params_start_idx = wn_params_end_idx
 
-    def tree_flatten(self):
-        # Children: the list of per-pulsar covariance objects.
-        # Each Fix_TM_TOA_cov_full is itself a pytree, so JAX will recurse
-        # into them automatically.
-        children = tuple(self.cov_matrices)
-        # Aux data: everything static (shapes / slice boundaries).
-        aux_data = (
-            self.npulsars,
-            self.ntoas_per_psr,
-            self.total_ntoas,
-            self.toa_starts,
-            self.toa_ends,
-        )
-        return children, aux_data
+                white_noise_helper = cov.get_nvec_jvec(wn_params)
+                F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
+                r_p  = residuals[start:end]                             # [n_p]
+                # One solve per pulsar: right = [T_p | r_p]
+                Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
+                res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
 
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        npulsars, ntoas_per_psr, total_ntoas, toa_starts, toa_ends = aux_data
-        obj = cls.__new__(cls)
-        obj.npulsars       = npulsars
-        obj.ntoas_per_psr  = ntoas_per_psr
-        obj.total_ntoas    = total_ntoas
-        obj.toa_starts     = toa_starts
-        obj.toa_ends       = toa_ends
-        obj.cov_matrices   = list(children)
-        return obj
+                FNF = FNF.at[pidx].set(res[:, :N_basis])
+                FNr = FNr.at[pidx].set(res[:, N_basis])
+
+                x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
+                rNr += x
+                log_det_N += y
+            
+            return FNF, FNr, rNr[0, 0], log_det_N
