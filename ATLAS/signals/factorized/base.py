@@ -8,7 +8,6 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 
 from functools import partial
-import random
 
 class Red:
     """A signal class for a factorized likelihood (not prior).
@@ -517,7 +516,6 @@ class Red:
         halflog10_rho = 0.5*jnp.log10(new_params).reshape(-1, self.ndraws) # [npsr*nfreqs, nfreqs]
         return halflog10_rho.T # [ndraws, nfreqs*npsrs]
         
-
 class SuperSignal:
     """A signal class for a pulsar-independent free spectrum red noise (IRN) signal.
 
@@ -645,20 +643,40 @@ class SuperSignal:
         
 
     def padd_tm_design_matrix(self):
+        """        
+        Padd zeros to the timing model design matrix in places where 
+        there is no parameter.
 
+        Returns:
+            list: padded timing model design matrix in the shape of
+            (n_psr, linear_timing_model_size)
+        """        
         padded_list = []
         for M in self.Mmat:
             padded = jnp.zeros((M.shape[0], self.linear_timing_model_size))
-            # padded = jrandom.normal(jrandom.key(random.randint(0, 10_000)), (M.shape[0], self.linear_timing_model_size)) * 1e-30
             padded = padded.at[:, :M.shape[1]].set(M)
             padded_list.append(padded)
-
         return padded_list
     
     def Tmaker(self, 
                 Fmats, 
                 padd_tm_design_matrix = True):
+        """
+        Build the T-matrix as the concatenated basis of 
+        timing and red noise (in that order!). There is an
+        option to pad to the timing basis of each pulsar with
+        zeros so that all timing design matricies have the same size.
+        This is more GPU friendly!
 
+        Args:
+            Fmats array: the red noise basis matrix (F-mat) for all pulsars
+            padd_tm_design_matrix (bool, optional): Do you want to pad 
+            the timing design matrix with zeros to extend its size to a 
+            common size across pulsar? Defaults to True.
+
+        Returns:
+            aray: The T-matrix as[M, F]
+        """                
         if padd_tm_design_matrix:
             Mmats  = self.padd_tm_design_matrix()
         else:
@@ -964,11 +982,14 @@ class SuperSignal:
             aG = coeff[:, self.linear_timing_model_size:] #[npsr, 2 * nfreq, 1]
             lnprior_value = -0.5 * ((aG.transpose(1, 2, 0) @ phiinvs @ aG.transpose(1, 0, 2)).sum() + logdet_phimat)
 
-        # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
-        # these parameters do not impact the likelihood, prior, and are uncorrelated with all other parameters
-        # so this should not effect parameter estimation, but merely provides some curvature for HMC to latch
-        # onto when sampling 
-        padded_logpdf = -0.5 * jnp.sum((self._pad_mask * coeff[:, :self.linear_timing_model_size, 0])**2)
+        if self.linear_timing and not self.marg_tm:
+            # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
+            # these parameters do not impact the likelihood, prior, and are uncorrelated with all other parameters
+            # so this should not effect parameter estimation, but merely provides some curvature for HMC to latch
+            # onto when sampling 
+            padded_logpdf = -0.5 * jnp.sum((self._pad_mask * coeff[:, :self.linear_timing_model_size, 0])**2)
+        else:
+            padded_logpdf = 0.
 
         log_density = lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N) + padded_logpdf
 
