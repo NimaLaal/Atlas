@@ -634,13 +634,22 @@ class SuperSignal:
 
         # Hidden attributes if needed-------------------------------------------
         self._diag_idx = jnp.arange(self.nmodes)
+        
+        # (npsr, linear_timing_model_size) with ones where padded, zero else
+        self._pad_mask_list = []
+        for M in self.Mmat:
+            mask_per_psr = jnp.ones((self.linear_timing_model_size,))
+            mask_per_psr = mask_per_psr.at[:M.shape[1]].set(0.)
+            self._pad_mask_list.append(mask_per_psr)
+        self._pad_mask = jnp.array(self._pad_mask_list)
+        
 
     def padd_tm_design_matrix(self):
 
         padded_list = []
         for M in self.Mmat:
-            # padded = jnp.zeros((M.shape[0], self.linear_timing_model_size))
-            padded = jrandom.normal(jrandom.key(random.randint(0, 10_000)), (M.shape[0], self.linear_timing_model_size)) * 1e-30
+            padded = jnp.zeros((M.shape[0], self.linear_timing_model_size))
+            # padded = jrandom.normal(jrandom.key(random.randint(0, 10_000)), (M.shape[0], self.linear_timing_model_size)) * 1e-30
             padded = padded.at[:, :M.shape[1]].set(M)
             padded_list.append(padded)
 
@@ -648,8 +657,7 @@ class SuperSignal:
     
     def Tmaker(self, 
                 Fmats, 
-                padd_tm_design_matrix = True, 
-                padd_value = 0):
+                padd_tm_design_matrix = True):
 
         if padd_tm_design_matrix:
             Mmats  = self.padd_tm_design_matrix()
@@ -699,8 +707,7 @@ class SuperSignal:
 
         if self.linear_timing:
             T = self.Tmaker(Fmats = shared_signals[shared_idx].get_basis(), 
-                padd_tm_design_matrix = True, 
-                padd_value = 0)
+                padd_tm_design_matrix = True)
         else:
             T = shared_signals[shared_idx].get_basis()
         shared_Fmat = (
@@ -927,6 +934,8 @@ class SuperSignal:
         if self.linear_timing and not self.marg_tm:
             phiinvs_diags_ltm = jnp.full(shape = (self.nmodes, self.npsrs), fill_value = self.lowest_value_eq_to_zero)
             phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
+            # set prior variance of padded parameters to one for stable transformation
+            phiinvs_diags = phiinvs_diags.at[:self.linear_timing_model_size, :].add(self._pad_mask.T)
 
         # Posterior precision Cholesky (cho_factor equivalent), batched over pulsars
         Sigma_inv = TNT.at[:, self._diag_idx , self._diag_idx ].add(phiinvs_diags.T)     # [npsr, nmodes, nmodes]
@@ -955,7 +964,15 @@ class SuperSignal:
             aG = coeff[:, self.linear_timing_model_size:] #[npsr, 2 * nfreq, 1]
             lnprior_value = -0.5 * ((aG.transpose(1, 2, 0) @ phiinvs @ aG.transpose(1, 0, 2)).sum() + logdet_phimat)
 
-        return lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N), coeff[..., 0]
+        # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
+        # these parameters do not impact the likelihood, prior, and are uncorrelated with all other parameters
+        # so this should not effect parameter estimation, but merely provides some curvature for HMC to latch
+        # onto when sampling 
+        padded_logpdf = -0.5 * jnp.sum((self._pad_mask * coeff[:, :self.linear_timing_model_size, 0])**2)
+
+        log_density = lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N) + padded_logpdf
+
+        return log_density, coeff[..., 0]
 
     def ln_likelihood_curn(self, helpers, params):
         """Get the Fourier coefficient marginalized likelihood function for 
