@@ -1030,7 +1030,7 @@ class WhiteCov:
                 x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
                 rNr += x
                 log_det_N += y
-            
+
             return FNF, FNr, rNr[0, 0], log_det_N
 
         else:
@@ -1056,5 +1056,93 @@ class WhiteCov:
                 x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
                 rNr += x
                 log_det_N += y
-            
+
             return FNF, FNr, rNr[0, 0], log_det_N
+
+    def get_red_det_helpers(self, red_noise_basis, det_signal_basis,
+                            residuals, white_noise_params):
+        """Compute the red-noise *and* deterministic-signal N^{-1} helpers per pulsar.
+
+        This extends :meth:`get_red_helpers` with a second (independently sized)
+        design matrix ``det_signal_basis`` (denoted "TD") for a deterministic
+        signal. In addition to the usual red-noise helpers it returns every
+        N^{-1}-weighted cross product between the red-noise basis ``T``, the
+        deterministic basis ``TD``, and the residuals ``r``.
+
+        Parameters
+        ----------
+        red_noise_basis : array [total_ntoas, N_basis]
+            Global red-noise (Fourier / T-matrix) design matrix.
+        det_signal_basis : array [total_ntoas, N_det_basis]
+            Global deterministic-signal design matrix. May have a different
+            number of columns than ``red_noise_basis``.
+        residuals : array [total_ntoas]
+            Global residuals vector.
+        white_noise_params : array
+            The global (concatenated) white noise values.
+
+        Returns
+        -------
+        TNT : array [npulsars, N_basis, N_basis]
+            T^T N^{-1} T for each pulsar.
+        TNr : array [npulsars, N_basis]
+            T^T N^{-1} r for each pulsar.
+        rNr : array [1]
+            r^T N^{-1} r summed over pulsars.
+        logdet_N : array [1]
+            log|N| summed over pulsars.
+        TDNTD : array [npulsars, N_det_basis, N_det_basis]
+            TD^T N^{-1} TD for each pulsar.
+        TDNr : array [npulsars, N_det_basis]
+            TD^T N^{-1} r for each pulsar.
+        TNTD : array [npulsars, N_basis, N_det_basis]
+            T^T N^{-1} TD for each pulsar.
+        """
+        N_basis = red_noise_basis.shape[1]
+        N_det_basis = det_signal_basis.shape[1]
+        Ntot = N_basis + N_det_basis
+
+        TNT   = jnp.zeros((self.npulsars, N_basis, N_basis))
+        TNr   = jnp.zeros((self.npulsars, N_basis))
+        TDNTD = jnp.zeros((self.npulsars, N_det_basis, N_det_basis))
+        TDNr  = jnp.zeros((self.npulsars, N_det_basis))
+        TNTD  = jnp.zeros((self.npulsars, N_basis, N_det_basis))
+
+        logdet_N = 0
+        rNr = 0
+        wn_params_start_idx = 0
+
+        for pidx, cov, start, end in zip(self.pulsar_idxs,
+                                         self.cov_matrices,
+                                         self.toa_starts,
+                                         self.toa_ends):
+
+            if self.diag_white_cov:
+                white_noise_helper = cov.get_nvec_jvec()
+            else:
+                wn_params_end_idx = wn_params_start_idx + 3 * cov.n_backends
+                wn_params = white_noise_params[wn_params_start_idx: wn_params_end_idx]
+                wn_params_start_idx = wn_params_end_idx
+                white_noise_helper = cov.get_nvec_jvec(wn_params)
+
+            T_p  = red_noise_basis[start:end, :]                   # [n_p, N_basis]
+            TD_p = det_signal_basis[start:end, :]                  # [n_p, N_det_basis]
+            r_p  = residuals[start:end]                            # [n_p]
+
+            # Stack once: M_p = [T_p | TD_p | r_p]  -> [n_p, Ntot + 1]
+            M_p = jnp.concatenate([T_p, TD_p, r_p[:, None]], axis=1)
+
+            # One solve per pulsar gives the full symmetric Gram matrix + logdet.
+            # G = M_p^T N_p^{-1} M_p  -> [Ntot + 1, Ntot + 1]
+            G, y = cov.solve_with_logdet(white_noise_helper, M_p, M_p)
+
+            TNT   = TNT.at[pidx].set(G[:N_basis, :N_basis])
+            TNTD  = TNTD.at[pidx].set(G[:N_basis, N_basis:Ntot])
+            TDNTD = TDNTD.at[pidx].set(G[N_basis:Ntot, N_basis:Ntot])
+            TNr   = TNr.at[pidx].set(G[:N_basis, Ntot])
+            TDNr  = TDNr.at[pidx].set(G[N_basis:Ntot, Ntot])
+
+            rNr += G[Ntot, Ntot]
+            logdet_N += y
+
+        return TNT, TNr, rNr, logdet_N, TDNTD, TDNr, TNTD
