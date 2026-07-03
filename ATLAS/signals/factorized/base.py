@@ -642,6 +642,8 @@ class SuperSignal:
             mask_per_psr = mask_per_psr.at[:M.shape[1]].set(0.)
             self._pad_mask_list.append(mask_per_psr)
         self._pad_mask = jnp.array(self._pad_mask_list)
+        
+        self.eps_diag_idx = jnp.arange(self.linear_timing_model_size)
 
     @jit_method   
     def update_red_basis(self, chrom_index):
@@ -1063,6 +1065,7 @@ class SuperSignal:
         lnlike = 0.5 * (expvals - logdet_Sigma - logdet_phis.sum()) # scalar
         return lnlike - 0.5 * (rNr + logdet_N)
     
+
     @jit_method
     def lnposterior_partial_marg_reparam(self,
                                         helpers,
@@ -1091,21 +1094,23 @@ class SuperSignal:
             the log-determinant of the Jacobian of the coordinate transformation [float].
         """ 
         # ── Slice TNT/TNr into GWB and IRN blocks ────────────────────────────────
-        TNT, TNr, rNr, logdet_N = helpers
-        full_gwb_phi, gwb_phi_diag, psr_phi_diags = self.model.partial_reparam_helper(red_params)
+        # TNT, TNr, rNr, logdet_N = helpers
+        TNT_b, TNr_b, rNr, logdet_N, TNT_p, TNr_p, T_bp = helpers
+
+        full_gwb_phi, gwb_phi_diag, psr_phi_diags = self.model.partial_reparm_helper(red_params)
         gwb_phi_diag = jnp.repeat(gwb_phi_diag, 2, axis = 0)[:, 0] #[nmode_b]
         psr_phi_diags = jnp.repeat(psr_phi_diags.T, 2, axis = 1) #[npsr, nmode_p]
-
+    
         LG = jsl.cho_factor(full_gwb_phi, lower=True)                     #[nfreqs,npsrs,npsrs]
         gwb_phi_inv = jnp.repeat(jsl.cho_solve(LG, self.model._eye), 2, axis = 0)
 
 
-        # TODO: CHECK THESE SLICINGS!!!
-        TNT_b = TNT[:, self.gwb_idxs, self.gwb_idxs]  # [npsr, nmode_b, nmode_b], [npsr, nmode_b]
-        TNr_b = TNr[:, self.gwb_idxs] 
-        TNT_p = TNT[:, self.non_gwb_idxs, self.non_gwb_idxs]  # [npsr, nmode_p, nmode_p], [npsr, nmode_p]
-        TNr_p = TNr[:, self.non_gwb_idxs]
-        T_bp = TNT[:, self.gwb_idxs, self.non_gwb_idxs]         # [npsr, nmode_b, nmode_p]
+        # # TODO: CHECK THESE SLICINGS!!!
+        # TNT_b = TNT[:, self.gwb_idxs, self.gwb_idxs]  # [npsr, nmode_b, nmode_b], [npsr, nmode_b]
+        # TNr_b = TNr[:, self.gwb_idxs] 
+        # TNT_p = TNT[:, self.non_gwb_idxs, self.non_gwb_idxs]  # [npsr, nmode_p, nmode_p], [npsr, nmode_p]
+        # TNr_p = TNr[:, self.non_gwb_idxs]
+        # T_bp = TNT[:, self.gwb_idxs, self.non_gwb_idxs]         # [npsr, nmode_b, nmode_p]
 
         (npsrs, nmodes_b, nmodes_p) = T_bp.shape
 
@@ -1146,8 +1151,22 @@ class SuperSignal:
         # -------------------------------------------------------------------------
         # GWB block: build Sigma_b_inv and GWB prior arrays
         # -------------------------------------------------------------------------
-        gwb_phi_inv_spec = jnp.diag(1. / gwb_phi_diag)                          # [nmode_b, nmode_b]
-        gwb_sigma_b_inv = TNT_b + gwb_phi_inv_spec[None] - T_bp_Sigma_p_T_bpT         # [npsr, nmode_b, nmode_b]
+        gwb_phi_inv_spec = jnp.diag(1. / gwb_phi_diag) # [nmode_b, nmode_b]
+
+        # phiinvs_diags_ltm = jnp.full(shape = TNT_b.shape, fill_value = self.lowest_value_eq_to_zero)
+        phiinvs_diags_ltm = -T_bp_Sigma_p_T_bpT + self.lowest_value_eq_to_zero
+        # print(phiinvs_diags_ltm.shape)
+        # print(gwb_phi_inv_spec[None].shape)
+        # print(T_bp_Sigma_p_T_bpT.shape)
+        phiinvs_diags = phiinvs_diags_ltm.at[:, self.linear_timing_model_size:, self.linear_timing_model_size:].add(gwb_phi_inv_spec[None])
+        # set prior variance of padded parameters to one for stable transformation
+        phiinvs_diags = phiinvs_diags.at[:, self.eps_diag_idx, self.eps_diag_idx].add(self._pad_mask)
+
+        # TNT_b : [npsr, ntiming + ncrn, ntiming + ncrn]
+        # gwb_phi_inv_spec : [ncrn, ncrn]
+        # T_bp_Sigma_p_T_bpT : [npsr, ncrn, ncrn]
+        # gwb_sigma_b_inv = TNT_b + gwb_phi_inv_spec[None] - T_bp_Sigma_p_T_bpT         # [npsr, nmode_b, nmode_b]
+        gwb_sigma_b_inv = TNT_b + phiinvs_diags
 
         # Effective GWB data vector: w_b = r_b - T_bp Sigma_p r_p
         w_b = TNr_b - T_bp_Sigma_p_r_p  # [npsr, nmode_b]
@@ -1176,19 +1195,29 @@ class SuperSignal:
         # -------------------------------------------------------------------------
         # Log-likelihood (marginalised over a_p)
         # -------------------------------------------------------------------------
-        ln_likelihood_val  = -0.5 * jnp.sum(a_b.mT @ (gwb_sigma_b_inv - gwb_phi_inv_spec[None]) @ a_b)
-        ln_likelihood_val +=        jnp.sum(a_b[..., 0] * w_b)
+        a_G = a_b[:, self.linear_timing_model_size:]
+        ln_likelihood_val  = -0.5 * jnp.sum(a_G.mT @ (gwb_sigma_b_inv[:, self.linear_timing_model_size:, self.linear_timing_model_size:] - gwb_phi_inv_spec[None]) @ a_G)
+        ln_likelihood_val +=        jnp.sum(a_G[..., 0] * w_b[:, self.linear_timing_model_size:])
         ln_likelihood_val +=  0.5 * jnp.sum(r_p_Sigma_p_r_p)
         ln_likelihood_val += -0.5 * psr_phi_p_ln_det - 0.5 * jnp.sum(psr_sigma_p_inv_ln_dets)
 
         # -------------------------------------------------------------------------
         # Log-prior on GWB coefficients: -1/2 a_b^T phi_b_inv a_b - 1/2 ln|phi_b|
         # -------------------------------------------------------------------------
-        aG = a_b.transpose((1, 0, 2)) #[npsrs,nmodes,1]-->[nmodes,npsrs,1]
+        aG = a_G.transpose((1, 0, 2)) #[npsrs,nmodes,1]-->[nmodes,npsrs,1]
         logdet_phi_gwb = 4 * jnp.sum(jnp.log(LG[0].diagonal(axis1=-2, axis2=-1))) #LG is not repeated hence the 4 not 2
         ln_prior_val = -0.5 * jnp.sum(aG.mT @ gwb_phi_inv @ aG + logdet_phi_gwb)
 
-        return ln_likelihood_val + ln_prior_val + lndet_Jac + 0.5 * jnp.sum(z**2), a_b
+        if self.linear_timing and not self.marg_tm:
+            # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
+            # these parameters do not impact the likelihood, prior, and are uncorrelated with all other parameters
+            # so this should not effect parameter estimation, but merely provides some curvature for HMC to latch
+            # onto when sampling 
+            padded_logpdf = -0.5 * jnp.sum((self._pad_mask * a_b[:, :self.linear_timing_model_size, 0])**2)
+        else:
+            padded_logpdf = 0.
+
+        return ln_likelihood_val + ln_prior_val + lndet_Jac + padded_logpdf + 0.5 * jnp.sum(z**2), aG
 
 
     

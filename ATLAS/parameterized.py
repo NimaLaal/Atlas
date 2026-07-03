@@ -4,6 +4,7 @@ import warnings, inspect, jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.random as jr
+from ATLAS.utils import jit_method
 
 fref = 1 / (1 * 365.25 * 24 * 60 * 60)
 
@@ -634,6 +635,7 @@ class MultiPulsarRedNoise:
         Npulsars=None,
         first_crn_bin_index=0,
         renorm_const=1.0,
+        shared_irn_and_gwb=True,
     ):
         # ------------------------------------------------------------------ #
         #  Basic bookkeeping                                                   #
@@ -649,6 +651,7 @@ class MultiPulsarRedNoise:
         self.ppair_number = int(Npulsars * (Npulsars - 1) * 0.5)
         self.renorm_const = renorm_const
         self.logrenorm_offset = 0.5 * jnp.log10(renorm_const)
+        self.shared_irn_and_gwb = shared_irn_and_gwb
 
         # Frequency scalars / arrays
         self.crn_bins = crn_bins
@@ -943,7 +946,10 @@ class MultiPulsarRedNoise:
         irn_flat, dm_flat, gwb_params, _ = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
 
-        n_total = self.irn_bins if self.has_irn else self.crn_bins
+        if self.shared_irn_and_gwb:
+            n_total = self.irn_bins if self.has_irn else self.crn_bins
+        else:
+            n_total = self.irn_bins + self.crn_bins
         if self.has_dm:
             n_total = n_total + self.dm_bins
 
@@ -1097,8 +1103,8 @@ class MultiPulsarRedNoise:
 
         return jnp.repeat(phiinv, 2, axis=0), 2.0 * logdet_phi
 
-    @partial(jax.jit, static_argnums=(0,))
-    def partial_reparam_helper(self, xs):
+    @jit_method
+    def partial_reparm_helper(self, xs):
 
         """
         Constructs the phi-matrix based on the flattened array of model paraemters (`xs`)
@@ -1114,23 +1120,25 @@ class MultiPulsarRedNoise:
 
         # Unitiate the arrays
         n_total = self.irn_bins if self.has_irn else 0
+
         if self.has_dm:
             n_total = n_total + self.dm_bins
+
         phi_diag_non_gwb = jnp.zeros((n_total, self.Npulsars))
         phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         orf_val = self.orf_val if self.orf_fixed else self.orf_func(self.xi, *orf_params)
-
+        # print(phi_diag_non_gwb.shape)
         # Add non_gwb separately
         if self.has_irn:
             irn_psd = self._eval_irn_psd_all(irn_flat)
             phi_diag_non_gwb = phi_diag_non_gwb.at[
-                self.first_irn_bin_index:self.last_irn_bin_index
+                self.first_irn_bin_index - self.crn_bins:self.last_irn_bin_index - self.crn_bins
             ].add(irn_psd)
 
         if self.has_dm:
             dm_psd = self._eval_dm_psd_all(dm_flat)
             phi_diag_non_gwb = phi_diag_non_gwb.at[
-                self.first_dm_bin_index:self.last_dm_bin_index
+                self.first_dm_bin_index - self.crn_bins:self.last_dm_bin_index - self.crn_bins
             ].add(dm_psd)
 
         # Make the phi matrix for gwb ONLY!

@@ -18,7 +18,7 @@ from ATLAS.signals import signals_utils as sutils
 from ATLAS.signals.deterministic import utils as dutils
 
 
-class Deterministic(SuperSignal):
+class Deterministic:
 
     """
     Class for determinist signals. Contains methods to get
