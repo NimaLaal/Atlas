@@ -602,7 +602,8 @@ class SuperSignal:
         self.linear_timing = self.data.linear_timing
         self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
-
+        self.inc_chrom = data.include_chromatic
+        
         # linear timing model attributes
         if self.marg_tm:
             self.linear_timing_model_size = 0
@@ -615,6 +616,7 @@ class SuperSignal:
 
         # getting ways to slice TNT and TNr
         self.gwb_idxs = self.signal_comb_idxs['cor']
+        self.chrom_idxs = self.signal_comb_idxs['chr'] if 'chr' in self.signal_comb_idxs.keys() else None
 
         if 'cor' in [x.name for x in signal_helper['shared_basis']['signal_list']]:
             self.non_gwb_idxs = slice(0, self.get_Fmat_concat.shape[-1], None)
@@ -640,7 +642,11 @@ class SuperSignal:
             mask_per_psr = mask_per_psr.at[:M.shape[1]].set(0.)
             self._pad_mask_list.append(mask_per_psr)
         self._pad_mask = jnp.array(self._pad_mask_list)
-        
+
+    @jit_method   
+    def update_red_basis(self, chrom_index):
+        DM = (1400 / self.data.radio_freqs) ** chrom_index
+        return self.get_Fmat_concat.at[:, self.chrom_idxs].multiply(DM[:, None])
 
     def padd_tm_design_matrix(self):
         """        
@@ -709,11 +715,6 @@ class SuperSignal:
         signal_indices : dict[str, slice]
             Maps each signal name to its column slice in Fmat / FNF.
         """
-        if not signal_helper['order'].endswith('cor'):
-            raise ValueError(
-                f"`cor` MUST be the last signal."
-            )
-
         shared_cfg   = signal_helper.get('shared_basis') or {}
         separate_cfg = signal_helper.get('separate') or {}
         order = [s.strip() for s in signal_helper['order'].split(',')]
@@ -737,12 +738,7 @@ class SuperSignal:
         separate_signals = separate_cfg.get('signal_list') or []
         separate_map = {}
         for sig in separate_signals:
-            if self.linear_timing:
-                T_sig = self.Tmaker(Fmats = sig.get_basis(), 
-                                    padd_tm_design_matrix = True, 
-                                    padd_value = 0)
-            else:
-                T_sig = sig.get_basis()
+            T_sig = sig.get_basis()
 
             separate_map.update({sig.name: jnp.concat(T_sig)})
 
@@ -756,7 +752,7 @@ class SuperSignal:
         # --- Assemble columns in user-specified order ---
         Fmats          = []
         signal_indices = {}
-        col            = 0
+        col            = self.linear_timing_model_size
 
         shared_block_placed = False
         shared_start        = None
@@ -772,6 +768,7 @@ class SuperSignal:
                 signal_indices[name] = slice(shared_start, shared_start + shared_signals[shared_signal_ct].nmodes)
                 shared_signal_ct+=1
             else:
+                col -= self.linear_timing_model_size
                 F      = separate_map[name]
                 n_cols = F.shape[1]
                 Fmats.append(F)
@@ -792,33 +789,65 @@ class SuperSignal:
         new_func: callable
             Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
         """
+        if not self.inc_chrom:
+            if self.fixed_wn and not self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                white_noise_params = self.data.fixed_white_noise_params,
+                                red_noise_basis = self.get_Fmat_concat,
+                                )
+                return jit(new_func)
 
-        if self.fixed_wn and not self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               white_noise_params = self.data.fixed_white_noise_params,
-                               )
-            return jit(new_func)
+            elif not self.fixed_wn and not self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                red_noise_basis = self.get_Fmat_concat,
+                                )
+                return jit(new_func)
 
-        elif not self.fixed_wn and not self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               )
-            return jit(new_func)
+            elif not self.fixed_wn and self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                reff = jnp.concat(self.data.raw_residuals)[:, None],
+                                red_noise_basis = self.get_Fmat_concat,
+                                )
+                return jit(new_func)
 
-        elif not self.fixed_wn and self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               reff = jnp.concat(self.data.raw_residuals)[:, None],
-                               )
-            return jit(new_func)
+            elif self.fixed_wn and self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                white_noise_params = self.data.fixed_white_noise_params,
+                                red_noise_basis = self.get_Fmat_concat,
+                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
+                return jit(new_func)
+        else:
+            if self.fixed_wn and not self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                white_noise_params = self.data.fixed_white_noise_params,
+                                red_noise_basis = self.get_Fmat_concat,
+                                )
+                return jit(new_func)
 
-        elif self.fixed_wn and self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               white_noise_params = self.data.fixed_white_noise_params,
-                               reff = jnp.concat(self.data.raw_residuals)[:, None],)
-            return jit(new_func)
+            elif not self.fixed_wn and not self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                )
+                return jit(new_func)
+
+            elif not self.fixed_wn and self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                reff = jnp.concat(self.data.raw_residuals)[:, None],
+                                )
+                return jit(new_func)
+
+            elif self.fixed_wn and self.fixed_res:
+                new_func = partial(self.update_white_matrix_products_unjitted,
+                                N_list = self.data.Nmat,
+                                white_noise_params = self.data.fixed_white_noise_params,
+                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
+                return jit(new_func)
 
     def add_parameterization(self, model):
         """Add a specific parameterization of the power spectral density based
@@ -831,7 +860,7 @@ class SuperSignal:
         """
         self.model = model
 
-    def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
+    def update_white_matrix_products_unjitted(self, red_noise_basis, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
         This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
@@ -855,7 +884,7 @@ class SuperSignal:
             The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
         """
-        return N_list.get_red_helpers(red_noise_basis = self.get_Fmat_concat, 
+        return N_list.get_red_helpers(red_noise_basis = red_noise_basis, 
                                       residuals = reff, 
                                       white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
 

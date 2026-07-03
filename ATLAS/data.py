@@ -39,6 +39,7 @@ class PTA_Data:
     def __init__(self, 
                 psrs, 
                 fixed_white_noise_params = jnp.array([False]),
+                include_chromatic = False,
                 linear_timing = False,
                 marg_timing = False,
                 diag_white_cov = False,
@@ -86,7 +87,11 @@ class PTA_Data:
         self.linear_timing = linear_timing
         self.diag_white_cov = diag_white_cov
         self.marg = marg_timing
-        
+
+        # Radio frequencies
+        self.radio_freqs = jnp.concat([psr.freqs for psr in psrs])
+        self.include_chromatic = include_chromatic
+
     def add_white_noise_cov(self, white_noise_cov):
         self.Nmat = white_noise_cov
 

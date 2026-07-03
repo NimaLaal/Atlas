@@ -66,8 +66,8 @@ def powerlaw(f, df, log10_A, gamma):
     calc = (
         df
         * 10 ** (2 * log10_A)
-        / (12 * jnp.pi**2 * f[:, None] ** 3)
-        * (f[:, None] / fref) ** (3 - gamma)
+        / (12 * jnp.pi**2 * f ** 3)
+        * (f / fref) ** (3 - gamma)
     )
     return clip_psd(calc)
 
@@ -82,7 +82,7 @@ def free_spectrum(f, df, *halflog10_rho):
     where \rho_i is the free parameter and T is the observation
     length.
     """
-    return 10 ** (2 * jnp.array(halflog10_rho))[:, None]
+    return 10 ** (2 * jnp.array(halflog10_rho))
 
 
 ##############################################################################################
@@ -90,10 +90,10 @@ def free_spectrum(f, df, *halflog10_rho):
 def turnover(f, df, log10_A, gamma, lf0, kappa, beta):
     hcf = (
         10**log10_A
-        * (f[:, None] / fref) ** ((3 - gamma) / 2)
+        * (f / fref) ** ((3 - gamma) / 2)
         / (1 + (10**lf0 / f) ** kappa) ** beta
     )
-    calc = hcf**2 / 12 / jnp.pi**2 / f[:, None] ** 3 * df
+    calc = hcf**2 / 12 / jnp.pi**2 / f ** 3 * df
     return clip_psd(calc)
 
 
@@ -107,8 +107,8 @@ def t_process(f, df, log10_A, gamma, alphas):
     calc = (
         df
         * 10 ** (2 * log10_A)
-        / (12 * jnp.pi**2 * f[:, None] ** 3)
-        * (f[:, None] / fref) ** (3 - gamma)
+        / (12 * jnp.pi**2 * f ** 3)
+        * (f / fref) ** (3 - gamma)
     )
     return clip_psd(calc * alphas)
 
@@ -128,11 +128,11 @@ def turnover_knee(f, df, log10_A, gamma, lfb, lfk, kappa, delta):
     """
     hcf = (
         10**log10_A
-        * (f[:, None] / fref) ** ((3 - gamma) / 2)
-        * (1.0 + (f[:, None] / 10**lfk)) ** delta
+        * (f / fref) ** ((3 - gamma) / 2)
+        * (1.0 + (f / 10**lfk)) ** delta
         / jnp.sqrt(1 + (10**lfb / f) ** kappa)
     )
-    calc = hcf**2 / 12 / jnp.pi**2 / f[:, None] ** 3 * df
+    calc = hcf**2 / 12 / jnp.pi**2 / f ** 3 * df
     return clip_psd(calc)
 
 
@@ -152,11 +152,11 @@ def broken_powerlaw(f, df, log10_A, gamma, delta, log10_fb, kappa):
     """
     hcf = (
         10**log10_A
-        * (f[:, None] / fref) ** ((3 - gamma) / 2)
-        * (1 + (f[:, None] / 10**log10_fb) ** (1 / kappa))
+        * (f / fref) ** ((3 - gamma) / 2)
+        * (1 + (f / 10**log10_fb) ** (1 / kappa))
         ** (kappa * (gamma - delta) / 2)
     )
-    return hcf**2 / 12 / jnp.pi**2 / f[:, None] ** 3 * df
+    return hcf**2 / 12 / jnp.pi**2 / f ** 3 * df
 
 
 ##############################################################################################
@@ -167,7 +167,7 @@ def powerlaw_genmodes(f, df, log10_A, gamma, wgts):
         / 12.0
         / jnp.pi**2
         * fref ** (gamma - 3)
-        * f[:, None] ** (-gamma)
+        * f ** (-gamma)
         * wgts**2 * df
     )
     return clip_psd(calc)
@@ -184,7 +184,7 @@ def spectrum_ttvl(f,
     """
 
     pdist = p_dist * kpc / c
-    orf_aa_vl = 6 * jnp.log(4 * jnp.pi * f[:, None] * pdist[None, :]) - 14 + 6 * euler_e
+    orf_aa_vl = 6 * jnp.log(4 * jnp.pi * f * pdist[None, :]) - 14 + 6 * euler_e
 
     tt_psd = 10**(2 * rho_tt)
     vl_psd = 10**(2 * rho_vl)
@@ -207,10 +207,10 @@ def powerlaw_ttvl(f,
     """
 
     pdist = p_dist * kpc / c
-    orf_aa_vl = 6 * jnp.log(4 * jnp.pi * f[:, None] * pdist[None, :]) - 14 + 6 * euler_e
+    orf_aa_vl = 6 * jnp.log(4 * jnp.pi * f * pdist[None, :]) - 14 + 6 * euler_e
 
-    tt_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_tt) * (f[:, None]/fref)**(3-gamma_tt))
-    vl_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_vl) * (f[:, None]/fref)**(3-gamma_vl))
+    tt_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_tt) * (f/fref)**(3-gamma_tt))
+    vl_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_vl) * (f/fref)**(3-gamma_vl))
 
     calc = tt_psd + vl_psd *  orf_aa_vl
     return clip_psd(calc), jnp.concatenate((tt_psd[None], vl_psd[None]), axis = 0)
@@ -232,11 +232,11 @@ def powerlaw_ttstvl(f,
     """
 
     pdist = p_dist * kpc / c
-    orf_aa_vl = 6 * jnp.log(4 * jnp.pi * f[:, None] * pdist[None, :]) - 14 + 6 * euler_e
+    orf_aa_vl = 6 * jnp.log(4 * jnp.pi * f * pdist[None, :]) - 14 + 6 * euler_e
 
-    tt_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_tt) * (f[:, None]/fref)**(3-gamma_tt))
-    st_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_st) * (f[:, None]/fref)**(3-gamma_st))
-    vl_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_vl) * (f[:, None]/fref)**(3-gamma_vl))
+    tt_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_tt) * (f/fref)**(3-gamma_tt))
+    st_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_st) * (f/fref)**(3-gamma_st))
+    vl_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_vl) * (f/fref)**(3-gamma_vl))
 
     calc = tt_psd + st_psd + vl_psd *  orf_aa_vl
     return clip_psd(calc), jnp.concatenate((tt_psd[None], st_psd[None], vl_psd[None]), axis = 0)
@@ -254,8 +254,8 @@ def powerlaw_ttst(f,
     Generic powerlaw spectrum for TT + ST Case.
     """
 
-    tt_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_tt) * (f[:, None]/fref)**(3-gamma_tt))
-    st_psd = df/(12 * jnp.pi**2 * f[:, None]**3) * (10**(2 * log10_A_st) * (f[:, None]/fref)**(3-gamma_st))
+    tt_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_tt) * (f/fref)**(3-gamma_tt))
+    st_psd = df/(12 * jnp.pi**2 * f**3) * (10**(2 * log10_A_st) * (f/fref)**(3-gamma_st))
 
     calc = tt_psd + st_psd
     return clip_psd(calc), jnp.concatenate((tt_psd[None], st_psd[None]), axis = 0)
@@ -263,7 +263,7 @@ def powerlaw_ttst(f,
 ##############################################################################################
 @jax.jit
 def infinitepower(f, df):
-    return jnp.full_like(f[:, None], 1e40)
+    return jnp.full_like(f, 1e40)
 
 
 ##############################################################################################
