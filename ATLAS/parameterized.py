@@ -682,7 +682,6 @@ class MultiPulsarRedNoise:
         has_dm = dm_psd_func is not None
         self.has_dm = has_dm
         if has_dm:
-            assert has_irn, "DM noise requires IRN to also be specified."
             assert dm_bins is not None and f_dm is not None, (
                 "dm_bins and f_dm must be supplied when dm_psd_func is given."
             )
