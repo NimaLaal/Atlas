@@ -1,229 +1,213 @@
+"""
+gwb_model_builder.py
+====================
+Utilities for constructing the ``(gwb_psd_func, orf_func, gwb_helper_dictionary)``
+triple consumed by ``RedNoise``.
+
+Design
+------
+All factory functions are built on a single generic ``make_gwb_model`` function.
+The named shortcuts (``fixed_gamma_hd_pl``, ``varied_gamma_hd_pl``, …) are thin
+``functools.partial`` wrappers that pre-fill the choices that define each model
+variant, leaving only the user-facing knobs (prior bounds, ``renorm_const``) as
+call-time arguments.
+
+Adding a new model variant therefore requires only one ``partial`` line, with no
+boilerplate duplication.
+"""
+
 import numpy as np
-import jax.numpy as jnp
 import inspect
+from functools import partial
+
+import jax.numpy as jnp
+
 import ATLAS.psd_functions as psd_functions
+from ATLAS.signals.signals_utils import _extract_fixed_from_partial, _sig_params
 
-# GWB Model Definition Utilities--------------------------------------------------------------
 
-def param_order_help(
+# ---------------------------------------------------------------------------
+# Low-level helper: build the gwb_helper_dictionary
+# ---------------------------------------------------------------------------
+
+def _param_order_help(
     lower_bound_array,
     upper_bound_array,
-    list_of_orf_params=[None],
-    list_of_psd_params=["log10_A", "gamma"],
-    fixed_gwb_psd_params=[None],
-    fixed_gwb_psd_param_values=[None],
+    list_of_psd_params,
+    list_of_orf_params=(),
+    fixed_psd_params=(),
+    fixed_psd_param_values=(),
+    fixed_orf_params=(),          
+    fixed_orf_param_values=(),    
+):
+    d = {}
+    d["ordered_gwb_psd_model_params"] = np.array(list_of_psd_params)
+
+    if list_of_orf_params:
+        d["ordered_orf_model_params"] = np.array(list_of_orf_params)
+
+    if fixed_psd_params:
+        fixed_idx = [list(list_of_psd_params).index(p) for p in fixed_psd_params]
+        d["fixed_gwb_psd_param_indices"] = jnp.array(fixed_idx)
+        d["fixed_gwb_psd_param_values"]  = jnp.array(fixed_psd_param_values)
+
+    if fixed_orf_params:
+        fixed_idx = [list(list_of_orf_params).index(p) for p in fixed_orf_params]
+        d["fixed_orf_param_indices"] = jnp.array(fixed_idx)
+        d["fixed_orf_param_values"]  = jnp.array(fixed_orf_param_values)
+
+    d["gwb_psd_param_lower_lim"] = lower_bound_array
+    d["gwb_psd_param_upper_lim"] = upper_bound_array
+    return d
+
+
+def _sig_params(func, skip=2):
+    """Return the non-``*args`` parameter names of ``func``, skipping the first ``skip``."""
+    return np.array(
+        [str(p) for p in inspect.signature(func).parameters if "args" not in str(p)][skip:]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Generic factory
+# ---------------------------------------------------------------------------
+
+def make_gwb_model(
+    psd_func,
+    orf_func,
+    lower_bound_array,
+    upper_bound_array,
+    renorm_const=1.0,
+    fixed_psd_params=(),
+    fixed_psd_param_values=(),
+    fixed_orf_params=(),
+    fixed_orf_param_values=()
 ):
     """
-    A utility function that helps organize and structure parameters
-    related to gravitational wave background (GWB) PSD and ORF models.
+    Build the ``(psd_func, orf_func, gwb_helper_dictionary)`` triple for ``RedNoise``.
 
-    :param lower_bound_array: the lower bound on the model params (PSD + ORF) as a JAX array
-    :param upper_bound_array: the upper bound on the model params (PSD + ORF) as a JAX array
-    :list_of_orf_params: a list containing the name of the ORF model parameters. The ordering
-      ***MUST*** match those in `psd_functions.py`
-    :list_of_psd_params: a list containing the name of the PSD model parameters. The ordering
-      ***MUST*** match those in `psd_functions.py`
-    :fixed_gwb_psd_params: a list containing the GWB PSD parameters that you want to be fixed
-    :fixed_gwb_psd_param_values: a JAX array containing the values of fixed GWB PSD params.
+    This is the single generic entry-point.  All named shortcuts below are
+    ``partial`` applications of this function.
 
+    Parameters
+    ----------
+    psd_func : callable
+        GWB PSD function with signature ``(f, df, *params)``.
+    orf_func : callable
+        ORF function with signature ``(angle, *free_params)``.
+        A fixed ORF (e.g. HD) takes only ``angle``; a free ORF (e.g. GT)
+        also takes additional parameters — these are detected automatically
+        from the signature.
+    lower_bound_array, upper_bound_array : array-like
+        Prior bounds for the *varied* parameters in the order::
+
+            [ varied_psd_params ..., free_orf_params ... ]
+
+        A ``renorm_const``-derived log-amplitude offset is applied
+        automatically to every element (same convention as pandora).
+    renorm_const : float
+        Unit renormalisation constant.  Enters as
+        ``0.5 * log10(renorm_const)`` added to the bounds.
+    fixed_psd_params : sequence[str]
+        Names of PSD parameters to hold fixed (must match the PSD function
+        signature).
+    fixed_psd_param_values : array-like
+        Values for ``fixed_psd_params``, in the same order.
+
+    Returns
+    -------
+    psd_func : callable
+    orf_func : callable
+    gwb_helper_dictionary : dict
     """
-    x = {}
-    x.update({"ordered_gwb_psd_model_params": list_of_psd_params})
-    if any(fixed_gwb_psd_params):
-        fixed_gwb_psd_param_indxs = [
-            list(list_of_psd_params).index(_) for _ in fixed_gwb_psd_params
-        ]
-        x.update({"fixed_gwb_psd_params": fixed_gwb_psd_params})
-    if any(list_of_orf_params):
-        x.update({"ordered_orf_model_params": list_of_orf_params})
-    x.update(
-        {
-            "varied_gwb_psd_params": [
-                *[_ for _ in list_of_psd_params if _ not in fixed_gwb_psd_params],
-                *list_of_orf_params,
-            ]
-        }
+    psd_func, fixed_psd_params, fixed_psd_param_values = _extract_fixed_from_partial(
+        psd_func, fixed_psd_params, fixed_psd_param_values, skip=2
     )
-    x.update({"gwb_psd_param_lower_lim": lower_bound_array})
-    x.update({"gwb_psd_param_upper_lim": upper_bound_array})
-    if any(fixed_gwb_psd_params):
-        x.update({"fixed_gwb_psd_params": fixed_gwb_psd_params})
-        x.update({"fixed_gwb_psd_param_indices": jnp.array(fixed_gwb_psd_param_indxs)})
-        x.update({"fixed_gwb_psd_param_values": fixed_gwb_psd_param_values})
-    return x
-
-def fixed_gamma_hd_pl(
-    renorm_const, 
-    lower_amp=-18.0, 
-    upper_amp=-11.0
-    ):
-    """
-    A lazy way to get the right `param_order_help` dictionary for a fixed gamma HD model
-    """
-    logamp_offset = logamp_offset = 0.5 * jnp.log10(renorm_const)
-    chosen_psd_model = psd_functions.powerlaw
-    chosen_orf_model = psd_functions.hd_orf
-    chosen_psd_model_params = np.array(
-        [
-            str(_)
-            for _ in inspect.signature(chosen_psd_model).parameters
-            if not "args" in str(_)
-        ][2:]
-    )
-    return (
-        chosen_psd_model,
-        chosen_orf_model,
-        param_order_help(
-            list_of_psd_params=chosen_psd_model_params,
-            lower_bound_array=jnp.array([lower_amp + logamp_offset]),
-            upper_bound_array=jnp.array([upper_amp + logamp_offset]),
-            fixed_gwb_psd_params=["gamma"],
-            fixed_gwb_psd_param_values=jnp.array([13 / 3]),
-            list_of_orf_params=[],
-        ),
+    orf_func, fixed_orf_params, fixed_orf_param_values = _extract_fixed_from_partial(
+        orf_func, fixed_orf_params, fixed_orf_param_values, skip=1
     )
 
-def broken_pl(
-    renorm_const,
-    lower_amp=-18.0,
-    upper_amp=-11.0,
-    lower_gamma=0.0,
-    upper_gamma=7.0,
-    lower_log10_fb=-8.7,
-    upper_log10_fb=-7.0,
-):
-    """
-    A lazy way to get the right `param_order_help` dictionary for a fixed gamma HD model
-    """
-    logamp_offset = logamp_offset = 0.5 * jnp.log10(renorm_const)
-    chosen_psd_model = psd_functions.broken_powerlaw
-    chosen_orf_model = psd_functions.hd_orf
-    chosen_psd_model_params = np.array(
-        [
-            str(_)
-            for _ in inspect.signature(chosen_psd_model).parameters
-            if not "args" in str(_)
-        ][2:]
-    )
-    return (
-        chosen_psd_model,
-        chosen_orf_model,
-        param_order_help(
-            list_of_psd_params=chosen_psd_model_params,
-            lower_bound_array=jnp.array(
-                [lower_amp + logamp_offset, lower_gamma, lower_log10_fb]
-            ),
-            upper_bound_array=jnp.array(
-                [upper_amp + logamp_offset, upper_gamma, upper_log10_fb]
-            ),
-            fixed_gwb_psd_params=["delta", "kappa"],
-            fixed_gwb_psd_param_values=jnp.array([0.0, 0.1]),
-            list_of_orf_params=[],
-        ),
-    )
-
-def varied_gamma_hd_pl(
-    renorm_const,
-    lower_amp=-18.0, 
-    upper_amp=-11.0, 
-    lower_gamma=0.0, 
-    upper_gamma=7.0
-):
-    """
-    A lazy way to get the right `param_order_help` dictionary for a varied gamma HD model
-    """
     logamp_offset = 0.5 * jnp.log10(renorm_const)
-    chosen_psd_model = psd_functions.powerlaw
-    chosen_orf_model = psd_functions.hd_orf
-    chosen_psd_model_params = np.array(
-        [
-            str(_)
-            for _ in inspect.signature(chosen_psd_model).parameters
-            if not "args" in str(_)
-        ][2:]
-    )
-    return (
-        chosen_psd_model,
-        chosen_orf_model,
-        param_order_help(
-            list_of_psd_params=chosen_psd_model_params,
-            lower_bound_array=jnp.array([lower_amp + logamp_offset, lower_gamma]),
-            upper_bound_array=jnp.array([upper_amp + logamp_offset, upper_gamma]),
-            fixed_gwb_psd_param_values=[],
-            list_of_orf_params=[],
-        ),
-    )
+    lower = jnp.asarray(lower_bound_array) + logamp_offset
+    upper = jnp.asarray(upper_bound_array) + logamp_offset
 
-def hd_spectrum(
-    renorm_const, 
-    crn_bins, 
-    lower_halflog10_rho=-9, 
-    upper_halflog10_rho=-1
-    ):
-    """
-    A lazy way to get the right `param_order_help` dictionary for a free-spectral HD model
-    """
-    logamp_offset = 0.5 * jnp.log10(renorm_const)
-    chosen_psd_model = psd_functions.free_spectrum
-    chosen_orf_model = psd_functions.hd_orf
-    chosen_psd_model_params = np.array(
-        [
-            str(_)
-            for _ in inspect.signature(chosen_psd_model).parameters
-            if not "args" in str(_)
-        ][2:]
-    )
-    return (
-        chosen_psd_model,
-        chosen_orf_model,
-        param_order_help(
-            list_of_psd_params=chosen_psd_model_params,
-            lower_bound_array=jnp.ones(crn_bins)
-            * (lower_halflog10_rho + logamp_offset),
-            upper_bound_array=jnp.ones(crn_bins)
-            * (upper_halflog10_rho + logamp_offset),
-            fixed_gwb_psd_param_values=[],
-            list_of_orf_params=[],
-        ),
-    )
+    psd_params = _sig_params(psd_func, skip=2)   # skip f, df
+    orf_params = _sig_params(orf_func,  skip=1)   # skip angle
 
-def varied_gamma_gt_pl(
-    renorm_const, 
-    lower_amp=-18.0, 
-    upper_amp=-11.0, 
-    lower_gamma=0.0, 
-    upper_gamma=7.0
-):
-    """
-    A lazy way to get the right `param_order_help` dictionary for a varied gamma GT model
-    """
-    logamp_offset = 0.5 * jnp.log10(renorm_const)
-    chosen_psd_model = psd_functions.powerlaw
-    chosen_psd_model_params = np.array(
-        [
-            str(_)
-            for _ in inspect.signature(chosen_psd_model).parameters
-            if not "args" in str(_)
-        ][2:]
+    helper = _param_order_help(
+        lower_bound_array    = lower,
+        upper_bound_array    = upper,
+        list_of_psd_params   = psd_params,
+        list_of_orf_params   = list(orf_params) if len(orf_params) else (),
+        fixed_psd_params     = fixed_psd_params,
+        fixed_psd_param_values = fixed_psd_param_values,
     )
+    return psd_func, orf_func, helper
 
-    chosen_orf_model = psd_functions.gt_orf
-    chosen_orf_model_params = np.array(
-        [
-            str(_)
-            for _ in inspect.signature(chosen_orf_model).parameters
-            if not "args" in str(_)
-        ][1:]
-    )
 
-    return (
-        chosen_psd_model,
-        chosen_orf_model,
-        param_order_help(
-            list_of_psd_params=chosen_psd_model_params,
-            lower_bound_array=jnp.array([lower_amp + logamp_offset, lower_gamma, -1.5]),
-            upper_bound_array=jnp.array([upper_amp + logamp_offset, upper_gamma, 1.5]),
-            fixed_gwb_psd_param_values=[],
-            list_of_orf_params=chosen_orf_model_params,
-        ),
-    )
+# ---------------------------------------------------------------------------
+# Named shortcuts via partial
+# ---------------------------------------------------------------------------
+# Each partial pre-fills ``psd_func``, ``orf_func``, and any fixed-parameter
+# bookkeeping.  The user still supplies the prior bounds (and optionally
+# ``renorm_const``).
+#
+# Calling convention for all shortcuts:
+#
+#   model_func(lower_bound_array, upper_bound_array, renorm_const=1.0)
+#     → (psd_func, orf_func, gwb_helper_dictionary)
+#
+# ---------------------------------------------------------------------------
+
+# Power-law + HD ORF, gamma fixed at 13/3
+fixed_gamma_hd_pl = partial(
+    make_gwb_model,
+    psd_func              = psd_functions.powerlaw,
+    orf_func              = psd_functions.hd_orf,
+    fixed_psd_params      = ("gamma",),
+    fixed_psd_param_values= (13 / 3,),
+)
+
+# Power-law + HD ORF, gamma free
+varied_gamma_hd_pl = partial(
+    make_gwb_model,
+    psd_func = psd_functions.powerlaw,
+    orf_func = psd_functions.hd_orf,
+)
+
+# Broken power-law + HD ORF, delta and kappa fixed
+broken_pl_hd = partial(
+    make_gwb_model,
+    psd_func              = psd_functions.broken_powerlaw,
+    orf_func              = psd_functions.hd_orf,
+    fixed_psd_params      = ("delta", "kappa"),
+    fixed_psd_param_values= (0.0, 0.1),
+)
+
+# Free-spectral + HD ORF
+hd_spectrum = partial(
+    make_gwb_model,
+    psd_func = psd_functions.free_spectrum,
+    orf_func = psd_functions.hd_orf,
+)
+
+# Power-law + generalised-transverse ORF (free ORF parameter)
+varied_gamma_gt_pl = partial(
+    make_gwb_model,
+    psd_func = psd_functions.powerlaw,
+    orf_func = psd_functions.gt_orf,
+)
+
+# Power-law + CURN (monopole ORF), gamma free
+varied_gamma_curn_pl = partial(
+    make_gwb_model,
+    psd_func = psd_functions.powerlaw,
+    orf_func = psd_functions.monopole_orf,
+)
+
+# Power-law + dipole ORF, gamma free
+varied_gamma_dipole_pl = partial(
+    make_gwb_model,
+    psd_func = psd_functions.powerlaw,
+    orf_func = psd_functions.dipole_orf,
+)

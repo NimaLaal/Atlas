@@ -1,13 +1,13 @@
 
 from ATLAS.utils import jit
 from ATLAS.utils import F_YEAR_HZ
-
+import functools
 import numpy as np
 
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 import jax.random as jrandom
-
+import inspect
 
 # Model utilities---------------------------------------------------------------
 def build_basis(signal_helper):
@@ -94,6 +94,92 @@ def build_basis(signal_helper):
     Fmat = jnp.concat(Fmats, axis=1)
 
     return Fmat, signal_indices
+
+def _extract_fixed_from_partial(func, fixed_params, fixed_values, skip):
+    """
+    Generic version: works for both PSD (skip=2) and ORF (skip=1).
+    If func is a functools.partial, extracts pre-filled arguments as
+    fixed parameters, merging with any explicitly supplied ones.
+
+    Returns
+    -------
+    unwrapped_func  : the underlying callable (partial stripped)
+    fixed_params    : merged tuple of fixed param names
+    fixed_values    : merged tuple of fixed param values
+    """
+    if not isinstance(func, functools.partial):
+        return func, fixed_params, fixed_values
+
+    partial_fixed_names  = tuple(func.keywords.keys())
+    partial_fixed_values = tuple(func.keywords.values())
+
+    if func.args:
+        sig_params = _sig_params(func.func, skip=skip)
+        positional_names  = tuple(sig_params[:len(func.args)])
+        positional_values = tuple(func.args)
+        partial_fixed_names  = positional_names  + partial_fixed_names
+        partial_fixed_values = positional_values + partial_fixed_values
+
+    explicit = dict(zip(fixed_params, fixed_values))
+    merged   = {**dict(zip(partial_fixed_names, partial_fixed_values)), **explicit}
+
+    return func.func, tuple(merged.keys()), tuple(merged.values())
+
+def _sig_params(func, skip=2):
+    """Return the non-``*args`` parameter names of ``func``, skipping the first ``skip``."""
+    return np.array(
+        [str(p) for p in inspect.signature(func).parameters if "args" not in str(p)][skip:]
+    )
+
+def parse_basis_string(basis_string):
+    """
+    Parse an einsum-style basis string into basis configuration.
+
+    Syntax:  "T|shared_lhs->representative ; sep1, sep2, ..."
+      - T|             : optional prefix, include timing model (M-matrix)
+      - shared_lhs     : signal names joined by +, sharing one basis
+      - representative : which signal's basis to use (must appear in lhs)
+      - ; sep...       : optional semicolon-separated separate signals
+
+    Examples
+    --------
+    "unc+cor->unc"             # shared only, no timing model
+    "T|unc+cor->unc"           # shared only, with timing model prepended
+    "T|unc+cor->unc ; cw"      # shared + separate, with timing model
+    "unc ; cor,dm"             # no shared group, all separate, no timing model
+    "T|unc ; cor,dm"           # no shared group, all separate, with timing model
+    """
+    # Check for timing model prefix
+    include_timing = basis_string.startswith('ltm|')
+    if include_timing:
+        basis_string = basis_string[4:]
+
+    shared_part, _, separate_part = basis_string.partition(';')
+    shared_part    = shared_part.strip()
+    separate_names = [s.strip() for s in separate_part.split(',') if s.strip()]
+
+    # Parse shared group
+    if '->' in shared_part:
+        lhs, _, rep = shared_part.partition('->')
+        shared_names = [s.strip() for s in lhs.split('+') if s.strip()]
+        rep = rep.strip()
+        if rep not in shared_names:
+            raise ValueError(
+                f"Representative '{rep}' must appear in the shared group {shared_names}"
+            )
+    else:
+        # No shared group — everything before ; is separate
+        extra          = [s.strip() for s in shared_part.split(',') if s.strip()]
+        separate_names = extra + separate_names
+        shared_names, rep = [], None
+
+    return {
+        'include_timing' : include_timing,
+        'shared_names'   : shared_names,
+        'representative' : rep,
+        'separate_names' : separate_names,
+        'order'          : shared_names + separate_names,
+    }
 
 def _timing_model_svd(M):
     """Create an more stable basis for the timing model design matrix using SVD.

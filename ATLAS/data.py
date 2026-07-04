@@ -39,11 +39,11 @@ class PTA_Data:
     def __init__(self, 
                 psrs, 
                 fixed_white_noise_params = jnp.array([False]),
-                include_chromatic = False,
                 linear_timing = False,
                 marg_timing = False,
                 diag_white_cov = False,
-                fixed_res = False): 
+                fixed_res = False,
+                dm_ref_freq = 1400): 
         """The constructor for the PTA_Data class
 
         This class is intended to hold all the static data attributes of the PTA 
@@ -89,8 +89,17 @@ class PTA_Data:
         self.marg = marg_timing
 
         # Radio frequencies
-        self.radio_freqs = jnp.concat([psr.freqs for psr in psrs])
-        self.include_chromatic = include_chromatic
+        radio_freqs = jnp.concat([psr.freqs for psr in psrs])
+        self.dm_ref_freq = dm_ref_freq
+        self.ref_over_radio_freqs = self.dm_ref_freq / radio_freqs
+
+        # A celever way to broadcast DM index over all concatenated toas
+        ct = 0
+        self.dm_exploder_idxs = []
+        for pidx in range(self.npsrs):
+            self.dm_exploder_idxs.append(ct * jnp.ones(len(self.toas[pidx])))
+            ct+=1
+        self.dm_exploder_idxs = jnp.concat(self.dm_exploder_idxs).astype(int)
 
     def add_white_noise_cov(self, white_noise_cov):
         self.Nmat = white_noise_cov

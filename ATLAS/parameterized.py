@@ -110,7 +110,7 @@ def _parse_orf_func(orf_func, helper_dict):
 # Unified red-noise covariance-matrix class
 # ---------------------------------------------------------------------------
 
-class SinglePulsarRedNoise:
+class PerPulsarRedNoise:
     """
     A unified class for constructing the red-noise covariance (phi) matrix
     for pulsar timing array (PTA) analyses.
@@ -185,21 +185,32 @@ class SinglePulsarRedNoise:
 
     def __init__(
         self,
+        signal_indices,          # from build_basis
+        linear_timing_model_size,
         irn_psd_func=None,
         irn_helper_dictionary=None,
         irn_bins=None,
         f_irn=None,
-        first_irn_bin_index=0,
         # ---- DM noise (optional) ----
         dm_psd_func=None,
         dm_helper_dictionary=None,
         dm_bins=None,
         f_dm=None,
-        first_dm_bin_index=0,
         # ---- shared ----
         renorm_const=1.0,
-        Npulsars = 1,
+        Npulsars=1,
     ):
+        ...
+        # ------------------------------------------------------------------ #
+        #  Frequency index arrays from signal_indices                          #
+        # ------------------------------------------------------------------ #
+        tm_offset = linear_timing_model_size
+
+        def _fourier_slice(name):
+            sl = signal_indices[name]
+            return slice((sl.start - tm_offset) // 2,
+                        (sl.stop  - tm_offset) // 2)
+
         # ------------------------------------------------------------------ #
         #  Basic bookkeeping                                                   #
         # ------------------------------------------------------------------ #
@@ -216,6 +227,18 @@ class SinglePulsarRedNoise:
         self.has_dm = has_dm
         if self.has_dm is None and self.has_irn is None:
             raise ValueError("Either `irn` or 'dm' needs to be supplied." )
+
+        if has_irn:
+            self.IRN_slice = _fourier_slice('unc')
+
+        if has_dm:
+            self.DM_slice = _fourier_slice('dm')
+
+        # n_total_bins = stop of the last occupied slice
+        all_stops = []
+        if has_irn: all_stops.append(self.IRN_slice.stop)
+        if has_dm:  all_stops.append(self.DM_slice.stop)
+        self.n_total_bins = max(all_stops)
 
         # ------------------------------------------------------------------ #
         #  IRN bookkeeping                                                     #
@@ -246,19 +269,6 @@ class SinglePulsarRedNoise:
             self.dm_bins = dm_bins
             self.f_dm = f_dm if f_dm.ndim == 2 else jnp.broadcast_to(f_dm, (self.Npulsars, self.dm_bins))
             self.df_dm = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_dm), axis = 1))
-
-        # ------------------------------------------------------------------ #
-        #  Frequency index arrays                                              #
-        # ------------------------------------------------------------------ #
-        if has_irn:
-            self.first_irn_bin_index = first_irn_bin_index
-            self.last_irn_bin_index = first_irn_bin_index + irn_bins
-
-        if has_dm:
-            self.first_dm_bin_index = first_dm_bin_index
-            self.last_dm_bin_index = first_dm_bin_index + dm_bins
-            self.DM_fidxs = jnp.arange(first_dm_bin_index,
-                                        first_dm_bin_index + dm_bins)
             
         # ------------------------------------------------------------------ #
         #  Parse IRN PSD                                                       #
@@ -334,7 +344,7 @@ class SinglePulsarRedNoise:
     #  Internal PSD helpers                                                   #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _eval_irn_psd_all(self, irn_params_flat):
         """
         Evaluate the IRN PSD for *all* pulsars.
@@ -356,7 +366,7 @@ class SinglePulsarRedNoise:
 
         return jax.vmap(_single)(per_psr, self.f_irn, self.df_irn).T  # → (irn_bins, Npulsars)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _eval_dm_psd_all(self, dm_params_flat):
         """
         Evaluate the DM PSD for *all* pulsars.
@@ -377,7 +387,7 @@ class SinglePulsarRedNoise:
     #  Parameter unpacking                                                    #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _unpack(self, xs):
         """Return (irn_flat, dm_flat) from ``xs``."""
         irn = xs[:self.irn_end_idx]
@@ -388,40 +398,25 @@ class SinglePulsarRedNoise:
     #  Core phi builders                                                      #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_diag(self, xs):
-        """
-        Compute the diagonal of the phi-matrix (shape ``(n_total_bins, Npulsars)``)
-        and the GWB PSD (shape ``(crn_bins,)``).
-
-        Returns
-        -------
-        phi_diag : jnp.ndarray  (n_total_bins, Npulsars)
-        psd_common : jnp.ndarray  (crn_bins,)
-        """
         irn_flat, dm_flat = self._unpack(xs)
 
-        n_total = self.irn_bins if self.has_irn else 0
-        if self.has_dm:
-            n_total = n_total + self.dm_bins
-
-        phi_diag = jnp.zeros((n_total, self.Npulsars))
+        phi_diag = jnp.zeros((self.n_total_bins, self.Npulsars))
 
         if self.has_irn:
-            irn_psd = self._eval_irn_psd_all(irn_flat)
-            phi_diag = phi_diag.at[
-                self.first_irn_bin_index:self.last_irn_bin_index
-            ].add(irn_psd)
+            phi_diag = phi_diag.at[self.IRN_slice].add(
+                self._eval_irn_psd_all(irn_flat)
+            )
 
         if self.has_dm:
-            dm_psd = self._eval_dm_psd_all(dm_flat)
-            phi_diag = phi_diag.at[
-                self.first_dm_bin_index:self.last_dm_bin_index
-            ].add(dm_psd)
+            phi_diag = phi_diag.at[self.DM_slice].add(
+                self._eval_dm_psd_all(dm_flat)
+            )
 
         return phi_diag
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat(self, xs):
         """
         Build the full phi-matrix  (n_total_bins, Npulsars, Npulsars).
@@ -440,7 +435,7 @@ class SinglePulsarRedNoise:
         """
         return self.get_phi_diag(xs)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_full(self, xs):
         """
         Like ``get_phi_mat`` but also fills the *upper* triangle so the matrix
@@ -448,7 +443,7 @@ class SinglePulsarRedNoise:
         """
         return self.get_phi_diag(xs)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_CURN(self, xs):
         """
         Return the phi diagonal (CURN = Common Uncorrelated Red Noise):
@@ -461,7 +456,7 @@ class SinglePulsarRedNoise:
         """
         return self.get_phi_diag(xs)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_from_diag(self, xs):
         """
         Build the full phi-matrix from a pre-computed diagonal and GWB PSD.
@@ -479,7 +474,7 @@ class SinglePulsarRedNoise:
     #  Inversion                                                              #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_inv(self, xs):
         """
         Invert the phi-matrix using mixed Cholesky + diagonal strategies.
@@ -503,7 +498,7 @@ class SinglePulsarRedNoise:
     #  Prior                                                                  #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_lnprior(self, xs):
         """Uniform log-prior: returns a small constant if in bounds, -inf otherwise."""
         in_bounds = jnp.logical_and(
@@ -514,8 +509,17 @@ class SinglePulsarRedNoise:
     def get_lnprior_numpy(self, xs):
         return self.get_lnprior(xs).__array__()
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def make_initial_guess(self, key):
+        """Draw a uniform initial sample within the prior bounds."""
+        return jr.uniform(
+            key,
+            shape=(self.upper_prior_lim_all.shape[0],),
+            minval=self.lower_prior_lim_all,
+            maxval=self.upper_prior_lim_all,
+        )
+
+    def test(self, key):
         """Draw a uniform initial sample within the prior bounds."""
         return jr.uniform(
             key,
@@ -537,7 +541,7 @@ class SinglePulsarRedNoise:
     def _spit_neg_number(self):
         return -8.01
 
-class MultiPulsarRedNoise:
+class CorrelatedPulsarRedNoise:
     """
     A unified class for constructing the red-noise covariance (phi) matrix
     for pulsar timing array (PTA) analyses.
@@ -609,9 +613,12 @@ class MultiPulsarRedNoise:
     Nima Laal (original pandora classes, 02/12/2025)
     Unified refactor: Ge (06/2025)
     """
-
     def __init__(
         self,
+        psr_pos,
+        Npulsars,
+        signal_indices,
+        linear_timing_model_size,
         # ---- GWB ----
         gwb_psd_func,
         orf_func,
@@ -623,20 +630,34 @@ class MultiPulsarRedNoise:
         irn_helper_dictionary=None,
         irn_bins=None,
         f_irn=None,
-        first_irn_bin_index=0,
         # ---- DM noise (optional) ----
         dm_psd_func=None,
         dm_helper_dictionary=None,
         dm_bins=None,
         f_dm=None,
-        first_dm_bin_index=0,
         # ---- shared ----
-        psr_pos=None,
-        Npulsars=None,
-        first_crn_bin_index=0,
         renorm_const=1.0,
-        shared_irn_and_gwb=True,
     ):
+        ...
+        # Build basis and extract signal indices
+        # signal_indices maps signal name -> slice into Fmat columns (offset by tm_size)
+        # We need the Fourier-only row indices for phi_diag, so subtract tm_offset
+        self.signal_indices = signal_indices
+        tm_offset = linear_timing_model_size  # 0 if no T| prefix
+
+        def _fourier_slice(name):
+            """Convert Fmat column slice -> phi_diag frequency-row slice."""
+            sl = self.signal_indices[name]
+            start_col = sl.start - tm_offset
+            stop_col  = sl.stop  - tm_offset
+            # Each freq bin = 2 columns; integer-divide to get freq indices
+            return slice(start_col // 2, stop_col // 2)
+
+        # Replace first/last_*_bin_index with slices from signal_indices
+        self.GWB_slice     = _fourier_slice('cor')   # or whatever name used in basis_string
+        self.GWB_fidxs     = jnp.arange(self.GWB_slice.start, self.GWB_slice.stop)
+        self.crn_bins      = crn_bins
+
         # ------------------------------------------------------------------ #
         #  Basic bookkeeping                                                   #
         # ------------------------------------------------------------------ #
@@ -651,7 +672,6 @@ class MultiPulsarRedNoise:
         self.ppair_number = int(Npulsars * (Npulsars - 1) * 0.5)
         self.renorm_const = renorm_const
         self.logrenorm_offset = 0.5 * jnp.log10(renorm_const)
-        self.shared_irn_and_gwb = shared_irn_and_gwb
 
         # Frequency scalars / arrays
         self.crn_bins = crn_bins
@@ -695,31 +715,23 @@ class MultiPulsarRedNoise:
         # ------------------------------------------------------------------ #
         #  Frequency index arrays                                              #
         # ------------------------------------------------------------------ #
-        self.first_crn_bin_index = first_crn_bin_index
-        self.last_crn_bin_index = first_crn_bin_index + crn_bins
-
-        self.GWB_fidxs = jnp.arange(first_crn_bin_index,
-                                     first_crn_bin_index + crn_bins)
-
         if has_irn:
-            self.first_irn_bin_index = first_irn_bin_index
-            self.last_irn_bin_index = first_irn_bin_index + irn_bins
-
+            self.IRN_slice = _fourier_slice('unc')   # or 'irn', match basis_string name
             self.nonGWB_fidxs = jnp.array(
-                [i for i in range(first_irn_bin_index,
-                                  first_irn_bin_index + irn_bins)
-                 if i not in self.GWB_fidxs]
+                [i for i in range(int(self.IRN_slice.start/2), int(self.IRN_slice.stop/2))
+                if i not in self.GWB_fidxs]
             )
             self.separate_inversion_strat = bool(self.nonGWB_fidxs.any())
-        else:
-            self.nonGWB_fidxs = jnp.array([], dtype=int)
-            self.separate_inversion_strat = False
 
         if has_dm:
-            self.first_dm_bin_index = first_dm_bin_index
-            self.last_dm_bin_index = first_dm_bin_index + dm_bins
-            self.DM_fidxs = jnp.arange(first_dm_bin_index,
-                                        first_dm_bin_index + dm_bins)
+            self.DM_slice  = _fourier_slice('dm')
+            self.DM_fidxs  = jnp.arange(self.DM_slice.start, self.DM_slice.stop)
+
+        # n_total_bins is now just the stop of the last signal slice
+        all_stops = [self.GWB_slice.stop]
+        if has_irn: all_stops.append(self.IRN_slice.stop)
+        if has_dm:  all_stops.append(self.DM_slice.stop)
+        self.n_total_bins = max(all_stops)
 
         # ------------------------------------------------------------------ #
         #  Pulsar-pair angular separations & multi-dim index arrays           #
@@ -867,7 +879,7 @@ class MultiPulsarRedNoise:
     #  Internal PSD helpers                                                   #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _eval_gwb_psd(self, gwb_psd_params):
         """Evaluate the GWB PSD on ``self.f_common``."""
         filled = self.gwb_param_container.at[self.gwb_varied_indxs].set(
@@ -875,7 +887,7 @@ class MultiPulsarRedNoise:
         )
         return self.gwb_psd_func(self.f_common, self.df_gwb, *filled)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _eval_irn_psd_all(self, irn_params_flat):
         """
         Evaluate the IRN PSD for *all* pulsars.
@@ -897,7 +909,7 @@ class MultiPulsarRedNoise:
 
         return jax.vmap(_single)(per_psr, self.f_irn, self.df_irn).T  # → (irn_bins, Npulsars)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _eval_dm_psd_all(self, dm_params_flat):
         """
         Evaluate the DM PSD for *all* pulsars.
@@ -918,7 +930,7 @@ class MultiPulsarRedNoise:
     #  Parameter unpacking                                                    #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def _unpack(self, xs):
         """Return (irn_flat, dm_flat, gwb_psd_params, orf_params) from ``xs``."""
         irn = xs[:self.irn_end_idx]
@@ -931,49 +943,26 @@ class MultiPulsarRedNoise:
     #  Core phi builders                                                      #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_diag(self, xs):
-        """
-        Compute the diagonal of the phi-matrix (shape ``(n_total_bins, Npulsars)``)
-        and the GWB PSD (shape ``(crn_bins,)``).
-
-        Returns
-        -------
-        phi_diag : jnp.ndarray  (n_total_bins, Npulsars)
-        psd_common : jnp.ndarray  (crn_bins,)
-        """
         irn_flat, dm_flat, gwb_params, _ = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
 
-        if self.shared_irn_and_gwb:
-            n_total = self.irn_bins if self.has_irn else self.crn_bins
-        else:
-            n_total = self.irn_bins + self.crn_bins
-        if self.has_dm:
-            n_total = n_total + self.dm_bins
-
-        phi_diag = jnp.zeros((n_total, self.Npulsars))
+        phi_diag = jnp.zeros((self.n_total_bins, self.Npulsars))
 
         if self.has_irn:
-            irn_psd = self._eval_irn_psd_all(irn_flat)
-            phi_diag = phi_diag.at[
-                self.first_irn_bin_index:self.last_irn_bin_index
-            ].add(irn_psd)
+            irn_psd = self._eval_irn_psd_all(irn_flat)          # (irn_bins, Npulsars)
+            phi_diag = phi_diag.at[self.IRN_slice].add(irn_psd)
 
         if self.has_dm:
-            dm_psd = self._eval_dm_psd_all(dm_flat)
-            phi_diag = phi_diag.at[
-                self.first_dm_bin_index:self.last_dm_bin_index
-            ].add(dm_psd)
+            dm_psd = self._eval_dm_psd_all(dm_flat)             # (dm_bins, Npulsars)
+            phi_diag = phi_diag.at[self.DM_slice].add(dm_psd)
 
-        # Add GWB contribution to diagonal
-        phi_diag = phi_diag.at[
-            self.first_crn_bin_index:self.last_crn_bin_index
-        ].add(psd_common)
+        phi_diag = phi_diag.at[self.GWB_slice].add(psd_common)
 
         return phi_diag, psd_common
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat(self, xs):
         """
         Build the full phi-matrix  (n_total_bins, Npulsars, Npulsars).
@@ -1000,7 +989,7 @@ class MultiPulsarRedNoise:
         orf_val = self.orf_val if self.orf_fixed else self.orf_func(self.xi, *orf_params)
         return phi.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_full(self, xs):
         """
         Like ``get_phi_mat`` but also fills the *upper* triangle so the matrix
@@ -1017,7 +1006,7 @@ class MultiPulsarRedNoise:
         phi = phi.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
         return phi.at[self.KGW, self.J, self.I].set(orf_val * psd_common)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_CURN(self, xs):
         """
         Return the phi diagonal (CURN = Common Uncorrelated Red Noise):
@@ -1030,7 +1019,7 @@ class MultiPulsarRedNoise:
         """
         return self.get_phi_diag(xs)
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_from_diag(self, phi_diag, psd_common, orf_params=None):
         """
         Build the full phi-matrix from a pre-computed diagonal and GWB PSD.
@@ -1060,7 +1049,7 @@ class MultiPulsarRedNoise:
     #  Inversion                                                              #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_phi_mat_inv(self, phi):
         """
         Invert the phi-matrix using mixed Cholesky + diagonal strategies.
@@ -1104,43 +1093,32 @@ class MultiPulsarRedNoise:
 
     @jit_method
     def partial_reparm_helper(self, xs):
-
-        """
-        Constructs the phi-matrix based on the flattened array of model paraemters (`xs`)
-
-        :param xs: flattened array of model paraemters (`xs`)
-
-        :return: the phi-matrix` with dimensions `(n_f,n_p, n_p)`.
-        """
-        # Unpack `xs`
         irn_flat, dm_flat, gwb_params, _ = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
         *_, orf_params = self._unpack(xs)
-
-        # Unitiate the arrays
-        n_total = self.irn_bins if self.has_irn else 0
-
-        if self.has_dm:
-            n_total = n_total + self.dm_bins
-
-        phi_diag_non_gwb = jnp.zeros((n_total, self.Npulsars))
-        phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         orf_val = self.orf_val if self.orf_fixed else self.orf_func(self.xi, *orf_params)
-        # print(phi_diag_non_gwb.shape)
-        # Add non_gwb separately
+
+        # non-GWB diagonal (IRN + DM rows only, no GWB rows)
+        n_non_gwb = (self.IRN_slice.stop - self.IRN_slice.start if self.has_irn else 0) + \
+                    (self.DM_slice.stop  - self.DM_slice.start  if self.has_dm  else 0)
+        phi_diag_non_gwb = jnp.zeros((n_non_gwb, self.Npulsars))
+
+        # Offset slices relative to phi_diag_non_gwb (which starts at 0)
+        irn_local = slice(0, self.IRN_slice.stop - self.IRN_slice.start) if self.has_irn else None
+        dm_local  = slice(irn_local.stop if irn_local else 0,
+                        (irn_local.stop if irn_local else 0) + 
+                        (self.DM_slice.stop - self.DM_slice.start)) if self.has_dm else None
+
         if self.has_irn:
-            irn_psd = self._eval_irn_psd_all(irn_flat)
-            phi_diag_non_gwb = phi_diag_non_gwb.at[
-                self.first_irn_bin_index - self.crn_bins:self.last_irn_bin_index - self.crn_bins
-            ].add(irn_psd)
-
+            phi_diag_non_gwb = phi_diag_non_gwb.at[irn_local].add(
+                self._eval_irn_psd_all(irn_flat)
+            )
         if self.has_dm:
-            dm_psd = self._eval_dm_psd_all(dm_flat)
-            phi_diag_non_gwb = phi_diag_non_gwb.at[
-                self.first_dm_bin_index - self.crn_bins:self.last_dm_bin_index - self.crn_bins
-            ].add(dm_psd)
+            phi_diag_non_gwb = phi_diag_non_gwb.at[dm_local].add(
+                self._eval_dm_psd_all(dm_flat)
+            )
 
-        # Make the phi matrix for gwb ONLY!
+        phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         phi_gwb = phi_gwb.at[:, self.diag_idx, self.diag_idx].set(psd_common)
         phi_gwb = phi_gwb.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
         phi_gwb = phi_gwb.at[self.KGW, self.J, self.I].set(orf_val * psd_common)
@@ -1153,7 +1131,7 @@ class MultiPulsarRedNoise:
     #  Prior                                                                  #
     # ---------------------------------------------------------------------- #
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def get_lnprior(self, xs):
         """Uniform log-prior: returns a small constant if in bounds, -inf otherwise."""
         in_bounds = jnp.logical_and(
@@ -1164,7 +1142,7 @@ class MultiPulsarRedNoise:
     def get_lnprior_numpy(self, xs):
         return self.get_lnprior(xs).__array__()
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jit_method
     def make_initial_guess(self, key):
         """Draw a uniform initial sample within the prior bounds."""
         return jr.uniform(

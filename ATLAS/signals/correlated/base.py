@@ -4,7 +4,7 @@ from ATLAS.signals import signals_utils as sutils
 from ATLAS.signals import orf_functions as orf_funcs
 
 from functools import cached_property, partial
-
+from ATLAS.signals.correlated.utils import make_gwb_model
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
@@ -72,6 +72,10 @@ class Correlated:
     def __init__(self,
                  data,
                  name,
+                 psd_function,
+                 orf_function,
+                 upper_bound_psd,
+                 lower_bound_psd,
                  orf='hd',
                  nfreqs=10, 
                  halflog10_rho_range=(-9,-2), 
@@ -117,6 +121,12 @@ class Correlated:
         data : Atlas.data.Data.PTA_Data, optional
             The PTA data, by default None
         """
+        # PSD and ORF reparameterization
+        self.psd_function, self.orf_function, self.psd_reparam_helper = make_gwb_model(psd_function,
+                                        orf_function, 
+                                        lower_bound_array = lower_bound_psd, 
+                                        upper_bound_array = upper_bound_psd)
+
         # Simple initialization-------------------------------------------------
         self.name = name
         self.data = data

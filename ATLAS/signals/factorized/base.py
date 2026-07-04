@@ -1,11 +1,12 @@
 
 from ATLAS.utils import jit_method, jit
 from ATLAS.signals import signals_utils as sutils
-
+from ATLAS.signals.factorized.utils import make_irn_model
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 import jax.random as jrandom
+from ATLAS import parameterized
 
 from functools import partial
 
@@ -59,7 +60,10 @@ class Red:
     """
     def __init__(self,
                  name,
-                 data, 
+                 data,
+                 psd_function,
+                 lower_bound_psd,
+                 upper_bound_psd, 
                  nfreqs=10, 
                  halflog10_rho_range=(-9,-2), 
                  use_pulsar_tspan=False,
@@ -97,6 +101,11 @@ class Red:
         user_freqs: arr, optional
             Frequency bins provided by user to use instead of i/T harmonics.
         """
+        # PSD reparameterization
+        self.psd_function, self.psd_reparam_helper = make_irn_model(psd_function, 
+                                        lower_bound_array = lower_bound_psd, 
+                                        upper_bound_array = upper_bound_psd)
+        
         self.name = name
         self.data = data
         self.ndraws = posterior_draw_ndraws # Number of posterior draws to run in parallel when sampling_method is 'posterior_draws'
@@ -570,7 +579,8 @@ class SuperSignal:
         An array of diagonal indices for the Sigma matrix, used for efficient updates.
     """
     def __init__(self,
-                signal_helper,
+                signal_list,
+                signal_combination_string,
                 data,
                 ):
         """The constructor for the IRN_Freespectrum signal class.
@@ -595,6 +605,7 @@ class SuperSignal:
         data : Atlas.data
             Atlas data object.
         """
+        self.signal_combination_string = signal_combination_string
         self.data = data
         # extract data anlaysis settings from data object
         self.fixed_wn = self.data.fixed_wn
@@ -602,7 +613,6 @@ class SuperSignal:
         self.linear_timing = self.data.linear_timing
         self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
-        self.inc_chrom = data.include_chromatic
         
         # linear timing model attributes
         if self.marg_tm:
@@ -612,16 +622,17 @@ class SuperSignal:
         self.linear_timing = data.linear_timing
         self.lowest_value_eq_to_zero = 1e-40
 
-        self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(signal_helper)
+        self.signal_map = {s.name: s for s in signal_list}
+        self.has_unc = False; self.has_cor = False; self.has_dm = False
+        if 'cor' in self.signal_map.keys():
+            self.has_cor = True
+        if 'unc' in self.signal_map.keys():
+            self.has_unc = True
+        if 'dm' in self.signal_map.keys():
+            self.has_dm = True
 
-        # getting ways to slice TNT and TNr
-        self.gwb_idxs = self.signal_comb_idxs['cor']
-        self.chrom_idxs = self.signal_comb_idxs['chr'] if 'chr' in self.signal_comb_idxs.keys() else None
-
-        if 'cor' in [x.name for x in signal_helper['shared_basis']['signal_list']]:
-            self.non_gwb_idxs = slice(0, self.get_Fmat_concat.shape[-1], None)
-        else:
-            self.non_gwb_idxs = slice(0, self.gwb_idxs.start  , None)
+        self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
+        self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
 
         self.nmodes = self.get_Fmat_concat.shape[-1]
         self.npsrs = self.data.npsrs
@@ -645,9 +656,23 @@ class SuperSignal:
         
         self.eps_diag_idx = jnp.arange(self.linear_timing_model_size)
 
-    @jit_method   
+        self.model_maker()
+        
+    @jit_method     
     def update_red_basis(self, chrom_index):
-        DM = (1400 / self.data.radio_freqs) ** chrom_index
+        """        
+        Update the red noise basis using a
+        chromatic index per pulsar. 
+
+        Args:
+            chrom_index: The chromatic index per pulsar.
+            The shape of the array must be (npsrs)
+
+        Returns:
+            the updated red noise basis
+        """
+        index = chrom_index[self.data.dm_exploder_idxs]
+        DM = self.data.ref_over_radio_freqs ** index
         return self.get_Fmat_concat.at[:, self.chrom_idxs].multiply(DM[:, None])
 
     def padd_tm_design_matrix(self):
@@ -694,91 +719,94 @@ class SuperSignal:
             T.append(jnp.concat((M, F), axis = -1))
         return T
 
-    def build_basis(self, signal_helper):
+    def build_basis(self, basis_string, signal_map):
         """
-        Build the combined Fourier basis matrix and a dict mapping each signal
-        name to its column slice in the final F-matrix (and therefore in FNF).
+        Build the combined basis matrix and index slices for each signal.
+
+        The timing model columns (if [T] prefix used) are prepended to the
+        shared block only. Signal indices are offset accordingly so they
+        correctly index into the full T-matrix columns.
 
         Parameters
         ----------
-        signal_helper : dict with keys
-            'shared_basis' : {
-                'signal_list': [...] or None,
-                'index_of_signal_used_for_basis': int
-            }  or None
-            'separate' : {
-                'signal_list': [...] or None
-            }  or None
-            'order' : comma-separated signal names, e.g. 'dm,unc,cor'
+        basis_string : str
+            e.g. "[T]:unc+cor->unc | cw"
+        signal_map : dict
+            Maps signal names to signal objects,
+            e.g. {'unc': sig_unc, 'cor': sig_cor, 'cw': sig_cw}
 
         Returns
         -------
-        Fmat : jnp.ndarray, shape (n_toas, total_basis_cols)
+        Fmat : jnp.ndarray, shape (n_toas, total_cols)
+            Full basis matrix [M | F_shared | F_sep1 | ...]
         signal_indices : dict[str, slice]
-            Maps each signal name to its column slice in Fmat / FNF.
+            Maps each signal name to its column slice in Fmat.
+            For shared signals, slices index into the Fourier columns only
+            (i.e. offset by linear_timing_model_size, width = sig.nmodes).
+            For separate signals, same convention.
         """
-        shared_cfg   = signal_helper.get('shared_basis') or {}
-        separate_cfg = signal_helper.get('separate') or {}
-        order = [s.strip() for s in signal_helper['order'].split(',')]
+        cfg = sutils.parse_basis_string(basis_string)
 
-        # --- Shared group ---
-        shared_signals = shared_cfg.get('signal_list') or []
-        shared_idx     = shared_cfg.get('index_of_signal_used_for_basis', 0)
-        shared_names   = {sig.name for sig in shared_signals}
+        include_timing = cfg['include_timing']
+        shared_names   = cfg['shared_names']
+        rep            = cfg['representative']
+        separate_names = cfg['separate_names']
+        order          = cfg['order']
 
-        if self.linear_timing:
-            T = self.Tmaker(Fmats = shared_signals[shared_idx].get_basis(), 
-                padd_tm_design_matrix = True)
-        else:
-            T = shared_signals[shared_idx].get_basis()
-        shared_Fmat = (
-            jnp.concat(T)
-            if shared_signals else None
-        )
+        # Validate all names are in signal_map
+        missing = set(order) - set(signal_map)
+        if missing:
+            raise ValueError(f"Signals {missing} not found in signal_map")
 
-        # --- Separate signals ---
-        separate_signals = separate_cfg.get('signal_list') or []
-        separate_map = {}
-        for sig in separate_signals:
-            T_sig = sig.get_basis()
+        tm_offset = self.linear_timing_model_size if include_timing else 0
 
-            separate_map.update({sig.name: jnp.concat(T_sig)})
-
-        # --- Validate order covers exactly the declared signals ---
-        declared = shared_names | set(separate_map)
-        if set(order) != declared:
-            raise ValueError(
-                f"'order' signals {set(order)} do not match declared signals {declared}"
+        # --- Shared block ---
+        if rep is not None:
+            raw_basis = signal_map[rep].get_basis()
+            shared_Fmat = (
+                jnp.concat(self.Tmaker(raw_basis, padd_tm_design_matrix=True))
+                if include_timing
+                else jnp.concat(raw_basis)
             )
+        else:
+            shared_Fmat = None
 
-        # --- Assemble columns in user-specified order ---
+        # --- Separate blocks (never include timing model) ---
+        separate_Fmats = {
+            name: jnp.concat(signal_map[name].get_basis())
+            for name in separate_names
+        }
+
+        # --- Assemble in order ---
         Fmats          = []
         signal_indices = {}
-        col            = self.linear_timing_model_size
+        col            = tm_offset   # start after M columns
+
+        # Track timing model indices
+        if include_timing:
+            signal_indices['timing'] = slice(0, tm_offset)
 
         shared_block_placed = False
         shared_start        = None
-        shared_signal_ct = 0
+
         for name in order:
             if name in shared_names:
                 if not shared_block_placed:
-                    n_cols = shared_Fmat.shape[1]
                     Fmats.append(shared_Fmat)
                     shared_start        = col
                     shared_block_placed = True
-                    col += n_cols
-                signal_indices[name] = slice(shared_start, shared_start + shared_signals[shared_signal_ct].nmodes)
-                shared_signal_ct+=1
+                    col += shared_Fmat.shape[1] - tm_offset  # advance by F cols only
+                # Each shared signal gets a slice of width nmodes within the shared block
+                sig_nmodes = signal_map[name].nmodes
+                signal_indices[name] = slice(shared_start, shared_start + sig_nmodes)
             else:
-                col -= self.linear_timing_model_size
-                F      = separate_map[name]
+                F      = separate_Fmats[name]
                 n_cols = F.shape[1]
                 Fmats.append(F)
                 signal_indices[name] = slice(col, col + n_cols)
                 col += n_cols
 
         Fmat = jnp.concat(Fmats, axis=1)
-
         return Fmat, signal_indices
 
     def _get_helpers(self):
@@ -791,7 +819,7 @@ class SuperSignal:
         new_func: callable
             Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
         """
-        if not self.inc_chrom:
+        if not self.has_dm:
             if self.fixed_wn and not self.fixed_res:
                 new_func = partial(self.update_white_matrix_products_unjitted,
                                 N_list = self.data.Nmat,
@@ -851,7 +879,7 @@ class SuperSignal:
                                 reff = jnp.concat(self.data.raw_residuals)[:, None],)
                 return jit(new_func)
 
-    def add_parameterization(self, model):
+    def model_maker(self):
         """Add a specific parameterization of the power spectral density based
         on Atlas' `parameterized.py`.
 
@@ -860,7 +888,61 @@ class SuperSignal:
         model: Atlas.parameterized object.
             An instantiation of a parameterized object.
         """
-        self.model = model
+        if not self.has_cor:
+            model_kwargs = dict(
+                Npulsars                 = self.data.npsrs,
+                signal_indices           = self.signal_comb_idxs,
+                linear_timing_model_size = self.linear_timing_model_size,
+            )
+
+            if self.has_unc:
+                model_kwargs.update(
+                    irn_psd_func          = self.signal_map['unc'].psd_function,
+                    irn_helper_dictionary = self.signal_map['unc'].psd_reparam_helper,
+                    irn_bins              = self.signal_map['unc'].nfreqs,
+                    f_irn                 = self.signal_map['unc'].freqs,
+                )
+
+            if self.has_dm:
+                model_kwargs.update(
+                    dm_psd_func           = self.signal_map['dm'].psd_function,
+                    dm_helper_dictionary  = self.signal_map['dm'].psd_reparam_helper,
+                    dm_bins               = self.signal_map['dm'].nfreqs,
+                    f_dm                  = self.signal_map['dm'].freqs,
+                )
+
+            self.model = partial(parameterized.PerPulsarRedNoise, **model_kwargs)()
+        else:
+            model_kwargs = dict(
+                psr_pos                  = self.data.psr_pos,
+                Npulsars                 = self.data.npsrs,
+                signal_indices           = self.signal_comb_idxs,
+                linear_timing_model_size = self.linear_timing_model_size,
+                gwb_psd_func             = self.signal_map['cor'].psd_function,
+                orf_func                 = self.signal_map['cor'].orf_function,
+                gwb_helper_dictionary    = self.signal_map['cor'].psd_reparam_helper,
+                crn_bins                 = self.signal_map['cor'].nfreqs,
+                f_common                 = self.signal_map['cor'].freqs,
+            )
+
+            if self.has_unc:
+                model_kwargs.update(
+                    irn_psd_func          = self.signal_map['unc'].psd_function,
+                    irn_helper_dictionary = self.signal_map['unc'].psd_reparam_helper,
+                    irn_bins              = self.signal_map['unc'].nfreqs,
+                    f_irn                 = self.signal_map['unc'].freqs,
+                )
+
+            # --- Optional DM kwargs ---
+            if self.has_dm:
+                model_kwargs.update(
+                    dm_psd_func           = self.signal_map['dm'].psd_function,
+                    dm_helper_dictionary  = self.signal_map['dm'].psd_reparam_helper,
+                    dm_bins               = self.signal_map['dm'].nfreqs,
+                    f_dm                  = self.signal_map['dm'].freqs,
+                )
+
+            self.model = partial(parameterized.CorrelatedPulsarRedNoise, **model_kwargs)()
 
     def update_white_matrix_products_unjitted(self, red_noise_basis, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
@@ -889,8 +971,7 @@ class SuperSignal:
         return N_list.get_red_helpers(red_noise_basis = red_noise_basis, 
                                       residuals = reff, 
                                       white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
-
-                                        
+                                     
     @jit_method
     def get_sigma(self, TNT, phi_diag):
         """Get the per-pulsar fourier coefficient covariance matrix Sigma. [npsr, nmodes, nmodes]
@@ -1065,13 +1146,8 @@ class SuperSignal:
         lnlike = 0.5 * (expvals - logdet_Sigma - logdet_phis.sum()) # scalar
         return lnlike - 0.5 * (rNr + logdet_N)
     
-
     @jit_method
-    def lnposterior_partial_marg_reparam(self,
-                                        helpers,
-                                        red_params,
-                                        z):
-
+    def lnposterior_partial_marg_reparam(self, helpers, red_params, z):
         """
         This method evaluates the partially marginalized posterior under a reparameterization of the Fourier
         coefficients.
@@ -1082,9 +1158,8 @@ class SuperSignal:
         helpers : tuple
             The helper objects (TNT and TNr) for each pulsar. 
             [npsr, nmode, nmode], [npsr, nmode]
-        red_noise_cov : array
-            The red noise covaraince matrix
-            over FREQUENCY! [nfreqs, npsr, npsr]
+        red_params : array
+            The red noise parameters
         z : array
             "Whitened coefficients", [npsr, nmode]
         Returns
@@ -1092,132 +1167,117 @@ class SuperSignal:
         tuple
             Fourier coefficients with variance imposed by spectral model [npsr, nmodes] and
             the log-determinant of the Jacobian of the coordinate transformation [float].
-        """ 
-        # ── Slice TNT/TNr into GWB and IRN blocks ────────────────────────────────
-        # TNT, TNr, rNr, logdet_N = helpers
+        """
         TNT_b, TNr_b, rNr, logdet_N, TNT_p, TNr_p, T_bp = helpers
 
         full_gwb_phi, gwb_phi_diag, psr_phi_diags = self.model.partial_reparm_helper(red_params)
-        gwb_phi_diag = jnp.repeat(gwb_phi_diag, 2, axis = 0)[:, 0] #[nmode_b]
-        psr_phi_diags = jnp.repeat(psr_phi_diags.T, 2, axis = 1) #[npsr, nmode_p]
-    
-        LG = jsl.cho_factor(full_gwb_phi, lower=True)                     #[nfreqs,npsrs,npsrs]
-        gwb_phi_inv = jnp.repeat(jsl.cho_solve(LG, self.model._eye), 2, axis = 0)
+        gwb_phi_diag  = jnp.repeat(gwb_phi_diag, 2, axis=0)[:, 0]          # [nmode_b]
+        psr_phi_diags = jnp.repeat(psr_phi_diags.T, 2, axis=1)             # [npsr, nmode_p]
 
-
-        # # TODO: CHECK THESE SLICINGS!!!
-        # TNT_b = TNT[:, self.gwb_idxs, self.gwb_idxs]  # [npsr, nmode_b, nmode_b], [npsr, nmode_b]
-        # TNr_b = TNr[:, self.gwb_idxs] 
-        # TNT_p = TNT[:, self.non_gwb_idxs, self.non_gwb_idxs]  # [npsr, nmode_p, nmode_p], [npsr, nmode_p]
-        # TNr_p = TNr[:, self.non_gwb_idxs]
-        # T_bp = TNT[:, self.gwb_idxs, self.non_gwb_idxs]         # [npsr, nmode_b, nmode_p]
+        LG = jsl.cho_factor(full_gwb_phi, lower=True)
+        gwb_phi_inv = jnp.repeat(jsl.cho_solve(LG, self.model._eye), 2, axis=0)
 
         (npsrs, nmodes_b, nmodes_p) = T_bp.shape
 
         # -------------------------------------------------------------------------
-        # Pulsar RN block: invert Sigma_p = (T_pp + phi_p_inv)^{-1} per pulsar
-        # Block-diagonal across pulsars [npsr, nmode_p, nmode_p]
+        # Pulsar RN block: Sigma_p = (TNT_p + phi_p_inv)  [npsr, nmode_p, nmode_p]
         # -------------------------------------------------------------------------
         psr_sigma_p_inv = TNT_p + jnp.einsum('pi,ij->pij', 1. / psr_phi_diags, jnp.eye(nmodes_p))
         psr_phi_p_ln_det = jnp.sum(jnp.log(psr_phi_diags))
 
-        psr_sigma_p_inv_chol = jnp.linalg.cholesky(psr_sigma_p_inv)  # [npsr, nmode_p, nmode_p]
+        psr_sigma_p_inv_chol = jnp.linalg.cholesky(psr_sigma_p_inv)        # [npsr, nmode_p, nmode_p]
         psr_sigma_p_inv_ln_dets = 2 * jnp.sum(
             jnp.log(jnp.diagonal(psr_sigma_p_inv_chol, axis1=1, axis2=2)), axis=1
         )  # [npsr]
 
         # -------------------------------------------------------------------------
-        # inner products needed for likelihood / standardizing transformation
+        # Inner products for Schur complement
         # -------------------------------------------------------------------------
-        # L^{-1} T_bp^T
         Linv_T_bpT = jax.lax.linalg.triangular_solve(
             psr_sigma_p_inv_chol, T_bp.mT, left_side=True, lower=True
         )  # [npsr, nmode_p, nmode_b]
 
-        # L^{-1} r_p
         Linv_r_p = jax.lax.linalg.triangular_solve(
             psr_sigma_p_inv_chol, TNr_p[:, :, None], left_side=True, lower=True
         )  # [npsr, nmode_p, 1]
 
-        # T_bp Sigma_p T_bp^T = (L^{-1} T_bp^T)^T (L^{-1} T_bp^T)
-        T_bp_Sigma_p_T_bpT = Linv_T_bpT.mT @ Linv_T_bpT  # [npsr, nmode_b, nmode_b]
-
-        # T_bp Sigma_p r_p = (L^{-1} T_bp^T)^T (L^{-1} r_p)
-        T_bp_Sigma_p_r_p = (Linv_T_bpT.mT @ Linv_r_p)[:, :, 0]  # [npsr, nmode_b]
-
-        # r_p^T Sigma_p r_p = (L^{-1} r_p)^T (L^{-1} r_p)
-        r_p_Sigma_p_r_p = Linv_r_p.mT @ Linv_r_p  # [npsr, 1, 1]
+        T_bp_Sigma_p_T_bpT = Linv_T_bpT.mT @ Linv_T_bpT   # [npsr, nmode_b, nmode_b]
+        T_bp_Sigma_p_r_p   = (Linv_T_bpT.mT @ Linv_r_p)[:, :, 0]  # [npsr, nmode_b]
+        r_p_Sigma_p_r_p    = Linv_r_p.mT @ Linv_r_p        # [npsr, 1, 1]
 
         # -------------------------------------------------------------------------
-        # GWB block: build Sigma_b_inv and GWB prior arrays
+        # GWB block: Sigma_b_inv  [npsr, nmode_b, nmode_b]
+        # phiinvs_diags packs both the Schur complement term and the GWB prior
+        # into a single additive correction to TNT_b
         # -------------------------------------------------------------------------
-        gwb_phi_inv_spec = jnp.diag(1. / gwb_phi_diag) # [nmode_b, nmode_b]
+        gwb_phi_inv_spec = jnp.diag(1. / gwb_phi_diag)                     # [nmode_b, nmode_b] (CRN only)
 
-        # phiinvs_diags_ltm = jnp.full(shape = TNT_b.shape, fill_value = self.lowest_value_eq_to_zero)
-        phiinvs_diags_ltm = -T_bp_Sigma_p_T_bpT + self.lowest_value_eq_to_zero
-        # print(phiinvs_diags_ltm.shape)
-        # print(gwb_phi_inv_spec[None].shape)
-        # print(T_bp_Sigma_p_T_bpT.shape)
-        phiinvs_diags = phiinvs_diags_ltm.at[:, self.linear_timing_model_size:, self.linear_timing_model_size:].add(gwb_phi_inv_spec[None])
-        # set prior variance of padded parameters to one for stable transformation
-        phiinvs_diags = phiinvs_diags.at[:, self.eps_diag_idx, self.eps_diag_idx].add(self._pad_mask)
+        phiinvs_diags = (-T_bp_Sigma_p_T_bpT + self.lowest_value_eq_to_zero)
+        phiinvs_diags = phiinvs_diags.at[:, self.linear_timing_model_size:,
+                                            self.linear_timing_model_size:].add(gwb_phi_inv_spec[None])
+        phiinvs_diags = phiinvs_diags.at[:, self.eps_diag_idx,
+                                            self.eps_diag_idx].add(self._pad_mask)
 
-        # TNT_b : [npsr, ntiming + ncrn, ntiming + ncrn]
-        # gwb_phi_inv_spec : [ncrn, ncrn]
-        # T_bp_Sigma_p_T_bpT : [npsr, ncrn, ncrn]
-        # gwb_sigma_b_inv = TNT_b + gwb_phi_inv_spec[None] - T_bp_Sigma_p_T_bpT         # [npsr, nmode_b, nmode_b]
-        gwb_sigma_b_inv = TNT_b + phiinvs_diags
+        gwb_sigma_b_inv = TNT_b + phiinvs_diags                            # [npsr, nmode_b, nmode_b]
 
-        # Effective GWB data vector: w_b = r_b - T_bp Sigma_p r_p
-        w_b = TNr_b - T_bp_Sigma_p_r_p  # [npsr, nmode_b]
+        # Effective data vector after marginalising IRN
+        w_b = TNr_b - T_bp_Sigma_p_r_p                                     # [npsr, nmode_b]
 
         # -------------------------------------------------------------------------
-        # Standardizing transformation: a_b = a_hat_b + L_b z
+        # Standardizing transformation: a_b = a_hat_b + L_b^{-T} z
         # -------------------------------------------------------------------------
-        Sigma_b_inv_L = jnp.linalg.cholesky(gwb_sigma_b_inv)  # [npsr, nmode_b, nmode_b]
+        Sigma_b_inv_L = jnp.linalg.cholesky(gwb_sigma_b_inv)               # [npsr, nmode_b, nmode_b]
 
-        # L y = w_b
-        y_b = jax.lax.linalg.triangular_solve(
+        y_b    = jax.lax.linalg.triangular_solve(
             Sigma_b_inv_L, w_b[:, :, None], left_side=True, lower=True
-        )
-        # L^T a_hat_b = y_b
+        )  # L y = w_b
         a_hat_b = jax.lax.linalg.triangular_solve(
             Sigma_b_inv_L, y_b, left_side=True, lower=True, transpose_a=True
-        )
-        # L^T (L_b z) = z
+        )  # L^T a_hat = y
         Lz = jax.lax.linalg.triangular_solve(
             Sigma_b_inv_L, z[:, :, None], left_side=True, lower=True, transpose_a=True
-        )
-        a_b = a_hat_b + Lz  # [npsr, nmode_b, 1]
+        )  # L^T Lz = z
+        a_b = a_hat_b + Lz                                                  # [npsr, nmode_b, 1]
 
         lndet_Jac = -jnp.sum(jnp.log(jnp.diagonal(Sigma_b_inv_L, axis1=1, axis2=2)))
 
         # -------------------------------------------------------------------------
-        # Log-likelihood (marginalised over a_p)
+        # Log-likelihood: use full a_b — timing model params couple to CRN through
+        # off-diagonal blocks of W_b = TNT_b - T_bp_Sigma_p_T_bpT, so dropping
+        # the timing model slice introduces missing quadratic and linear terms
         # -------------------------------------------------------------------------
-        a_G = a_b[:, self.linear_timing_model_size:]
-        ln_likelihood_val  = -0.5 * jnp.sum(a_G.mT @ (gwb_sigma_b_inv[:, self.linear_timing_model_size:, self.linear_timing_model_size:] - gwb_phi_inv_spec[None]) @ a_G)
-        ln_likelihood_val +=        jnp.sum(a_G[..., 0] * w_b[:, self.linear_timing_model_size:])
+        # W_b = gwb_sigma_b_inv minus the GWB prior block (leave timing and
+        # stabiliser terms in place; they are O(lowest_value) and cancel with
+        # padded_logpdf below)
+        phi_b_prior = jnp.zeros_like(gwb_sigma_b_inv)
+        phi_b_prior = phi_b_prior.at[:, self.linear_timing_model_size:,
+                                        self.linear_timing_model_size:].set(gwb_phi_inv_spec[None])
+        W_b = gwb_sigma_b_inv - phi_b_prior                                 # ≈ S_b = TNT_b - T_bp Sigma_p T_bp^T
+
+        ln_likelihood_val  = -0.5 * jnp.sum(a_b.mT @ W_b @ a_b)
+        ln_likelihood_val +=        jnp.sum(a_b[..., 0] * w_b)
         ln_likelihood_val +=  0.5 * jnp.sum(r_p_Sigma_p_r_p)
         ln_likelihood_val += -0.5 * psr_phi_p_ln_det - 0.5 * jnp.sum(psr_sigma_p_inv_ln_dets)
 
         # -------------------------------------------------------------------------
-        # Log-prior on GWB coefficients: -1/2 a_b^T phi_b_inv a_b - 1/2 ln|phi_b|
+        # Log-prior on GWB coefficients only (timing model has flat/improper prior)
         # -------------------------------------------------------------------------
-        aG = a_G.transpose((1, 0, 2)) #[npsrs,nmodes,1]-->[nmodes,npsrs,1]
-        logdet_phi_gwb = 4 * jnp.sum(jnp.log(LG[0].diagonal(axis1=-2, axis2=-1))) #LG is not repeated hence the 4 not 2
+        a_G  = a_b[:, self.linear_timing_model_size:]                       # [npsr, ncrn, 1]
+        aG   = a_G.transpose((1, 0, 2))                                     # [ncrn, npsr, 1]
+        logdet_phi_gwb = 4 * jnp.sum(jnp.log(LG[0].diagonal(axis1=-2, axis2=-1)))
         ln_prior_val = -0.5 * jnp.sum(aG.mT @ gwb_phi_inv @ aG + logdet_phi_gwb)
 
+        # -------------------------------------------------------------------------
+        # HMC curvature for zero-padded timing model entries
+        # -------------------------------------------------------------------------
         if self.linear_timing and not self.marg_tm:
-            # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
-            # these parameters do not impact the likelihood, prior, and are uncorrelated with all other parameters
-            # so this should not effect parameter estimation, but merely provides some curvature for HMC to latch
-            # onto when sampling 
-            padded_logpdf = -0.5 * jnp.sum((self._pad_mask * a_b[:, :self.linear_timing_model_size, 0])**2)
+            padded_logpdf = -0.5 * jnp.sum(
+                (self._pad_mask * a_b[:, :self.linear_timing_model_size, 0]) ** 2
+            )
         else:
             padded_logpdf = 0.
 
-        return ln_likelihood_val + ln_prior_val + lndet_Jac + padded_logpdf + 0.5 * jnp.sum(z**2), aG
+        return ln_likelihood_val + ln_prior_val + lndet_Jac + padded_logpdf + 0.5 * jnp.sum(z ** 2), aG
 
 
     

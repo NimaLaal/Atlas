@@ -26,37 +26,8 @@ jax.config.update('jax_enable_x64', True)
 from ATLAS.utils import jit, jit_method
 from functools import partial
 import jax.scipy.linalg as jsl
+from ATLAS.signals.signals_utils import _timing_model_svd
 
-def _timing_model_svd(M):
-    """Create an more stable basis for the timing model design matrix using SVD.
-
-    This function is used to create a basis U which represents the timing model
-    design matrix M and normalizes each of the basis vectors. This can be used
-    as a more stable alternative to M in timing model marginalization. 
-
-    This takes an SVD of the design matrix M, and returns only the left singular 
-    vectors U as the new basis. This works since during the marginalization process,
-    the singular values aren't important when integrating over the whole range of
-    timing model coefficients. Likewise, the right singular vectors are only
-    used to project into the original basis, which we do not need.
-
-    Parameters
-    ----------
-    M : array
-        The design matrix for the timing model. [ntoas, nparams]
-
-    Returns
-    -------
-    array
-        The left singular vectors of the design matrix M, which can be used as a more
-        stable basis for timing model marginalization. [ntoas, nparams]
-    """
-    U,C,V = jnp.linalg.svd(M, full_matrices=False)
-    # Return just the left singular vector.
-    # The singular values are a weighting factor that isn't important when marginalizing.
-    # the right singular vectors are used to project into the original basis, which isn't 
-    # important for marginalization either. 
-    return U
 
 _MAS_YR_TO_RAD_DAY = (np.pi / 180.0 / 3.6e6) / 365.25
 
