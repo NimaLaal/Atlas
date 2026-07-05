@@ -1,5 +1,5 @@
 
-from ATLAS.utils import jit
+from ATLAS.utils import jit, jit_method
 from ATLAS.utils import F_YEAR_HZ
 import functools
 import numpy as np
@@ -94,6 +94,51 @@ def build_basis(signal_helper):
     Fmat = jnp.concat(Fmats, axis=1)
 
     return Fmat, signal_indices
+
+def stabelize_TNT(A, A_shape, eps=1e-9):
+    """
+    This function stabelizes a batched of positve definite matricies
+    by shifting the diagonals of the matricies by
+    max(0, eps * eigen_max - eigen_min) where eps is a very small 
+    float. NOTE: the eigen decomposition is too expensive, so lets
+    just do a `dumb` inflation of diagonals!
+
+    Args:
+        A (array): The batch of positve definite matricies
+        eps (float, optional): the small positive float. Defaults to 1e-9.
+
+    Returns:
+        array: the numerically stabelized batch of positve definite matricies
+    """    
+    # eigvals = jnp.linalg.eigvalsh(A)
+    # shift = jnp.maximum(0.0, -eigvals[..., :1] + eps * eigvals[..., -1:])
+    # return A + shift[..., None] * jnp.eye(A_shape)
+
+    lowest = A.diagonal(axis1 = -2, axis2 = -1).min(axis = -1)[..., None]
+    idxs = jnp.arange(A_shape)
+    return A.at[:, idxs, idxs].add(eps * lowest)
+
+def stabelize_TDNTD(A, A_shape, eps=1e-9):
+    """
+    This function stabelizes a batched of positve definite matricies
+    by shifting the diagonals of the matricies by
+    max(0, eps * eigen_max - eigen_min) where eps is a very small 
+    float. 
+
+    Args:
+        A (array): The batch of positve definite matricies
+        eps (float, optional): the small positive float. Defaults to 1e-9.
+
+    Returns:
+        array: the numerically stabelized batch of positve definite matricies
+    """    
+    # eigvals = jnp.linalg.eigvalsh(A)
+    # shift = jnp.maximum(0.0, -eigvals[..., :1] + eps * eigvals[..., -1:])
+    # return A + shift[..., None] * jnp.eye(A_shape)
+
+    lowest = A.diagonal(axis1 = -2, axis2 = -1).min(axis = -1)[..., None]
+    idxs = jnp.arange(A_shape)
+    return A.at[:, idxs, idxs].add(eps * lowest)
 
 def _extract_fixed_from_partial(func, fixed_params, fixed_values, skip):
     """

@@ -1,0 +1,6 @@
+site_name: ATLAS
+
+theme: readthedocs
+
+nav:
+  - Home: index.md
