@@ -458,7 +458,16 @@ def setup_timing_model(par_path: str, tim_path: str,
 
     result_dummy = session.fit_parameters(max_iter=5)
     # Raw design matrix — PINT-matching sign/units; columns == design_matrix_labels
-    # (OFFSET first, then every free fit param).
+    # (OFFSET first, then every free fit param).  JUG returns design_matrix=None
+    # when its fit accepts zero steps (an already-optimal or very stiff fit like
+    # B1937+21 where every trial step marginally worsens the RMS); guard against
+    # the silent np.asarray(None) that would otherwise corrupt the linear basis.
+    if result_dummy.get('design_matrix') is None:
+        raise RuntimeError(
+            "JUG fit_parameters returned design_matrix=None (no fit step was "
+            "accepted).  ATLAS needs the design matrix at the par values as its "
+            "linear basis.  Update JUG to seed the design matrix on the first "
+            "iteration (optimized_fitter saves it only on step-accept).")
     _design_matrix_raw = np.asarray(result_dummy['design_matrix'])    # (n_toa, n_col)
     _design_labels_raw = list(result_dummy['design_matrix_labels'])   # incl. 'OFFSET'
     _fittable = [l for l in _design_labels_raw if l != 'OFFSET']       # real JUG labels
