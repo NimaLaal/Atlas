@@ -1092,7 +1092,7 @@ class CorrelatedPulsarRedNoise:
         return jnp.repeat(phiinv, 2, axis=0), 2.0 * logdet_phi
 
     @jit_method
-    def partial_reparm_helper(self, xs):
+    def partial_reparm_helper(self, xs, pad_mask):
         irn_flat, dm_flat, gwb_params, _ = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
         *_, orf_params = self._unpack(xs)
@@ -1123,7 +1123,26 @@ class CorrelatedPulsarRedNoise:
         phi_gwb = phi_gwb.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
         phi_gwb = phi_gwb.at[self.KGW, self.J, self.I].set(orf_val * psd_common)
 
-        return phi_gwb, psd_common, phi_diag_non_gwb
+        # per-pulsar phi
+        phiinv_non_gwb = 1 / phi_diag_non_gwb
+        logdet_phi_non_gwb = 2.0 * jnp.sum(jnp.log(phi_diag_non_gwb))
+        ltm_size = pad_mask.shape[-1]
+        concat_phiinv_non_gwb = jnp.zeros((2 * phi_diag_non_gwb.shape[0] + ltm_size, self.Npulsars))
+        concat_phiinv_non_gwb = concat_phiinv_non_gwb.at[ltm_size:].set(jnp.repeat(phiinv_non_gwb, repeats=2, axis=0))
+        concat_phiinv_non_gwb = concat_phiinv_non_gwb.at[:ltm_size].set(pad_mask.mT)
+        concat_phiinv_non_gwb += 1e-40
+
+        # gwb phi
+        cp = jsp.linalg.cho_factor(phi_gwb, lower=True)
+        phiinv_gwb = jsp.linalg.cho_solve(cp, self._eye)
+        logdet_phi_gwb = 4.0 * jnp.sum(jnp.log(cp[0].diagonal(axis1=-2, axis2=-1)))     # x4 b/c Cholesky + nfreq size
+        
+        result = (jnp.repeat(phiinv_gwb, repeats=2, axis=0),
+                  logdet_phi_gwb,
+                  concat_phiinv_non_gwb.mT,
+                  logdet_phi_non_gwb)
+        
+        return result
 
 
 
