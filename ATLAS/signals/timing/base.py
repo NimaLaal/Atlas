@@ -34,15 +34,18 @@ _MAS_YR_TO_RAD_DAY = (np.pi / 180.0 / 3.6e6) / 365.25
 _BINARY_KIND = {
     '': 'none', 'NONE': 'none',
     'ELL1': 'ell1', 'ELL1H': 'ell1',
-    'DD': 'dd', 'DDH': 'dd', 'DDGR': 'dd', 'DDK': 'dd',
+    'DD': 'dd', 'DDH': 'dd', 'DDGR': 'dd',
+    'DDK': 'ddk',
     'BT': 'bt', 'BTX': 'bt',
 }
 
 # jug.delays.combined.combined_delays binary_model_id switch (jax.lax.switch order):
-#   0=None, 1=ELL1, 2=DD, 3=T2, 4=BT, 5=DDK.  We route ELL1/DD/BT here; the
+#   0=None, 1=ELL1, 2=DD, 3=T2, 4=BT, 5=DDK.  We route ELL1/DD/BT/DDK here; the
 #   hand-rolled binary/astrometry kernels are retired in favour of
-#   combined_delays (binary/DM/FD/SW) and barycentric_jax (astrometry).
-_BINARY_MODEL_ID = {'none': 0, 'ell1': 1, 'dd': 2, 'bt': 4}
+#   combined_delays (binary/DM/FD/SW) and barycentric_jax (astrometry).  DDK
+#   selects the Kopeikin (KIN/KOM) branch; DDGR still reduces to DD (MTOT-derived
+#   PK params are not yet solved for — MTOT is rejected in the setup guard).
+_BINARY_MODEL_ID = {'none': 0, 'ell1': 1, 'dd': 2, 'bt': 4, 'ddk': 5}
 
 # Parameters wired into delay kernels below.
 # Anything else is accepted (warned) but contributes zero delay.
@@ -57,16 +60,39 @@ _KERNEL_PARAMS = frozenset({
     'TASC', 'EPS1', 'EPS2',
     'T0', 'ECC', 'OM',
     'M2', 'SINI',
-    # Secondary binary / DM-Taylor params, wired through combined_delays as traced
-    # args (DD/BT only for XDOT/OMDOT; DM1/DM2 extend the DM Taylor for all models).
-    'XDOT', 'OMDOT', 'DM1', 'DM2',
+    # Secondary binary params, all wired through combined_delays as traced args.
+    # Which ones are physically active depends on the binary model (e.g. EPS*DOT
+    # for ELL1, OMDOT/EDOT for DD, KIN/KOM for DDK, H3/H4/STIG orthometric
+    # Shapiro for ELL1H); inactive slots evaluate to zero delay, which the
+    # zero-Jacobian guard reports if such a param is sampled under a model that
+    # ignores it.  Fn / FDn / DMn / FBn / DMX / JUMP are handled by pattern below.
+    'XDOT', 'OMDOT', 'EDOT', 'GAMMA', 'PBDOT',
+    'EPS1DOT', 'EPS2DOT',
+    'H3', 'H4', 'STIG', 'KIN', 'KOM', 'DR', 'DTH',
+    # Solar-wind amplitude — returned by combined_delays as sw_sec(ne_sw), the
+    # same delay family as dm_sec(DM); traced like any other kernel param.
+    'NE_SW',
+})
+
+# Binary params JUG exposes as fittable but ATLAS's combined_delays wiring does
+# NOT model — sampling any of these would silently produce a zero/NaN Jacobian
+# column, so they are rejected up front with a clear error (see setup guard).
+# These genuinely have no combined_delays slot (unlike NE_SW, which does).
+#   A0/B0    : first-order aberration (no combined_delays slot)
+#   MTOT     : DDGR total mass (DDGR reduces to DD here; PK params not derived)
+#   SHAPMAX  : DDS Shapiro reparam (no slot)
+#   XOMDOT/XPBDOT : DDGR excess secular terms (no slot)
+_UNSUPPORTED_PARAMS = frozenset({
+    'A0', 'B0', 'MTOT', 'SHAPMAX', 'XOMDOT', 'XPBDOT',
 })
 
 # Patterns for parameter families handled generically.
 _RE_FN    = re.compile(r'^F(\d+)$')         # F2, F3, …
+_RE_DM    = re.compile(r'^DM(\d+)$')        # DM1, DM2, … (DM Taylor; NOT DMX_/DM)
 _RE_DMX   = re.compile(r'^DMX_\d+$', re.IGNORECASE)
 _RE_JUMP  = re.compile(r'^JUMP(\d+)$', re.IGNORECASE)
 _RE_FD    = re.compile(r'^FD(\d+)$', re.IGNORECASE)  # FD1, FD2, FD3, …
+_RE_FB    = re.compile(r'^FB(\d+)$', re.IGNORECASE)  # FB0, FB1, … (orbital freq)
 
 # Ecliptic public names → JUG internal equatorial working keys
 _ECL_TO_EQ: dict[str, str] = {
@@ -105,13 +131,18 @@ def _read_param(params: dict, name: str) -> float:
 
 
 def _classify_param(name: str) -> str:
-    """Return the class of a parameter: 'kernel', 'fn', 'dmx', 'jump', 'fd', 'unknown'."""
+    """Return the class of a parameter: 'kernel', 'fn', 'dm', 'fb', 'dmx',
+    'jump', 'fd', 'unknown'."""
     if name in _KERNEL_PARAMS:
         return 'kernel'
     if _RE_FN.match(name):
         return 'fn'
-    if _RE_DMX.match(name):
+    if _RE_DMX.match(name):      # DMX_0001 — check before _RE_DM (DM\d+)
         return 'dmx'
+    if _RE_DM.match(name):       # DM1, DM2, … Taylor coefficients
+        return 'dm'
+    if _RE_FB.match(name):       # FB0, FB1, … orbital-frequency Taylor
+        return 'fb'
     if _RE_JUMP.match(name):
         return 'jump'
     if _RE_FD.match(name):
@@ -427,7 +458,16 @@ def setup_timing_model(par_path: str, tim_path: str,
 
     result_dummy = session.fit_parameters(max_iter=5)
     # Raw design matrix — PINT-matching sign/units; columns == design_matrix_labels
-    # (OFFSET first, then every free fit param).
+    # (OFFSET first, then every free fit param).  JUG returns design_matrix=None
+    # when its fit accepts zero steps (an already-optimal or very stiff fit like
+    # B1937+21 where every trial step marginally worsens the RMS); guard against
+    # the silent np.asarray(None) that would otherwise corrupt the linear basis.
+    if result_dummy.get('design_matrix') is None:
+        raise RuntimeError(
+            "JUG fit_parameters returned design_matrix=None (no fit step was "
+            "accepted).  ATLAS needs the design matrix at the par values as its "
+            "linear basis.  Update JUG to seed the design matrix on the first "
+            "iteration (optimized_fitter saves it only on step-accept).")
     _design_matrix_raw = np.asarray(result_dummy['design_matrix'])    # (n_toa, n_col)
     _design_labels_raw = list(result_dummy['design_matrix_labels'])   # incl. 'OFFSET'
     _fittable = [l for l in _design_labels_raw if l != 'OFFSET']       # real JUG labels
@@ -476,14 +516,36 @@ def setup_timing_model(par_path: str, tim_path: str,
                 | {k: 'marginalise' for k in marg_set}
                 | {k: 'fix' for k in fixed_set})
 
+    # ---- Guard: sampled params must be wired into m_total_sec -------------
+    # A SAMPLED param is recovered by autodiff of ATLAS's m_total_sec, so it
+    # must have a delay kernel here; a MARGINALISED param instead rides JUG's
+    # own design-matrix column and needs no ATLAS wiring.  So this guard is
+    # scoped to sample_list only.
+    #
+    # (1) Known-fittable-in-JUG but deliberately-not-modelled here → hard error,
+    #     otherwise they would silently yield a zero/NaN Jacobian column and a
+    #     NaN MLE (the failure mode this guard exists to prevent).  Marginalise
+    #     or fix them instead.
+    unsupported = [k for k in sample_list if k in _UNSUPPORTED_PARAMS]
+    if unsupported:
+        raise NotImplementedError(
+            f"Sampled params {unsupported} are fittable in JUG but not modelled "
+            "by ATLAS's combined_delays wiring, so they cannot be recovered by "
+            "sampling (they would give zero/NaN Jacobian columns).  Move them to "
+            "marginalise_list (they ride JUG's linear design matrix) or fix them "
+            "at their par value.")
+    # (2) Anything else with no recognised class is an unforeseen gap → error
+    #     rather than warn, so a new JUG parameter family can never slip through
+    #     as a silent zero column.
     unknown = [k for k in sample_list if _classify_param(k) == 'unknown']
     if unknown:
-        warnings.warn(
-            f"Sampled params {unknown} have no delay kernel; they will appear in "
-            "the Jacobian/MLE with zero columns and cannot be recovered.  Add a "
-            "kernel branch to m_total_sec() to give them physical meaning.",
-            stacklevel=2,
-        )
+        raise NotImplementedError(
+            f"Sampled params {unknown} have no delay kernel in m_total_sec and no "
+            "recognised parameter family (kernel/Fn/DMn/FBn/FDn/DMX/JUMP).  This "
+            "usually means JUG gained a new fittable parameter that ATLAS has not "
+            "wired yet; add a kernel branch (and _KERNEL_PARAMS/pattern entry) or, "
+            "if it cannot be modelled, add it to _UNSUPPORTED_PARAMS.  Marginalise "
+            "or fix it in the meantime.")
 
     # ---- Build M from EXACTLY the marginalised set (strip BEFORE the SVD) --
     # A sampled param must never appear in M (double-counting); a fixed param is
@@ -523,7 +585,9 @@ def setup_timing_model(par_path: str, tim_path: str,
     weights     = 1.0 / errors_us**2
     ssb_obs_km  = jnp.asarray(np.asarray(result['ssb_obs_pos_ls'], dtype=np.float64) * C_KM_S)
     obs_sun_km  = jnp.asarray(np.asarray(result['obs_sun_pos_ls'], dtype=np.float64) * C_KM_S)
-    sw_delay    = jnp.asarray(np.asarray(result.get('sw_delay_sec',    np.zeros(n_toa)), dtype=np.float64))
+    # Solar wind is now computed inside combined_delays from ne_sw (a traceable,
+    # fittable param); the frozen result['sw_delay_sec'] precompute is no longer
+    # folded in (it double-counted with the ne_sw path).
     tropo_delay = jnp.asarray(np.asarray(result.get('tropo_delay_sec', np.zeros(n_toa)), dtype=np.float64))
     r_obs_us    = jnp.asarray(np.asarray(result['residuals_us'],   dtype=np.float64))
 
@@ -534,12 +598,12 @@ def setup_timing_model(par_path: str, tim_path: str,
     dt_pos_days = jnp.asarray(np.asarray(
         tdb_mjd_ld - np.longdouble(POSEPOCH_0), dtype=np.float64))
 
-    # Frozen secondary binary params
-    GAMMA_0 = float(params.get('GAMMA', 0.0))
-    PBDOT_0 = float(params.get('PBDOT', 0.0))
+    # Secondary binary params are now traced via _g(theta, …) (see _KERNEL_PARAMS),
+    # so their frozen baselines come from the theta_0_full fallback pool below.
+    # Two need an explicit read here because the par label differs from / is not
+    # the JUG design label: XDOT (par stores A1DOT) and OMDOT (override baseline).
     OMDOT_0 = float(params.get('OMDOT', 0.0))
     XDOT_0  = float(params.get('XDOT', params.get('A1DOT', 0.0)))
-    EDOT_0  = float(params.get('EDOT', 0.0))
 
     # ---- combined_delays wiring (binary + DM + FD + solar wind) ------------
     # combined_delays carries the binary epoch (TASC for ELL1, T0 for DD/BT)
@@ -547,17 +611,44 @@ def setup_timing_model(par_path: str, tim_path: str,
     # We rebuild tt_binary_sec inside the JAX trace from the (possibly sampled)
     # epoch param so its physics is unchanged from the hand-rolled path.
     binary_model_id = _BINARY_MODEL_ID[binary_kind]
-    BINARY_EPOCH_NAME = {'ell1': 'TASC', 'dd': 'T0', 'bt': 'T0'}.get(binary_kind)
+    BINARY_EPOCH_NAME = {'ell1': 'TASC', 'dd': 'T0', 'bt': 'T0',
+                         'ddk': 'T0'}.get(binary_kind)
     DMEPOCH_0 = float(params.get('DMEPOCH', params['PEPOCH']))
-    # DM Taylor: dm_eff = DM + DM1·dt + DM2·dt²/2 with dt in years from DMEPOCH
-    # (combined_delays forms dt_years = (tdb − dm_epoch)/365.25 internally).  The
-    # factorials [0!,1!,2!] = [1,1,2] match PINT's DM(t) convention.  DM1/DM2 are
-    # frozen at par values unless sampled, so when frozen they contribute the SAME
-    # per-TOA term to m(θ) and m(θ₀) and cancel in the θ₀-referenced delta — the
-    # pass-1 regression (DM1=DM2=0 there) stays bit-identical.
-    _DM_FACTORIALS = jnp.asarray([1.0, 1.0, 2.0], dtype=jnp.float64)
-    # FD orbital-frequency (FB) path is unused here — pass empty arrays so the
-    # PB/T0 branch is selected (use_fb=False).
+    # DM Taylor: dm_eff = Σ_n DMn·dtⁿ/n! with dt in years from DMEPOCH
+    # (combined_delays forms dt_years = (tdb − dm_epoch)/365.25 internally and
+    # indexes dm_coeffs by power 0,1,2,….).  We build a DENSE coefficient vector
+    # DM0(≡DM), DM1, …, DM_max covering every DMn present in the par (missing
+    # orders zero-filled), with factorials [0!,1!,…,max!] matching PINT's DM(t)
+    # convention.  DMn are frozen at par values unless sampled, so when frozen
+    # they contribute the SAME per-TOA term to m(θ) and m(θ₀) and cancel in the
+    # θ₀-referenced delta — the pass-1 regression stays bit-identical.
+    dm_orders_full: list[int] = []
+    k = 1
+    while f'DM{k}' in params:
+        dm_orders_full.append(k)
+        k += 1
+    max_dm_order = max(dm_orders_full) if dm_orders_full else 0
+    dm_0_full = {n: float(params.get(f'DM{n}', 0.0)) for n in dm_orders_full}
+    _DM_FACTORIALS = jnp.asarray(
+        [float(math.factorial(n)) for n in range(max_dm_order + 1)],
+        dtype=jnp.float64)
+    # Orbital-frequency (FB) parametrisation: when the par uses FB0,FB1,… instead
+    # of PB, combined_delays' use_fb branch integrates the orbital phase from the
+    # FB Taylor (referenced to the binary epoch baked into tt_binary_sec).  Build
+    # a DENSE FB0..FB_max vector; use_fb is a static Python bool so the PB slot
+    # can be forced non-zero below (the dead PB branch of jnp.where must not form
+    # 1/PB=inf and poison the reverse-mode gradient).
+    fb_orders_full: list[int] = []
+    k = 0
+    while f'FB{k}' in params:
+        fb_orders_full.append(k)
+        k += 1
+    max_fb_order = max(fb_orders_full) if fb_orders_full else -1
+    fb_0_full = {n: float(params.get(f'FB{n}', 0.0)) for n in fb_orders_full}
+    use_fb = bool(has_binary and 'FB0' in params)
+    _FB_FACTORIALS = (jnp.asarray(
+        [float(math.factorial(n)) for n in range(max_fb_order + 1)],
+        dtype=jnp.float64) if use_fb else jnp.asarray([], dtype=jnp.float64))
     _FB_EMPTY      = jnp.asarray([], dtype=jnp.float64)
 
     # ---- 3. Higher-order spindown: collect all Fn from par -----------------
@@ -615,9 +706,17 @@ def setup_timing_model(par_path: str, tim_path: str,
         elif cls == 'fd':
             order = int(_RE_FD.match(k_name).group(1))
             theta_0_full[k_name] = fd_0_full.get(order, 0.0)
+        elif cls == 'dm':
+            order = int(_RE_DM.match(k_name).group(1))
+            theta_0_full[k_name] = dm_0_full.get(order, 0.0)
+        elif cls == 'fb':
+            order = int(_RE_FB.match(k_name).group(1))
+            theta_0_full[k_name] = fb_0_full.get(order, 0.0)
         else:
             theta_0_full[k_name] = _read_param(params, k_name)
-    # Fallback pool for _g() — every kernel param and every Fn/FDn in par
+    # Fallback pool for _g() — every kernel param and every Fn/FDn/DMn/FBn.  The
+    # dense DM/FB coefficient vectors read EVERY order 0..max via _g, so every
+    # order (including gaps not in the par) must have a θ₀ entry.
     for k_name in _KERNEL_PARAMS:
         if k_name not in theta_0_full:
             theta_0_full[k_name] = _read_param(params, k_name)
@@ -629,13 +728,19 @@ def setup_timing_model(par_path: str, tim_path: str,
         fname = f'FD{order}'
         if fname not in theta_0_full:
             theta_0_full[fname] = fd_0_full[order]
-    # Frozen baselines for the secondary binary / DM-Taylor params.  XDOT is the
-    # JUG design label for A1DOT, so read it via the XDOT_0 fallback (par stores
-    # A1DOT); OMDOT/DM1/DM2 are par-native.  These override any _read_param zero.
+    for order in range(1, max_dm_order + 1):
+        dname = f'DM{order}'
+        if dname not in theta_0_full:
+            theta_0_full[dname] = dm_0_full.get(order, 0.0)
+    for order in range(0, max_fb_order + 1):
+        fbname = f'FB{order}'
+        if fbname not in theta_0_full:
+            theta_0_full[fbname] = fb_0_full.get(order, 0.0)
+    # Frozen baselines for the secondary binary params.  XDOT is the JUG design
+    # label for A1DOT, so read it via the XDOT_0 fallback (par stores A1DOT);
+    # OMDOT is par-native.  These override any _read_param zero.
     theta_0_full['XDOT']  = XDOT_0
     theta_0_full['OMDOT'] = OMDOT_0
-    theta_0_full['DM1']   = float(params.get('DM1', 0.0))
-    theta_0_full['DM2']   = float(params.get('DM2', 0.0))
 
     F0_0   = theta_0_full['F0']
     sample_set = set(sample_list)
@@ -669,8 +774,25 @@ def setup_timing_model(par_path: str, tim_path: str,
         EPS1  = _g(theta, 'EPS1'); EPS2  = _g(theta, 'EPS2')
         T0    = _g(theta, 'T0');   ECC   = _g(theta, 'ECC'); OM = _g(theta, 'OM')
         M2    = _g(theta, 'M2');   SINI  = _g(theta, 'SINI')
-        DM1   = _g(theta, 'DM1');  DM2   = _g(theta, 'DM2')
         XDOT  = _g(theta, 'XDOT'); OMDOT = _g(theta, 'OMDOT')
+        EDOT  = _g(theta, 'EDOT'); GAMMA = _g(theta, 'GAMMA')
+        PBDOT = _g(theta, 'PBDOT')
+        EPS1DOT = _g(theta, 'EPS1DOT'); EPS2DOT = _g(theta, 'EPS2DOT')
+        H3    = _g(theta, 'H3');   H4    = _g(theta, 'H4');  STIG = _g(theta, 'STIG')
+        KIN   = _g(theta, 'KIN');  KOM   = _g(theta, 'KOM')
+        DR    = _g(theta, 'DR');   DTH   = _g(theta, 'DTH')
+        NE_SW = _g(theta, 'NE_SW')
+        # Dense DM Taylor vector [DM0≡DM, DM1, …, DM_max]; missing orders read a
+        # 0.0 θ₀ baseline so they contribute nothing.
+        dm_coeffs = jnp.stack(
+            [DM] + [_g(theta, f'DM{n}') for n in range(1, max_dm_order + 1)])
+        # Dense FB Taylor vector [FB0, …, FB_max] (empty when the par uses PB).
+        fb_coeffs = (jnp.stack(
+            [_g(theta, f'FB{n}') for n in range(0, max_fb_order + 1)])
+            if use_fb else _FB_EMPTY)
+        # Force the (dead) PB branch's 1/PB away from 1/0 when FB-parametrised,
+        # so jnp.where's unused side cannot poison the reverse-mode gradient.
+        PB_arg = jnp.asarray(1.0, dtype=jnp.float64) if use_fb else PB
 
         # Astrometry now sourced from the JUG JAX twins (jug.delays.barycentric_jax),
         # mirroring JUG's NumPy barycentric path.  dt_pos_days is the host-side
@@ -695,28 +817,32 @@ def setup_timing_model(par_path: str, tim_path: str,
         # epoch so the physics matches the retired hand-rolled kernels exactly.
         #
         # Neutrality wiring (reproduces the hand-rolled path):
-        #   • DM      : single constant coeff [DM] → dm_sec = K_DM·DM/ν²  (DM1/DM2
-        #               were not modelled by the hand-rolled path).
+        #   • DM      : dense Taylor [DM, DM1, …, DM_max] → Σ K_DM·DMn·dtⁿ/(n!·ν²);
+        #               frozen orders cancel in the θ₀-referenced delta.
         #   • FD      : fd_coeffs = [FD1, FD2, …] → Σ FDn·log(ν/GHz)ⁿ.  Absolute
         #               vs the old (FDn−FDn₀) form, but identical in delta_m_us
         #               (the θ₀ subtraction removes the constant per-TOA offset).
-        #   • sol.W   : ne_sw = 0; the frozen precomputed sw_delay is folded into
-        #               the tropo (prebinary-only) slot — it shifts the binary time
-        #               but is NOT returned, matching the hand-rolled return.
+        #   • sol.W   : ne_sw traced → combined_delays returns sw_sec(ne_sw) as a
+        #               dispersive delay, the SAME family as dm_sec(DM).  SW is NOT
+        #               folded into the prebinary slot (that legacy placement made
+        #               NE_SW un-fittable and treated SW inconsistently with DM,
+        #               which is likewise returned rather than prebinary).
         #   • DMX     : dmx_sec = None — the hand-rolled binary pre-delay excluded
         #               DMX; the DMX offsets are added separately below.
-        #   • ELL1    : secondaries (PBDOT/XDOT/GAMMA/EPS*DOT) ZEROED — _ell1_delay
-        #               ignored them.
-        #   • DD/BT   : frozen par secondaries (GAMMA/PBDOT/OMDOT/XDOT/EDOT) passed
-        #               through, matching dd_binary_delay_vectorized.
+        #   • ELL1    : eps1dot/eps2dot/xdot/pbdot/gamma + orthometric Shapiro
+        #               (h3/h4/stig) are traced through; the eccentric slots
+        #               (ecc/om/t0/omdot/edot) stay zero (ELL1 uses eps1/eps2/tasc).
+        #   • DD/BT/DDK: full secondaries (gamma/pbdot/omdot/xdot/edot) plus
+        #               kin/kom (DDK Kopeikin, model_id 5) traced through.
+        #   • FB      : when use_fb, fb_coeffs drive the orbital phase and the PB
+        #               slot is forced to 1.0 (dead branch; see PB_arg above).
         fd_coeffs = (jnp.asarray([_g(theta, f'FD{order}') for order in fd_orders_full],
                                  dtype=jnp.float64)
                      if fd_orders_full else _FB_EMPTY)
         has_fd    = len(fd_orders_full) > 0
-        # DM Taylor [DM, DM1, DM2] (matched by _DM_FACTORIALS=[1,1,2]).  DM1/DM2 are
-        # traced when sampled, else frozen (cancel in the θ₀-referenced delta).
-        dm_coeffs = jnp.asarray([DM, DM1, DM2], dtype=jnp.float64)
-        tropo_prebin = tropo_delay + sw_delay      # frozen; prebinary-only slot
+        # Prebinary slot carries only the (frozen) troposphere now; solar wind is
+        # returned via ne_sw below, matching DM's returned-delay treatment.
+        tropo_prebin = tropo_delay
 
         if has_binary:
             epoch = _g(theta, BINARY_EPOCH_NAME)
@@ -729,22 +855,24 @@ def setup_timing_model(par_path: str, tim_path: str,
             combined = combined_delays(
                 tdb_mjd, freq_mhz, obs_sun_km, L_hat,
                 dm_coeffs, _DM_FACTORIALS, DMEPOCH_0,
-                0.0, fd_coeffs, has_fd,
+                NE_SW, fd_coeffs, has_fd,
                 roemer + shapiro, has_binary, binary_model_id,
-                PB, A1, TASC, EPS1, EPS2, 0.0, 0.0, 0.0, 0.0, 0.0, r_shap, SINI,
-                0.0, 0.0, 0.0, 0.0, 0.0, M2, SINI, 0.0, 0.0, 0.0, 0.0, 0.0,
-                _FB_EMPTY, _FB_EMPTY, 0.0, False,
+                PB_arg, A1, TASC, EPS1, EPS2, EPS1DOT, EPS2DOT, PBDOT, XDOT, GAMMA, r_shap, SINI,
+                0.0, 0.0, 0.0, 0.0, 0.0, M2, SINI, KIN, KOM, H3, H4, STIG,
+                fb_coeffs, _FB_FACTORIALS, 0.0, use_fb,
+                dr=DR, dth=DTH,
                 tropo_sec=tropo_prebin, tt_binary_sec=tt_binary_sec,
             )
-        else:   # dd / bt — frozen par secondaries forwarded (matches hand-rolled)
+        else:   # dd / bt / ddk — full secondaries + Kopeikin (kin/kom) forwarded
             combined = combined_delays(
                 tdb_mjd, freq_mhz, obs_sun_km, L_hat,
                 dm_coeffs, _DM_FACTORIALS, DMEPOCH_0,
-                0.0, fd_coeffs, has_fd,
+                NE_SW, fd_coeffs, has_fd,
                 roemer + shapiro, has_binary, binary_model_id,
-                PB, A1, 0.0, EPS1, EPS2, 0.0, 0.0, PBDOT_0, XDOT, GAMMA_0, 0.0, 0.0,
-                ECC, OM, T0, OMDOT, EDOT_0, M2, SINI, 0.0, 0.0, 0.0, 0.0, 0.0,
-                _FB_EMPTY, _FB_EMPTY, 0.0, False,
+                PB_arg, A1, 0.0, EPS1, EPS2, EPS1DOT, EPS2DOT, PBDOT, XDOT, GAMMA, 0.0, 0.0,
+                ECC, OM, T0, OMDOT, EDOT, M2, SINI, KIN, KOM, H3, H4, STIG,
+                fb_coeffs, _FB_FACTORIALS, 0.0, use_fb,
+                dr=DR, dth=DTH,
                 tropo_sec=tropo_prebin, tt_binary_sec=tt_binary_sec,
             )
 
@@ -781,6 +909,16 @@ def setup_timing_model(par_path: str, tim_path: str,
     theta_0_sampled = {k_name: theta_0_full[k_name] for k_name in sample_list}
     m0_sec = m_total_sec(theta_0_sampled)
 
+    # Fail fast if the model itself is non-finite at θ₀ — otherwise every Jacobian
+    # column below inherits the NaN and the whole pulsar silently returns a NaN
+    # MLE (the classic FB-vs-PB / PB=0 collapse).  A clear error beats silent NaN.
+    if not bool(np.isfinite(np.asarray(m0_sec)).all()):
+        raise FloatingPointError(
+            "m_total_sec is non-finite at the par values (θ₀).  Common cause: a "
+            "binary parametrisation whose required parameter is zero/absent (e.g. "
+            "an FB-parametrised orbit read with PB=0, or a missing epoch).  Check "
+            f"the par binary model {binary_model!r} and its parameters.")
+
     @jax.jit
     def delta_m_us(theta: dict) -> jnp.ndarray:
         """Mean-subtracted Δm in µs.  Autodiff-able."""
@@ -798,17 +936,23 @@ def setup_timing_model(par_path: str, tim_path: str,
         X_cols.append(col)
         col_norms.append(float(np.sqrt(np.dot(col, col))))
 
-    # Guard: any parameter whose Jacobian column is numerically zero (e.g. an
-    # unimplemented param that still reached sample_list) would make XtWX
-    # singular.  Identify these, warn, and exclude them from the solve.
+    # Guard: any parameter whose Jacobian column is numerically zero OR non-finite
+    # (e.g. an unmodelled param that still reached sample_list, or a NaN from a
+    # degenerate kernel) would make XtWX singular.  Identify these, warn, and
+    # exclude them from the solve.  With the setup guard above rejecting unwired
+    # params, a surviving zero column now signals a param that IS wired but is
+    # physically inert under this par's binary model (e.g. XDOT under a model
+    # that ignores it, or an EPS*DOT under DD) — still worth surfacing loudly.
     _ZERO_THRESH = 1e-30
-    active_mask  = np.array(col_norms) > _ZERO_THRESH
+    col_norms_arr = np.array(col_norms)
+    active_mask  = np.isfinite(col_norms_arr) & (col_norms_arr > _ZERO_THRESH)
     zero_params  = [k for k, active in zip(sample_list, active_mask) if not active]
     if zero_params:
         warnings.warn(
-            f"MLE: parameters {zero_params} have zero Jacobian columns and "
-            "will be excluded from the linear solve (their MLE delta/sigma "
-            "will be NaN).  This usually means a kernel branch is missing.",
+            f"MLE: parameters {zero_params} have zero or non-finite Jacobian "
+            "columns and will be excluded from the linear solve (their MLE "
+            "delta/sigma will be NaN).  The param is wired but contributes no "
+            "delay under this par's binary model, or produced a NaN derivative.",
             stacklevel=2,
         )
 
@@ -1124,7 +1268,7 @@ class MultiPsrTimingModel:
         # maps it to a physical value that stays in-domain for every real z,
         # so SINI≤1 / 0≤ECC<1 / M2,PX>0 are guaranteed before the JUG kernels.
         return {k: reparametrise(k, theta_0[k], z_p[i] * sc[k])
-                for i, k in enumerate(self.sample_list)}
+                for i, k in enumerate(self.sample_list[pidx])}
 
     # ------------------------------------------------------------------
     # Main callable
@@ -1258,7 +1402,7 @@ def build_multi_psr_timing_model(parfiles,
         from joblib import delayed
         ans = np.array(
             ParallelPbar("Loading the par and tim files...")(n_jobs=njobs)(
-            delayed(setup_timing_model)(par, tim, sample_list) for par, tim in zip(parfiles, timfiles)
+            delayed(setup_timing_model)(par, tim, sl) for par, tim, sl in zip(parfiles, timfiles, sample_list)
         ), dtype = object
         )
         delta_m_list = ans[:, 0].tolist()
@@ -1267,8 +1411,8 @@ def build_multi_psr_timing_model(parfiles,
     else:
         delta_m_list, aux_list = [], []
         pidx = 0
-        for par, tim in zip(parfiles, timfiles):
-            dm, a = setup_timing_model(par, tim, sample_list)
+        for par, tim, sl in zip(parfiles, timfiles, sample_list):
+            dm, a = setup_timing_model(par, tim, sl)
             delta_m_list.append(dm)
             aux_list.append(a)
             pidx+=1
@@ -1278,9 +1422,10 @@ def build_multi_psr_timing_model(parfiles,
     # physical value; their physical σ (often ~1e-3) would make u·scale tiny and
     # freeze the param at θ₀, so use a unit scale → O(1) exploration of the full
     # physical domain.
-    scales = [{k: (1.0 if k in _REPARAM_PARAMS else float(aux['mle']['sigma'][k]))
-               for k in sample_list}
-              for aux in aux_list]
+    scales = []
+    for pidx, aux in enumerate(aux_list):
+        scales.append({k: (1.0 if k in _REPARAM_PARAMS else float(aux['mle']['sigma'][k]))
+            for k in sample_list[pidx]})
 
     return MultiPsrTimingModel(delta_m_list, 
                                 aux_list,
