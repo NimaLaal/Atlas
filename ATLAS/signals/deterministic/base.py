@@ -114,10 +114,15 @@ class Deterministic:
                                        for _ in range(self.data.npsrs)])
         self.Tukey_det = jnp.array(tukey(self.Nsparse, alpha=(Tspan_ext - self.data.pta_tspan) / Tspan_ext))
 
-        freqs_for_Fmat = jnp.array([self.freqs_forFFT[0, j + 1] for j in range(self.nfreqs_det)])
-        Fs_det = [sutils.get_fourier_design_matrix(psr.toas, freqs_for_Fmat)
+        self.freqs_for_Fmat = jnp.array([self.freqs_forFFT[0, j + 1] for j in range(self.nfreqs_det)])
+        Fs_det = [sutils.get_fourier_design_matrix(psr.toas, self.freqs_for_Fmat)
                        for psr in self.data.psrs]
         self.Fs_det_concat = jnp.concat(Fs_det, axis=0)
+
+    def get_basis(self):
+        Fs_det = [sutils.get_fourier_design_matrix(psr.toas, self.freqs_for_Fmat)
+                       for psr in self.data.psrs]
+        return Fs_det
 
 
     def get_coeffs_via_FFT(self, det_params, psr_phases, psr_dists):
