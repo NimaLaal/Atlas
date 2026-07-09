@@ -45,55 +45,55 @@ def get_pulsar_timespan(psr):
     float
         The timespan in the specified unit.
     """
-    if hasattr(psr, '__iter__'):
-        tmin = min([min(p.toas) for p in psr]) # Do not trust that the first toa is the min!
-        tmax = max([max(p.toas) for p in psr])
+    if isinstance(psr, (list, tuple)):
+        tmin = jnp.min([jnp.min(p.toas) for p in psr]) # Do not trust that the first toa is the min!
+        tmax = jnp.max([jnp.max(p.toas) for p in psr])
     else:
-        tmin = min(psr.toas)
-        tmax = max(psr.toas)
+        tmin = jnp.min(psr.toas)
+        tmax = jnp.max(psr.toas)
     ret = float(tmax - tmin)
     return ret
 
 
 # Matrix utilities--------------------------------------------------------------
-def stabilize_covariance_matrix(C, n=1e-6):
-    """Stabilize a covariance matrix by adding jitter.
+def stabilize_covariance(cov, eig_thresh=1e-10):
+    """Stabilize a covariance matrix by setting a minimum eigenvalue
 
-    This function adds a small amount of noise (jitter) to the diagonal elements
-    of the correlation matrix to improve numerical stability. This function first
-    converts the covariance matrix to a correlation matrix, adds jitter to the diagonal,
-    and then reconstructs the stabilized covariance matrix. The jitter value `n` 
-    is a relative amount added to the diagonal elements of the correlation matrix.
+    This function takes a covariance matrix, or batch of covariance matrices, 
+    and sets the eigenvalues below a certain threshold to that threshold. This 
+    is useful for numerical stabilization for things like inversion. This function
+    also works for batches of covariance matrices like [..., N, N].
 
-    When adding jitter `n`, start small, with values close to machine precision
-    and increase as needed to achieve numerical stability.
+    NOTE: This function is not JIT compiled
 
     Parameters
     ----------
-    C : jax array
-         Covariance matrix to be stabilized. [N, N]
-    n : float
-        The relative jitter to add to the correlation matrix, by default 1e-6.
+    cov : array
+        The input covariance matrix or batch of covariance matrices. [..., N, N]
+    eig_thresh : float
+        The threshold for eigenvalues, by default 1e-10
 
     Returns
     -------
     jax array
-        The stabilized covariance matrix. [N, N]
+        The stabilized covariance matrix or batch of covariance matrices. [..., N, N]
     """
-    d = jnp.sqrt(jnp.diag(C))
-    D = jnp.outer(d, d)
+    N = cov.shape[-1]
+    idx = jnp.arange(N)
+    dims = cov.shape[:-2]
 
-    # Create correlation matrix
-    Corr = C / D
-
-    # Add jitter to the diagonal of the correlation matrix
-    idx = jnp.diag_indices_from(Corr)
-    Corr = Corr.at[idx].add(n)
-
-    # Reconstruct the stabilized covariance matrix
-    C_prime = Corr * D
-
-    return C_prime
+    # Compute eigenvalues and eigenvectors
+    e_vals, e_vec = jnp.linalg.eigh(cov) # [dims, N], [dims, N, N]
+    # Determine the threshold for eigenvalues
+    e_thr = eig_thresh * jnp.max(e_vals, axis=-1, keepdims=True) # [dims, 1]
+    # Compute new eigenvalues by thresholding
+    e_vals = jnp.where(e_vals < e_thr, e_thr, e_vals) # [dims, N]
+    # Construct the diagonal matrix of eigenvalues
+    e_mat = jnp.zeros((*dims, N, N))
+    e_mat = e_mat.at[..., idx, idx].set(e_vals) # [dims, N, N]
+    # Reconstruct the covariance matrix with the modified eigenvalues
+    new_cov = e_vec @ e_mat @ jnp.linalg.inv(e_vec) # [dims, N, N]
+    return new_cov
 
 
 def jagged2padded(jagged, pad_value=-1):
@@ -113,6 +113,15 @@ def jagged2padded(jagged, pad_value=-1):
         A list of jagged arrays (arrays of different lengths).
     pad_value : int
         The value to use for padding shorter arrays, by default -1
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - padded : array
+            The padded array with shape (n_array, max_length).
+        - mask : array
+            A boolean mask indicating valid entries (True for valid, False for padding).
     """
     final_shape = (len(jagged), max(len(arr) for arr in jagged))
     dtype = jagged[0].dtype
@@ -144,7 +153,7 @@ def padded2jagged(padded, mask):
     Returns
     -------
     list of arrays
-        The list of jagged arrays converted from the padded array.
+        The list of jax arrays.
     """
     jagged = []
     for i in range(len(padded)):

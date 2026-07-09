@@ -4,14 +4,16 @@ from ATLAS.utils import jit, jit_method
 import jax.numpy as jnp
 
 from glob import glob
-from tqdm import tqdm
+
+from tqdm_joblib import ParallelPbar
+from joblib import delayed
 
 from jug.engine.session import TimingSession
 from enterprise.pulsar import Pulsar as E_Pulsar
 import pint.logging
 import logging
 
-
+MAX_JOBS = 8
 LINEAR_PARAMS = ['offset','f','dm','fd','jump'] # Matt also said NE_SW, but I dunno what that is
 
 def load_pulsars(par, tim, use_enterprise=True):
@@ -40,15 +42,18 @@ def load_pulsars(par, tim, use_enterprise=True):
     # Ensure that the pars have corresponding tim files
     assert len(par_files) == len(tim_files), 'Number of par files must match number of tim files'
 
-    psrs = []
-    for p,t in tqdm(zip(par_files, tim_files), total=len(par_files), desc='Loading pulsars'):
-        pname = p.split('/')[-1].split('_')[0]
-        tname = t.split('/')[-1].split('_')[0]
-        assert pname == tname, f'Par file {p} and tim file {t} do not match'
+    def foo(i):
+        pname = par_files[i].split('/')[-1].split('_')[0]
+        tname = tim_files[i].split('/')[-1].split('_')[0]
+        assert pname == tname, f'Par file {par_files[i]} and tim file {tim_files[i]} do not match'
 
-        psr = Pulsar(p, t, use_enterprise=use_enterprise)
-        psrs.append(psr)
+        psr = Pulsar(par_files[i], tim_files[i], use_enterprise=use_enterprise)
+        return psr
     
+    psrs = ParallelPbar("Loading pulsars...")(n_jobs=MAX_JOBS)(
+        delayed(foo)(i) for i in range(len(par_files))
+    )
+
     return psrs
 
 class Pulsar:

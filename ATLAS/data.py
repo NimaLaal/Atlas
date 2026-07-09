@@ -4,6 +4,7 @@ from ATLAS.utils import jit, jit_method
 from ATLAS.signals.signals_utils import _timing_model_svd
 
 import jax.numpy as jnp
+from tqdm import tqdm
 
 
 class PTA_Data:
@@ -11,29 +12,6 @@ class PTA_Data:
 
     This class is intended to hold all the static data attributes of the PTA
     dataset, such as the pulsar objects, their TOAs, positions, and timespans.
-    See the following attributes for details.
-
-    Attributes
-    ----------
-    psrs : list
-        A list of enterprise-like pulsar objects.
-    npsrs : int
-        The number of pulsars in the dataset.
-    psr_names : list
-        A list of pulsar names corresponding to the pulsar objects.
-    fixed_wn : bool
-        A flag indicating whether the white noise matrices are fixed.
-    toas : list of arrays
-        A list where each element is an array of TOAs for a pulsar. [npsrs, ntoas]
-    psr_pos : array
-        An array containing the positions of the pulsars in unit-Cartesian 
-        coordinates. [npsrs, 3]
-    pta_tspan : float
-        The total timespan covered by the PTA dataset, calculated as the
-        difference between the maximum and minimum TOAs across all pulsars.
-    psr_tspans : array
-        An array containing the individual timespans for each pulsar, calculated
-        as the difference between the maximum and minimum TOAs for each pulsar. [npsrs]
     """
 
     def __init__(self, 
@@ -52,9 +30,19 @@ class PTA_Data:
         Parameters
         ----------
         psrs : list
-            A list of enterprise-like pulsar objects.
-        fixed_wn : bool
-            Whether the white noise matrices are fixed, by default False.
+            A list of pulsar objects.
+        fixed_white_noise_params : jnp.ndarray, optional
+            An array indicating which white noise parameters are fixed, by default jnp.array([False])
+        linear_timing : bool, optional
+            A flag indicating whether to use linear timing, by default False
+        marg_timing : bool, optional
+            A flag indicating whether to use marginalized timing, by default False
+        diag_white_cov : bool, optional
+            A flag indicating whether to use diagonal white noise covariance, by default False
+        fixed_res : bool, optional
+            A flag indicating whether to fix the residuals, by default False
+        dm_ref_freq : int, optional
+            The reference frequency for dispersion measure calculations, by default 1400
         """
         self.psrs = psrs # List of pulsar objects
         self.npsrs = len(psrs) # Number of pulsars
