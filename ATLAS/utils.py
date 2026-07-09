@@ -46,8 +46,8 @@ def get_pulsar_timespan(psr):
         The timespan in the specified unit.
     """
     if isinstance(psr, (list, tuple)):
-        tmin = jnp.min([jnp.min(p.toas) for p in psr]) # Do not trust that the first toa is the min!
-        tmax = jnp.max([jnp.max(p.toas) for p in psr])
+        tmin = jnp.min(jnp.array([jnp.min(p.toas) for p in psr])) # Do not trust that the first toa is the min!
+        tmax = jnp.max(jnp.array([jnp.max(p.toas) for p in psr]))
     else:
         tmin = jnp.min(psr.toas)
         tmax = jnp.max(psr.toas)
