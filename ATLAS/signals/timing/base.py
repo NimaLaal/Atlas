@@ -1102,7 +1102,7 @@ class MultiPsrTimingModel:
         self.aux_list      = aux_list
         self.sample_list   = list(sample_list)
         self.scales        = scales
-        self.nparams       = len(sample_list)
+        self.nparams       = [len(lst) for lst in self.sample_list]
         self.npulsars      = len(delta_m_list)
 
         ntoas = tuple(int(aux['n_toa']) for aux in aux_list)
@@ -1316,13 +1316,13 @@ class MultiPsrTimingModel:
         parts = []
         for pidx in range(self.npulsars):
             # Slice this pulsar's normalised params — static indices, no dynamic_slice needed
-            z_p     = z_concat[pidx * self.nparams : (pidx + 1) * self.nparams]
+            z_p     = z_concat[pidx * self.nparams[pidx] : (pidx + 1) * self.nparams[pidx]]
             theta_p = self.z_to_theta(pidx, z_p)
             tm_res  = self.delta_m_list[pidx](theta_p) * 1e-6          # µs → s
             r_obs_p = self.raw_residuals[pidx]
             parts.append(r_obs_p - tm_res)
         return jnp.concatenate(parts)                                    # [total_ntoas]
-
+    
     # ------------------------------------------------------------------
     # Production numpyro timing block — bounded proper priors (the single mechanism)
     # ------------------------------------------------------------------
