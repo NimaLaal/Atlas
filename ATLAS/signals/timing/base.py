@@ -365,7 +365,7 @@ def sample_timing_theta(sample_list, theta_0, sigma, prefix=''):
     ----------
     sample_list : list[str]     params to sample (physical names)
     theta_0     : dict          par-file values (affine centre / init)
-    sigma       : dict          linearised-MLE σ per param (affine scale)
+    sigma       : dict          JUG formal σ per param (affine scale = aux['sigJUG'])
     prefix      : str           name prefix (e.g. per-pulsar 'p0_') to avoid clashes
     """
     import numpyro
@@ -997,12 +997,34 @@ def setup_timing_model(par_path: str, tim_path: str,
         'zero_params': zero_params,
     }
 
+    # JUG's formal per-parameter σ (authoritative fit uncertainties) for the
+    # sampled params — the prior/coordinate SCALE (theta = theta_0 + z·scale).
+    # JUG computes these via its stable augmented-SVD solve.  Do NOT scale with
+    # mle['sigma']: its naive pinv of the raw, ~20-order-heterogeneous XᵀWX
+    # collapses (a single global rcond truncates all but ~1 of the singular
+    # values), returning σ ~1e-37× too small — smaller than the float64 ULP of
+    # theta_0, which freezes every well-measured param at the fit value.  The
+    # setup guard above ensures every sampled param is a JUG design label, so a
+    # finite σ is always available here.
+    _jug_unc = result_dummy['uncertainties']
+    sigJUG = {}
+    for k in sample_list:
+        v = float(_jug_unc[k]) if k in _jug_unc else float('nan')
+        if not np.isfinite(v) or v == 0.0:
+            raise ValueError(
+                f"JUG formal uncertainty for sampled param {k!r} is {v!r}; cannot "
+                "set its prior/coordinate scale.  A JUG design label should always "
+                "carry a finite, non-zero uncertainty — a NaN/0 signals a "
+                "degenerate JUG fit for this par/tim.")
+        sigJUG[k] = v
+
     aux = {
         'theta_0':      theta_0_sampled,
         'errors_us':    errors_us,
         'r_obs_us':     r_obs_us,
         'tdb_mjd':      tdb_mjd,
         'mle':          mle,
+        'sigJUG':       sigJUG,   # JUG formal σ per sampled param — the prior scale
         'sample_list':  list(sample_list),
         'marginalise_list': sorted(marg_set),       # params carried in M
         'fixed_list':   sorted(fixed_set),          # params held at par value
@@ -1320,7 +1342,7 @@ class MultiPsrTimingModel:
             theta_p = sample_timing_theta(
                 self.sample_list,
                 self.aux_list[pidx]['theta_0'],
-                self.aux_list[pidx]['mle']['sigma'],
+                self.aux_list[pidx]['sigJUG'],   # JUG formal σ (NOT mle['sigma'] — that collapses)
                 prefix=f'p{pidx}_',
             )
             tm_res = self.delta_m_list[pidx](theta_p) * 1e-6              # µs → s
@@ -1416,15 +1438,17 @@ def build_multi_psr_timing_model(parfiles,
             delta_m_list.append(dm)
             aux_list.append(a)
             pidx+=1
-    # Per-pulsar scales: linearised-MLE σ for affine params (physical step per
-    # unit z).  Reparametrised params (SINI/ECC/M2/PX) are sampled in an
-    # UNCONSTRAINED coordinate u = z·scale that reparametrise() maps to the
+    # Per-pulsar scales: JUG formal σ for affine params (physical step per unit
+    # z).  Sourced from aux['sigJUG'] (JUG's stable uncertainties), NOT
+    # aux['mle']['sigma'] whose naive pinv collapses to ~1e-37× the true σ and
+    # freezes the param at θ₀.  Reparametrised params (SINI/ECC/M2/PX) are sampled
+    # in an UNCONSTRAINED coordinate u = z·scale that reparametrise() maps to the
     # physical value; their physical σ (often ~1e-3) would make u·scale tiny and
     # freeze the param at θ₀, so use a unit scale → O(1) exploration of the full
     # physical domain.
     scales = []
     for pidx, aux in enumerate(aux_list):
-        scales.append({k: (1.0 if k in _REPARAM_PARAMS else float(aux['mle']['sigma'][k]))
+        scales.append({k: (1.0 if k in _REPARAM_PARAMS else float(aux['sigJUG'][k]))
             for k in sample_list[pidx]})
 
     return MultiPsrTimingModel(delta_m_list, 

@@ -229,7 +229,12 @@ class JointProblem:
         if not order:
             self.timing_metric = None
             return
-        idx = [self.labs.index(k) for k in order]
+        # Index the covariance by free_params (OFFSET-excluded) order: JUG's
+        # covariance/uncertainties exclude the OFFSET column, but self.labs
+        # INCLUDES 'OFFSET'.  Using labs.index here would shift every row by one
+        # whenever JUG emits OFFSET (→ neighbour's covariance, or IndexError on
+        # the last param).  free_params is labs minus OFFSET, matching _Cjug.
+        idx = [self.free_params.index(k) for k in order]
         Cphys = self._Cjug[np.ix_(idx, idx)]
         specs = {k: _BOUND_SPECS[k] for k in ("M2", "ECC") if k in order}
         if "SINI" in order:
