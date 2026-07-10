@@ -199,7 +199,9 @@ if __name__ == "__main__":
         sys.exit("usage: python -m ATLAS.signals.timing.block_detect <par> <tim>")
     par, tim = sys.argv[1], sys.argv[2]
     LBL, offset, bound, affine, labs, C = blockable_affine(par, tim)
-    idx = [labs.index(k) for k in affine]; Caff = C[np.ix_(idx, idx)]
+    # Index C (covariance, OFFSET-excluded) by LBL, not labs: labs INCLUDES
+    # 'OFFSET' so labs.index would be off-by-one whenever JUG emits it.
+    idx = [LBL.index(k) for k in affine]; Caff = C[np.ix_(idx, idx)]
     print(f"\n===== {len(LBL)} params | offset={offset} bound={bound} affine={len(affine)} =====")
     print("Detecting Gibbs blocks among AFFINE params only:")
     out = detect_gibbs_blocks(Caff, affine)
