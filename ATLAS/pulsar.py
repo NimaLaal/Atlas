@@ -67,23 +67,30 @@ class Pulsar:
             pint.logging.setup(level="ERROR")
             logging.getLogger('enterprise').setLevel(logging.ERROR)
 
-            ent_psr = E_Pulsar(par, tim, sort=False)
+            psr = E_Pulsar(par, tim, sort=False, drop_pintpsr=False) # keeps psr.model
 
-            self.name = ent_psr.name
+            self.name = psr.name
 
-            self.toas = jnp.array(ent_psr.toas)
-            self.residuals = jnp.array(ent_psr.residuals)
-            self.toaerrs = jnp.array(ent_psr.toaerrs)
-            self.freqs = jnp.array(ent_psr.freqs)
-            self.backend_flags = list(ent_psr.backend_flags) # Can't store as jnp array
+            # Actual TOA stuffs
+            self.toas = jnp.array(psr.toas)
+            self.residuals = jnp.array(psr.residuals)
+            self.toaerrs = jnp.array(psr.toaerrs)
+            self.freqs = jnp.array(psr.freqs)
+            self.backend_flags = list(psr.backend_flags) # Can't store as jnp array
 
-            self._raj = jnp.double(ent_psr._raj)
-            self._decj = jnp.double(ent_psr._decj)
+            # Position stuffs
+            self.raj = jnp.double(psr._raj)
+            self.decj = jnp.double(psr._decj)
+            self.pos = jnp.array(psr.pos)
 
-            self.pos = jnp.array(ent_psr.pos)
+            # Timing model parameters
+            self.fit_param_names = list(psr.fitpars)[1:] # Ignore the offset
+            self.fit_param_values = jnp.array([psr.model[k].value for k in self.fit_param_names], dtype=jnp.float64)
+            self.fit_param_uncertainties = jnp.array([psr.model[k].uncertainty_value for k in self.fit_param_names], dtype=jnp.float64)
 
-            self.Mmat = jnp.array(ent_psr.Mmat)
-            self.Mmat_labels = list(ent_psr.fitpars)
+            # Linearized design matrix
+            self.Mmat = jnp.array(psr.Mmat)
+            self.Mmat_labels = list(psr.fitpars)
 
             # Label which columns are exactly linear
             linear = []
@@ -98,21 +105,28 @@ class Pulsar:
 
             self.name = s.params['PSR']
 
+            # Actual TOA stuffs
             self.toas = jnp.array(result['bat_sec'])
             self.residuals = jnp.array(result['residuals_us']) * 1e-6
             self.toaerrs = jnp.array([t.error_us for t in s.toas_data]) * 1e-6
             self.freqs = jnp.array(result['freq_bary_mhz'])
             self.backend_flags = list([t.flags['f'] for t in s.toas_data]) # Can't store as jnp array
 
-            self._raj = float(s.params['_raj_rad'])
-            self._decj = float(s.params['_decj_rad'])
-            
+            # Position stuffs
+            self.raj = float(s.params['_raj_rad'])
+            self.decj = float(s.params['_decj_rad'])
             # Convert RAJ and DECJ to Cartesian coordinates
-            pos = [jnp.cos(self._raj) * jnp.cos(self._decj),
-                   jnp.sin(self._raj) * jnp.cos(self._decj),
-                   jnp.sin(self._decj)]
+            pos = [jnp.cos(self.raj) * jnp.cos(self.decj),
+                   jnp.sin(self.raj) * jnp.cos(self.decj),
+                   jnp.sin(self.decj)]
             self.pos = jnp.array(pos)
 
+            # Timing model parameters
+            self.fit_param_names = list(result['final_params'].keys())
+            self.fit_param_values = jnp.array(list(result['final_params'].values()), dtype=jnp.float64)
+            self.fit_param_uncertainties = jnp.array(list(result['uncertainties'].values()), dtype=jnp.float64)
+                                                                 
+            # Linearized design matrix
             self.Mmat = jnp.array(result['design_matrix'])
             self.Mmat_labels = result['design_matrix_labels']
 
