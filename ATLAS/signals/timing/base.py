@@ -472,6 +472,7 @@ def setup_timing_model(par_path: str, tim_path: str,
     _design_labels_raw = list(result_dummy['design_matrix_labels'])   # incl. 'OFFSET'
     _fittable = [l for l in _design_labels_raw if l != 'OFFSET']       # real JUG labels
     _fittable_set = set(_fittable)
+    _Cjug = np.asarray(result_dummy["covariance"], float)
 
     # ---- Resolve the three-way mode assignment ----------------------------
     if modes is not None:
@@ -1035,6 +1036,7 @@ def setup_timing_model(par_path: str, tim_path: str,
         'jump_masks':   jump_masks,  # {JUMP{n}: bool array} — for diagnostics
         'Mmat': _timing_model_svd(Mmat),           # SVD basis of sample-list-stripped M
         'Mmat_param_names': Mmat_param_names,       # retained linear labels (pre-SVD, auditable)
+        'Cjug':_Cjug 
     }
     return delta_m_us, aux
 
@@ -1314,13 +1316,17 @@ class MultiPsrTimingModel:
             ordered by pulsar, matching toa_starts/toa_ends.
         """
         parts = []
+        start_index = 0
         for pidx in range(self.npulsars):
             # Slice this pulsar's normalised params — static indices, no dynamic_slice needed
-            z_p     = z_concat[pidx * self.nparams[pidx] : (pidx + 1) * self.nparams[pidx]]
+            end_index = start_index + self.nparams[pidx]
+            z_p     = z_concat[start_index : end_index]
             theta_p = self.z_to_theta(pidx, z_p)
             tm_res  = self.delta_m_list[pidx](theta_p) * 1e-6          # µs → s
             r_obs_p = self.raw_residuals[pidx]
             parts.append(r_obs_p - tm_res)
+            
+            start_index = end_index
         return jnp.concatenate(parts)                                    # [total_ntoas]
     
     # ------------------------------------------------------------------
@@ -1340,7 +1346,7 @@ class MultiPsrTimingModel:
         parts = []
         for pidx in range(self.npulsars):
             theta_p = sample_timing_theta(
-                self.sample_list,
+                self.sample_list[pidx],
                 self.aux_list[pidx]['theta_0'],
                 self.aux_list[pidx]['sigJUG'],   # JUG formal σ (NOT mle['sigma'] — that collapses)
                 prefix=f'p{pidx}_',
