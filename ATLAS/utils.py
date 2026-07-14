@@ -163,6 +163,46 @@ def padded2jagged(padded, mask):
     return jagged
 
 
+def diagonalize(x):
+    """Transform a vector or batch of vectors into a diagonal matrix.
+
+    This function takes a vector of shape (..., N) and returns a diagonal matrix
+    of shape (..., N, N) where the diagonal elements are the elements of the input vector.
+
+    Parameters
+    ----------
+    x : array
+        Input array of shape (..., N).
+
+    Returns
+    -------
+    array
+        Diagonal matrix of shape (..., N, N) with the input vector on the diagonal.
+    """
+    return x[..., None] * jnp.eye(x.shape[-1])
+
+
+def is_diagonal(x):
+    """Check if a matrix or batch of matrices is diagonal.
+
+    This function checks whether the input matrix (or batch of matrices) is diagonal
+    by comparing the sum of all elements with the sum of the diagonal elements. If
+    the difference is zero, the matrix is considered diagonal.
+
+    Parameters
+    ----------
+    x : array
+        Input array of shape (..., N, N).
+
+    Returns
+    -------
+    bool
+        True if the matrix (or all matrices in the batch) is diagonal, False otherwise.
+    """
+    diff = (jnp.sum(x) - jnp.sum(jnp.diagonal(x, axis1=-2, axis2=-1)))
+    return diff == 0
+
+
 # Decorators for JIT compilation with proper metadata preservation--------------
 
 def jit(func=None, static_argnums=None):
