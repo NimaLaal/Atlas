@@ -456,26 +456,12 @@ class PerPulsarRedNoise:
         """
         return self.get_phi_diag(xs)
 
-    @jit_method
-    def get_phi_mat_from_diag(self, xs):
-        """
-        Build the full phi-matrix from a pre-computed diagonal and GWB PSD.
-
-        Parameters
-        ----------
-        phi_diag : jnp.ndarray  (n_total_bins, Npulsars)
-        psd_common : jnp.ndarray  (crn_bins,)
-        orf_params : jnp.ndarray or None
-            Required when the ORF is not fixed.
-        """
-        return self.get_phi_diag(xs)
-
     # ---------------------------------------------------------------------- #
     #  Inversion                                                              #
     # ---------------------------------------------------------------------- #
 
     @jit_method
-    def get_phi_mat_inv(self, xs):
+    def get_phi_mat_inv(self, phi):
         """
         Invert the phi-matrix using mixed Cholesky + diagonal strategies.
 
@@ -484,7 +470,7 @@ class PerPulsarRedNoise:
 
         Parameters
         ----------
-        phi : jnp.ndarray  (n_total_bins, Npulsars, Npulsars)
+        phi : jnp.ndarray  (n_total_bins, Npulsars)
 
         Returns
         -------
@@ -492,7 +478,9 @@ class PerPulsarRedNoise:
             Repeated twice along axis-0 (one for each quadrature component).
         logdet_phi : float
         """
-        return 1/self.get_phi_diag(xs)
+        phiinv = jnp.repeat(1/phi, 2, axis=0)
+        log_det_phi = 2.0 * jnp.sum(jnp.log(phi))
+        return phiinv[..., None] * jnp.eye(phiinv.shape[-1]) , log_det_phi 
 
     # ---------------------------------------------------------------------- #
     #  Prior                                                                  #
