@@ -1,9 +1,11 @@
+import itertools
 import jax.numpy as jnp
 import jax.random as jar
 import numpy as np
 import random, copy
 from tqdm import trange
-
+from tqdm_joblib import ParallelPbar
+from joblib import delayed
 
 class Sim(object):
     """
@@ -268,10 +270,10 @@ class Sim(object):
         else:
             timing_res = jnp.zeros(self.Npulsars)
 
-        for pidx in trange(self.Npulsars):
+        start_wn_index = 0
+        start_rn_index = 0
 
-            start_wn_index = 0
-            start_rn_index = 0
+        for pidx in trange(self.Npulsars):
 
             ####################################White Noise####################################
             if self.has_white:
@@ -296,7 +298,10 @@ class Sim(object):
 
         return sim_res
 
-    def write_to_psrs(self, residual_list, overwrite=False):
+    def write_to_psrs(self, 
+                    residual_list, 
+                    overwrite=False,
+                    load_how_many_in_parallel = 10):
         """
         Write simulated residuals into copies of the pulsar objects.
 
@@ -322,6 +327,20 @@ class Sim(object):
             A list of pulsar lists, one for each simulated realization.
 
         """
+        # all_poss = itertools.product(np.arange(self.real), np.arange(self.Npulsars))
+        # def doit(id):
+        #     rr, pidx = id
+        #     psr_copy = copy.deepcopy(self.data.psrs[pidx])
+        #     if overwrite:
+        #         psr_copy._residuals = np.array(residual_list[pidx][rr])
+        #     else:
+        #         psr_copy._residuals += np.array(residual_list[pidx][rr])
+
+        #     return psr_copy
+
+        # njobs = int(load_how_many_in_parallel)
+        # return ParallelPbar("Modifying the Pickle Files...")(n_jobs=njobs)(
+        #     delayed(doit)(id) for id in all_poss)
 
         ans = []
         for rr in trange(self.real):
