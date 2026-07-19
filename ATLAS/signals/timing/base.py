@@ -1328,7 +1328,39 @@ class MultiPsrTimingModel:
             
             start_index = end_index
         return jnp.concatenate(parts)                                    # [total_ntoas]
-    
+
+    @partial(jax.jit, static_argnums=0)
+    def residuals_per_pulsar(self, z_concat):
+        """Compute concatenated timing residuals for all pulsars.
+
+        Parameters
+        ----------
+        z_concat : array [npulsars * nparams]
+            Flat, normalised parameter vector.  Layout:
+                [z_0[0], z_0[1], ..., z_0[nparams-1],
+                 z_1[0], z_1[1], ..., z_1[nparams-1], ...]
+
+        Returns
+        -------
+        res : array [total_ntoas]
+            Concatenated timing residuals in seconds:
+                stochastic_res_p = r_obs_p - delta_m_p(theta_p)   (seconds)
+            ordered by pulsar, matching toa_starts/toa_ends.
+        """
+        parts = []
+        start_index = 0
+        for pidx in range(self.npulsars):
+            # Slice this pulsar's normalised params — static indices, no dynamic_slice needed
+            end_index = start_index + self.nparams[pidx]
+            z_p     = z_concat[start_index : end_index]
+            theta_p = self.z_to_theta(pidx, z_p)
+            tm_res  = self.delta_m_list[pidx](theta_p) * 1e-6          # µs → s
+            r_obs_p = self.raw_residuals[pidx]
+            parts.append(r_obs_p - tm_res)
+            
+            start_index = end_index
+        return parts
+
     # ------------------------------------------------------------------
     # Production numpyro timing block — bounded proper priors (the single mechanism)
     # ------------------------------------------------------------------
