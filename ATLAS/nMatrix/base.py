@@ -8,6 +8,7 @@ from tqdm import tqdm
 from tqdm.auto import trange
 
 import jax.numpy as jnp
+import jax
 from jax.tree_util import register_pytree_node_class
 import jax.scipy.linalg as jsl
 from functools import partial
@@ -420,6 +421,9 @@ class SinglePulsarWhiteCov:
         #jitted function that returns (left.T N right, logDetN)
         self.solve_with_logdet = self._solve_func_maker(return_logdet = True)
 
+        #Function used for performing cholesky decomp on N
+        self._chol_diag_plus_rank1_batched = jax.vmap(self._chol_diag_plus_rank1, in_axes=(0, 0))
+
     def params_dict_to_vector(self, params):
         """Extract white noise params from a dict into a flat JAX array.
 
@@ -789,6 +793,92 @@ class SinglePulsarWhiteCov:
         logdet_corr = jnp.sum(jnp.log(1.0 + jvec * epoch_sums))
 
         return logdet_D + logdet_corr
+
+    def _chol_diag_plus_rank1(self, d, s):
+        """Lower-triangular Cholesky factor of A = diag(d) + outer(s, s).
+
+        Rows/cols with s_i = 0 are fully decoupled from the rest (safe to
+        use for padded entries — d there just needs to be > 0).
+
+        Parameters
+        ----------
+        d : (n,) array   diagonal entries, all > 0
+        s : (n,) array   rank-1 vector
+
+        Returns
+        -------
+        L : (n, n) lower-triangular array with L @ L.T == A
+        """
+        n = d.shape[0]
+        L0 = jnp.diag(jnp.sqrt(d))
+        idx = jnp.arange(n)
+
+        def step(carry, k):
+            L, x = carry
+            Lkk = L[k, k]
+            xk = x[k]
+            r = jnp.sqrt(Lkk**2 + xk**2)
+            a = r / Lkk
+            b = xk / Lkk
+
+            below = idx > k
+            col_k = L[:, k]
+            new_col_k = jnp.where(below, (col_k + b * x) / a, col_k)
+            new_col_k = new_col_k.at[k].set(r)
+
+            new_x = jnp.where(below, a * x - b * new_col_k, x)
+
+            L = L.at[:, k].set(new_col_k)
+            return (L, new_x), None
+
+        (L, _), _ = jax.lax.scan(step, (L0, s), idx)
+        return L
+
+    
+    def CholN_dot(self, white_noise_helpers, right):
+        """Compute ``Cholesky(N) @ right``.
+
+        N is block-diagonal (diag(nvec) plus disjoint per-epoch ECORR
+        rank-1 blocks), so its Cholesky factor is too: a plain diagonal
+        sqrt everywhere, overridden on ECORR rows by a small dense
+        triangular block factor.
+
+        Parameters
+        ----------
+        white_noise_helpers : tuple
+            Tuple ``(nvec, jvec)`` containing the diagonal and ECORR
+            covariance components.
+        right : array-like
+            Matrix of shape ``[N_toa, M]`` to left-multiply by chol(N).
+
+        Returns
+        -------
+        array
+            ``Cholesky(N) @ right``, shape ``[N_toa, M]``.
+        """
+        nvec, jvec = white_noise_helpers
+
+        # Diagonal-only
+        result = jnp.sqrt(nvec)[:, None] * right
+
+        # --- per-block dense Cholesky ---------------------------------
+        d_blocks = nvec[self.U_pad]                      # (b, n) always > 0
+        s_blocks = jnp.sqrt(jvec)[:, None] * self.U_mask  # (b, n), 0 on padding
+        
+        L_blocks = self._chol_diag_plus_rank1_batched(d_blocks, s_blocks)  # (b, n, n)
+
+        right_blocks = right[self.U_pad, :]                            # (b, n, M)
+        out_blocks = jnp.einsum('bij,bjm->bim', L_blocks, right_blocks)
+
+        # delta = (full block answer) - (diagonal-only baseline already
+        # sitting in `result`); zero on padding so duplicate/dummy scatter
+        # indices just add zero, avoiding any set()-collision issues.
+        diag_only = jnp.sqrt(d_blocks)[..., None] * right_blocks
+        delta = (out_blocks - diag_only) * self.U_mask[..., None]
+
+        result = result.at[self.U_pad, :].add(delta)
+
+        return result
 
 class WhiteCov:
     """The Multi-pulsar white noise covariance matrix handler (also works with one pulsar!).
