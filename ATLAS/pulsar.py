@@ -101,7 +101,7 @@ class Pulsar:
             
         else:
             s = TimingSession(par, tim)
-            result = s.fit_parameters()
+            result = s.fit_parameters(verbose=False)
 
             self.name = s.params['PSR']
 
