@@ -474,7 +474,7 @@ class PerPulsarRedNoise:
 
         Returns
         -------
-        phiinv : jnp.ndarray  (2*n_total_bins, Npulsars, Npulsars)
+        phiinv : jnp.ndarray  (2*n_total_bins, Npulsars)
             Repeated twice along axis-0 (one for each quadrature component).
         logdet_phi : float
         """
@@ -706,7 +706,7 @@ class CorrelatedPulsarRedNoise:
         if has_irn:
             self.IRN_slice = _fourier_slice('unc')   # or 'irn', match basis_string name
             self.nonGWB_fidxs = jnp.array(
-                [i for i in range(int(self.IRN_slice.start/2), int(self.IRN_slice.stop/2))
+                [i for i in range(int(self.IRN_slice.start), int(self.IRN_slice.stop))
                 if i not in self.GWB_fidxs]
             )
             self.separate_inversion_strat = bool(self.nonGWB_fidxs.any())
