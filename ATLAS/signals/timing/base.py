@@ -1323,8 +1323,9 @@ class MultiPsrTimingModel:
             z_p     = z_concat[start_index : end_index]
             theta_p = self.z_to_theta(pidx, z_p)
             tm_res  = self.delta_m_list[pidx](theta_p) * 1e-6          # µs → s
-            r_obs_p = self.raw_residuals[pidx]
-            parts.append(r_obs_p - tm_res)
+            # r_obs_p = self.raw_residuals[pidx]
+            # parts.append(r_obs_p - tm_res)
+            parts.append(tm_res)
             
             start_index = end_index
         return jnp.concatenate(parts)                                    # [total_ntoas]

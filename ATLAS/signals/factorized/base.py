@@ -337,7 +337,7 @@ class Red:
         cfs = jsl.cho_factor(Sigma) # Cholesky for each psr [npsr, nmodes, nmodes]
 
         # Get the mean (covariance is Sigma)
-        mean = jsl.cho_solve(cfs, TNr[:,:,None]) # [npsr, nmodes, 1] 
+        mean = jsl.cho_solve(cfs, TNr) # [npsr, nmodes, 1] 
 
         # Transform a unit mean Gaussian random variable to desired distribution
         U = jrandom.normal(key, shape=(self.npsrs, self.nmodes, self.ndraws)) # [npsr, nmodes, ndraws]
@@ -613,7 +613,7 @@ class SuperSignal:
         self.linear_timing = self.data.linear_timing
         self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
-        
+
         # linear timing model attributes
         if self.marg_tm:
             self.linear_timing_model_size = 0
@@ -623,6 +623,8 @@ class SuperSignal:
         self.lowest_value_eq_to_zero = 1e-40
 
         self.signal_map = {s.name: s for s in signal_list}
+        self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
+
         self.has_unc = False; self.has_cor = False; self.has_dm = False
         if 'cor' in self.signal_map.keys():
             self.has_cor = True
@@ -631,7 +633,22 @@ class SuperSignal:
         if 'dm' in self.signal_map.keys():
             self.has_dm = True
 
-        self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
+        if 'cw' in self.signal_map.keys():
+            self.has_cw = True
+            self.det_idxs = self.signal_comb_idxs['cw']
+
+        if 'cor' in self.signal_map.keys():
+            self.has_cor = True
+            self.cor_idxs = self.signal_comb_idxs['cor']
+
+        if 'unc' in self.signal_map.keys():
+            self.has_unc = True
+            self.unc_tm_idxs = slice(self.signal_comb_idxs['timing'].start, 
+                                     self.signal_comb_idxs['unc'].stop)
+                        
+        if 'dm' in self.signal_map.keys():
+            self.has_dm = True
+
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
 
         self.nmodes = self.get_Fmat_concat.shape[-1]
@@ -1072,7 +1089,7 @@ class SuperSignal:
         Sigma_inv_L = jsl.cho_factor(Sigma_inv, lower = True)  # [npsr, nmodes, nmodes]
 
         # MAP coefficients via cho_solve pattern: forward then back substitution
-        a_hat = jsl.cho_solve(Sigma_inv_L, TNr[..., None])
+        a_hat = jsl.cho_solve(Sigma_inv_L, TNr)
 
         # Standardizing transform via back substitution
         Lz = jax.lax.linalg.triangular_solve(
@@ -1103,7 +1120,7 @@ class SuperSignal:
         else:
             padded_logpdf = 0.
 
-        log_density = lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N) + padded_logpdf
+        log_density = lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr[0, 0] + logdet_N) + padded_logpdf
 
         return log_density, coeff[..., 0]
 
@@ -1142,142 +1159,76 @@ class SuperSignal:
         logdet_Sigma = 2*jnp.sum(jnp.log(diags)) # scalar
 
         # rNT(Sigma^{-1})TNr
-        expvals = jnp.sum(TNr[:,:,None] * jsl.cho_solve(cfs, TNr[:,:,None])) # [npsr, nmodes, 1] -> scalar
+        expvals = jnp.sum(TNr * jsl.cho_solve(cfs, TNr)) # [npsr, nmodes, 1] -> scalar
         lnlike = 0.5 * (expvals - logdet_Sigma - logdet_phis.sum()) # scalar
-        return lnlike - 0.5 * (rNr + logdet_N)
+        return lnlike - 0.5 * (rNr[0, 0] + logdet_N)
     
     @jit_method
-    def lnposterior_partial_marg_reparam(self, helpers, red_params, z):
-        """
-        This method evaluates the partially marginalized posterior under a reparameterization of the Fourier
-        coefficients.
-        Call this method within gradient-based samplers.
-        NOTE: the reparameterization is based on the posterior of the coeffcients.
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT and TNr) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        red_params : array
-            The red noise parameters
-        z : array
-            "Whitened coefficients", [npsr, nmode]
-        Returns
-        -------
-        tuple
-            Fourier coefficients with variance imposed by spectral model [npsr, nmodes] and
-            the log-determinant of the Jacobian of the coordinate transformation [float].
-        """
-        TNT_b, TNr_b, rNr, logdet_N, TNT_p, TNr_p, T_bp = helpers
+    def partial_marg_lnposterior(self, 
+                                helpers,
+                                red_params, 
+                                z):
+        """_summary_
 
-        full_gwb_phi, gwb_phi_diag, psr_phi_diags = self.model.partial_reparm_helper(red_params)
-        gwb_phi_diag  = jnp.repeat(gwb_phi_diag, 2, axis=0)[:, 0]          # [nmode_b]
-        psr_phi_diags = jnp.repeat(psr_phi_diags.T, 2, axis=1)             # [npsr, nmode_p]
+        Args:
+            helpers (_type_): _description_
+            red_params (_type_): _description_
+            D_params (_type_): _description_
+            z (_type_): _description_
 
-        LG = jsl.cho_factor(full_gwb_phi, lower=True)
-        gwb_phi_inv = jnp.repeat(jsl.cho_solve(LG, self.model._eye), 2, axis=0)
+        Returns:
+            _type_: _description_
+        """        
+        # unpack and slice helper objects
+        TNT, TNr, rNr, logdet_N = helpers
 
-        (npsrs, nmodes_b, nmodes_p) = T_bp.shape
+        GG = TNT[:, self.cor_idxs, self.cor_idxs]
+        PP = TNT[:, self.unc_tm_idxs, self.unc_tm_idxs]
+        GP = TNT[:, self.cor_idxs, self.unc_tm_idxs]
+        Gr = TNr[:, self.cor_idxs, :1]
+        Pr = TNr[:, self.unc_tm_idxs, :1]
+        Pr_tim= TNr[:, self.unc_tm_idxs, 1:]
+        Gr_tim = TNr[:, self.cor_idxs, 1:]
+        r_r_tim = rNr[0, 1]
 
-        # -------------------------------------------------------------------------
-        # Pulsar RN block: Sigma_p = (TNT_p + phi_p_inv)  [npsr, nmode_p, nmode_p]
-        # -------------------------------------------------------------------------
-        psr_sigma_p_inv = TNT_p + jnp.einsum('pi,ij->pij', 1. / psr_phi_diags, jnp.eye(nmodes_p))
-        psr_phi_p_ln_det = jnp.sum(jnp.log(psr_phi_diags))
+        # get covariance matrices
+        phiinv_G, logdet_phi_G, phiinv_P, logdet_phi_P = self.model.partial_reparm_helper(red_params, self._pad_mask)
 
-        psr_sigma_p_inv_chol = jnp.linalg.cholesky(psr_sigma_p_inv)        # [npsr, nmode_p, nmode_p]
-        psr_sigma_p_inv_ln_dets = 2 * jnp.sum(
-            jnp.log(jnp.diagonal(psr_sigma_p_inv_chol, axis1=1, axis2=2)), axis=1
-        )  # [npsr]
+        diag_idxs_P = jnp.arange(PP.shape[-1])
+        Sigma_inv_P = PP.at[:, diag_idxs_P, diag_idxs_P].add(phiinv_P)
+        Sigma_inv_P_chol_factors = jsl.cho_factor(Sigma_inv_P, lower=True)
+        I = jnp.eye(Sigma_inv_P_chol_factors[0].shape[-1])
+        Sigma_P = jsl.cho_solve(Sigma_inv_P_chol_factors,
+                                jnp.broadcast_to(I, (Sigma_inv_P_chol_factors[0].shape))
+        )
 
-        # -------------------------------------------------------------------------
-        # Inner products for Schur complement
-        # -------------------------------------------------------------------------
-        Linv_T_bpT = jax.lax.linalg.triangular_solve(
-            psr_sigma_p_inv_chol, T_bp.mT, left_side=True, lower=True
-        )  # [npsr, nmode_p, nmode_b]
+        logdet_Sigma_inv_P = 2 * jnp.sum(jnp.log(jnp.diagonal(Sigma_inv_P_chol_factors[0], axis1=1, axis2=2)))
 
-        Linv_r_p = jax.lax.linalg.triangular_solve(
-            psr_sigma_p_inv_chol, TNr_p[:, :, None], left_side=True, lower=True
-        )  # [npsr, nmode_p, 1]
+        # build quadratic form of log-posterior
+        U = jnp.sum(0.5 * Pr.mT @ Sigma_P @ Pr + 0.5 * Pr_tim.mT @ Sigma_P @ Pr_tim \
+                    - Pr.mT @ Sigma_P @ Pr_tim - 0.5 * jnp.trace(rNr) + r_r_tim)
+        V = -GP @ Sigma_P @ Pr + GP @ Sigma_P @ Pr_tim + Gr - Gr_tim
+        W_inv_without_prior = -GP @ Sigma_P @ GP.mT + GG
 
-        T_bp_Sigma_p_T_bpT = Linv_T_bpT.mT @ Linv_T_bpT   # [npsr, nmode_b, nmode_b]
-        T_bp_Sigma_p_r_p   = (Linv_T_bpT.mT @ Linv_r_p)[:, :, 0]  # [npsr, nmode_b]
-        r_p_Sigma_p_r_p    = Linv_r_p.mT @ Linv_r_p        # [npsr, 1, 1]
+        # normalization
+        norm = -0.5 * (logdet_N + logdet_phi_G + logdet_phi_P + logdet_Sigma_inv_P)
 
-        # -------------------------------------------------------------------------
-        # GWB block: Sigma_b_inv  [npsr, nmode_b, nmode_b]
-        # phiinvs_diags packs both the Schur complement term and the GWB prior
-        # into a single additive correction to TNT_b
-        # -------------------------------------------------------------------------
-        gwb_phi_inv_spec = jnp.diag(1. / gwb_phi_diag)                     # [nmode_b, nmode_b] (CRN only)
+        # standardizing transformation
+        diag_idxs_G = jnp.arange(W_inv_without_prior.shape[-1])
+        phiinv_G_diag = jnp.diagonal(phiinv_G, axis1=1, axis2=2).T
+        W_inv_curn = W_inv_without_prior.at[:, diag_idxs_G, diag_idxs_G].add(phiinv_G_diag)
+        W_inv_curn_L = jsl.cho_factor(W_inv_curn, lower = True)
+        g_hat = jsl.cho_solve(W_inv_curn_L, V)
+        Lz = jax.lax.linalg.triangular_solve(W_inv_curn_L[0], z[..., None],
+                                            left_side=True, lower=True, transpose_a=True)
+        g = g_hat + Lz  # [npsr, nmodes, 1]
+        lndet_Jac = -jnp.sum(jnp.log(W_inv_curn_L[0].diagonal(axis1=-2, axis2=-1)))
 
-        phiinvs_diags = (-T_bp_Sigma_p_T_bpT + self.lowest_value_eq_to_zero)
-        phiinvs_diags = phiinvs_diags.at[:, self.linear_timing_model_size:,
-                                            self.linear_timing_model_size:].add(gwb_phi_inv_spec[None])
-        phiinvs_diags = phiinvs_diags.at[:, self.eps_diag_idx,
-                                            self.eps_diag_idx].add(self._pad_mask)
-
-        gwb_sigma_b_inv = TNT_b + phiinvs_diags                            # [npsr, nmode_b, nmode_b]
-
-        # Effective data vector after marginalising IRN
-        w_b = TNr_b - T_bp_Sigma_p_r_p                                     # [npsr, nmode_b]
-
-        # -------------------------------------------------------------------------
-        # Standardizing transformation: a_b = a_hat_b + L_b^{-T} z
-        # -------------------------------------------------------------------------
-        Sigma_b_inv_L = jnp.linalg.cholesky(gwb_sigma_b_inv)               # [npsr, nmode_b, nmode_b]
-
-        y_b    = jax.lax.linalg.triangular_solve(
-            Sigma_b_inv_L, w_b[:, :, None], left_side=True, lower=True
-        )  # L y = w_b
-        a_hat_b = jax.lax.linalg.triangular_solve(
-            Sigma_b_inv_L, y_b, left_side=True, lower=True, transpose_a=True
-        )  # L^T a_hat = y
-        Lz = jax.lax.linalg.triangular_solve(
-            Sigma_b_inv_L, z[:, :, None], left_side=True, lower=True, transpose_a=True
-        )  # L^T Lz = z
-        a_b = a_hat_b + Lz                                                  # [npsr, nmode_b, 1]
-
-        lndet_Jac = -jnp.sum(jnp.log(jnp.diagonal(Sigma_b_inv_L, axis1=1, axis2=2)))
-
-        # -------------------------------------------------------------------------
-        # Log-likelihood: use full a_b — timing model params couple to CRN through
-        # off-diagonal blocks of W_b = TNT_b - T_bp_Sigma_p_T_bpT, so dropping
-        # the timing model slice introduces missing quadratic and linear terms
-        # -------------------------------------------------------------------------
-        # W_b = gwb_sigma_b_inv minus the GWB prior block (leave timing and
-        # stabiliser terms in place; they are O(lowest_value) and cancel with
-        # padded_logpdf below)
-        phi_b_prior = jnp.zeros_like(gwb_sigma_b_inv)
-        phi_b_prior = phi_b_prior.at[:, self.linear_timing_model_size:,
-                                        self.linear_timing_model_size:].set(gwb_phi_inv_spec[None])
-        W_b = gwb_sigma_b_inv - phi_b_prior                                 # ≈ S_b = TNT_b - T_bp Sigma_p T_bp^T
-
-        ln_likelihood_val  = -0.5 * jnp.sum(a_b.mT @ W_b @ a_b)
-        ln_likelihood_val +=        jnp.sum(a_b[..., 0] * w_b)
-        ln_likelihood_val +=  0.5 * jnp.sum(r_p_Sigma_p_r_p)
-        ln_likelihood_val += -0.5 * psr_phi_p_ln_det - 0.5 * jnp.sum(psr_sigma_p_inv_ln_dets)
-
-        # -------------------------------------------------------------------------
-        # Log-prior on GWB coefficients only (timing model has flat/improper prior)
-        # -------------------------------------------------------------------------
-        a_G  = a_b[:, self.linear_timing_model_size:]                       # [npsr, ncrn, 1]
-        aG   = a_G.transpose((1, 0, 2))                                     # [ncrn, npsr, 1]
-        logdet_phi_gwb = 4 * jnp.sum(jnp.log(LG[0].diagonal(axis1=-2, axis2=-1)))
-        ln_prior_val = -0.5 * jnp.sum(aG.mT @ gwb_phi_inv @ aG + logdet_phi_gwb)
-
-        # -------------------------------------------------------------------------
-        # HMC curvature for zero-padded timing model entries
-        # -------------------------------------------------------------------------
-        if self.linear_timing and not self.marg_tm:
-            padded_logpdf = -0.5 * jnp.sum(
-                (self._pad_mask * a_b[:, :self.linear_timing_model_size, 0]) ** 2
-            )
-        else:
-            padded_logpdf = 0.
-
-        return ln_likelihood_val + ln_prior_val + lndet_Jac + padded_logpdf + 0.5 * jnp.sum(z ** 2), aG
+        ln_likelihood = U + g.mT @ V - 0.5 * g.mT @ W_inv_without_prior @ g
+        lnprior = -0.5 * (g.transpose(1, 2, 0) @ phiinv_G @ g.transpose(1, 0, 2)).sum()
+        
+        result = jnp.sum(norm + ln_likelihood + lnprior + lndet_Jac)
+        return result, g
 
 
     
