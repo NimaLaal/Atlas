@@ -1097,7 +1097,7 @@ class WhiteCov:
         """
         N_basis = red_noise_basis.shape[1]
         FNF = jnp.zeros((self.npulsars, N_basis, N_basis))
-        FNr = jnp.zeros((self.npulsars, N_basis, residuals.shape[1]))
+        FNr = jnp.zeros((self.npulsars, N_basis))
 
         log_det_N = 0
         rNr = 0
@@ -1113,17 +1113,17 @@ class WhiteCov:
                 F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
                 r_p  = residuals[start:end]                             # [n_p]
                 # One solve per pulsar: right = [T_p | r_p]
-                Fr_p = jnp.concatenate([F_p, r_p], axis=1)     # [n_p, N_basis+1]
+                Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
                 res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
 
                 FNF = FNF.at[pidx].set(res[:, :N_basis])
-                FNr = FNr.at[pidx].set(res[:, N_basis:])
+                FNr = FNr.at[pidx].set(res[:, N_basis])
 
-                x, y = cov.solve_with_logdet(white_noise_helper, r_p, r_p)
+                x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
                 rNr += x
                 log_det_N += y
 
-            return FNF, FNr, rNr, log_det_N
+            return FNF, FNr, rNr[0, 0], log_det_N
 
         else:
             for pidx, cov, start, end in zip(self.pulsar_idxs, 
@@ -1139,20 +1139,20 @@ class WhiteCov:
                 F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
                 r_p  = residuals[start:end]                             # [n_p]
                 # One solve per pulsar: right = [T_p | r_p]
-                Fr_p = jnp.concatenate([F_p, r_p], axis=1)     # [n_p, N_basis+1]
+                Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
                 res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
 
                 FNF = FNF.at[pidx].set(res[:, :N_basis])
-                FNr = FNr.at[pidx].set(res[:, N_basis:])
+                FNr = FNr.at[pidx].set(res[:, N_basis])
 
-                x, y = cov.solve_with_logdet(white_noise_helper, r_p, r_p)
+                x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
                 rNr += x
                 log_det_N += y
 
             if self.stabelize:
-                return stabelize_TNT(FNF, FNF.shape[-1]), FNr, rNr, log_det_N
+                return stabelize_TNT(FNF, FNF.shape[-1]), FNr, rNr[0, 0], log_det_N
             else:
-                return FNF, FNr, rNr, log_det_N
+                return FNF, FNr, rNr[0, 0], log_det_N
 
     def get_red_det_helpers(self, red_noise_basis, det_signal_basis,
                             residuals, white_noise_params):
@@ -1225,7 +1225,7 @@ class WhiteCov:
             r_p  = residuals[start:end]                            # [n_p]
 
             # Stack once: M_p = [T_p | TD_p | r_p]  -> [n_p, Ntot + 1]
-            M_p = jnp.concatenate([T_p, TD_p, r_p], axis=1)
+            M_p = jnp.concatenate([T_p, TD_p, r_p[:, None]], axis=1)
 
             # One solve per pulsar gives the full symmetric Gram matrix + logdet.
             # G = M_p^T N_p^{-1} M_p  -> [Ntot + 1, Ntot + 1]

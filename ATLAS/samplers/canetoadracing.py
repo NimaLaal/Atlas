@@ -153,21 +153,7 @@ class MultiHMCGibbs(MCMCKernel):
 
     def postprocess_fn(self, args, kwargs):
         _ = kwargs.pop("_cond_sites", {})
-
-        def combined(z):
-            constrained = {
-                name: self._site_bijectors[name](val)
-                for name, val in z.items()
-                if name in self._site_bijectors
-            }
-            model_trace = trace(substitute(self.model, data=constrained)).get_trace(*args, **kwargs)
-            out = dict(constrained)
-            for name, site in model_trace.items():
-                if site["type"] == "deterministic":
-                    out[name] = site["value"]
-            return out
-
-        return combined
+        return self.inner_kernels[0].postprocess_fn(args, kwargs)
 
     def check_gibbs_sites(self, model_args, model_kwargs):
         """Verify every sample site appears in exactly one Gibbs group."""
