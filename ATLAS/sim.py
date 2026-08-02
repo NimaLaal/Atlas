@@ -266,7 +266,7 @@ class Sim(object):
         a = self.get_red_coeff(red_params)
         ####################################Timing####################################
         if self.has_timing:
-            timing_res = self.timing_model.residuals_per_pulsar(z_tm_concat)  #jagged_list [n_psrs, n_toas] 
+            timing_res = self.timing_model.timing_model_residuals_per_pulsar(z_tm_concat)  #jagged_list [n_psrs, n_toas] 
         else:
             timing_res = jnp.zeros(self.Npulsars)
 

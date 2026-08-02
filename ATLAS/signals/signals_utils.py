@@ -95,7 +95,7 @@ def build_basis(signal_helper):
 
     return Fmat, signal_indices
 
-def stabelize_TNT(A, A_shape, eps=1e-9):
+def stabilize_TNT(A, A_shape, eps=1e-6):
     """
     This function stabelizes a batched of positve definite matricies
     by shifting the diagonals of the matricies by
@@ -117,8 +117,13 @@ def stabelize_TNT(A, A_shape, eps=1e-9):
     lowest = A.diagonal(axis1 = -2, axis2 = -1).min(axis = -1)[..., None]
     idxs = jnp.arange(A_shape)
     return A.at[:, idxs, idxs].add(eps * lowest)
+    
+    # diag = A.diagonal(axis1=-2, axis2=-1)
+    # lowest = jnp.where(diag > 0, diag, jnp.inf).min(axis=-1, keepdims=True)
+    # idxs = jnp.arange(A_shape)
+    # return A.at[:, idxs, idxs].add(eps * lowest)
 
-def stabelize_TDNTD(A, A_shape, eps=1e-9):
+def stabilize_TDNTD(A, A_shape, eps=1e-9):
     """
     This function stabelizes a batched of positve definite matricies
     by shifting the diagonals of the matricies by

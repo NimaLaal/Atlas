@@ -28,6 +28,8 @@ from numpyro.infer.mcmc import MCMCKernel
 from numpyro.util import is_prng_key
 import numpyro.distributions as dist
 
+import numpyro
+import numpyro.distributions as dist
 # ---------------------------------------------------------------------------
 # Public state type
 # ---------------------------------------------------------------------------
@@ -669,3 +671,46 @@ class MultiHMCGibbsWithAnalytic(MultiHMCGibbs):
             jnp.stack(rng_keys),
             hmc_state.potential_energy,
         )
+
+
+def model_maker(raw_residuals, 
+                super_sig,
+                vary_white = False,
+                wn_lower_bound = None,
+                wn_upper_bound = None,
+                tm_model = None,
+                helpers = None,
+                save_red_coeff = False,
+                fixed_white_noise_params = None,
+                ):
+                
+    ######################################## Timing Model ########################################
+    if tm_model:
+        lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
+        k = numpyro.sample("timing_k", dist.Normal(0, 50).expand([tm_model.nparams_total]))
+        stochastic_res = tm_model.residuals(k * lam)
+    else:
+        stochastic_res = raw_residuals
+
+    ######################################## White Noise ########################################
+    if vary_white:
+        theta_wn = numpyro.sample('white_noise', dist.Uniform(wn_lower_bound, wn_upper_bound))
+        helpers_now = super_sig.get_helpers(reff = stochastic_res,
+                                  white_noise_params = theta_wn)
+
+    elif not vary_white and tm_model:
+        helpers_now = super_sig.get_helpers(reff = stochastic_res,
+                                  white_noise_params = fixed_white_noise_params)
+    else:
+        helpers_now = helpers
+
+    ######################################## Red Noise ########################################
+    xs = numpyro.sample('red_noise', dist.Uniform(super_sig.model.lower_prior_lim_all, 
+                                                  super_sig.model.upper_prior_lim_all))
+    z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes))) #the reparam coefficients
+
+    # evaluate the posterior
+    lprob, coeff = super_sig.lnposterior_reparam(helpers = helpers_now, red_params = xs, z = z_a)
+    numpyro.factor('lnpost', lprob + 0.5 * jnp.sum(z_a**2))
+    if save_red_coeff:
+        numpyro.deterministic('coeff', coeff)

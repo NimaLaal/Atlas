@@ -6,6 +6,13 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
+import numpyro
+import numpyro.distributions as dist
+from numpyro.infer import MCMC, NUTS, init_to_value
+
+from ATLAS.signals.timing.routing import route
+from ATLAS.signals.timing import preconditioning as P
+from ATLAS.samplers.canetoadracing import MultiHMCGibbs
 
 from jug.engine.session import TimingSession
 from jug.utils.constants import K_DM_SEC, SECS_PER_DAY, C_KM_S, T_SUN_SEC
@@ -350,10 +357,10 @@ def reparametrise(name: str, x0: float, u):
 _M2_BOUNDS = (0.0, 3.0)        # M2 ∈ [0, 3] Msun  (J1909 truth ≈0.21 → 7% of range)
 _PX_BOUNDS = (0.0, 10.0)       # PX ∈ [0, 10] mas  (J1909 truth ≈1.0 → 10% of range)
 _ECC_HI    = 1.0 - 1e-6
-_AFFINE_Z_SD = 8.0
+_BOUND_SPECS = {"M2": ("uniform", *_M2_BOUNDS), "ECC": ("uniform", 0.0, _ECC_HI)}
+DEFAULT_BOUND = ("M2", "SINI", "ECC")
 
-
-def sample_timing_theta(sample_list, theta_0, sigma, prefix=''):
+def sample_timing_theta(sample_list, theta_0, sigma, prefix='', AFFINE_Z_SD = 100.0):
     """numpyro: draw each sampled timing param from its proper bounded prior.
 
     THE single prior mechanism — called by both the production MultiPsrTimingModel
@@ -384,11 +391,39 @@ def sample_timing_theta(sample_list, theta_0, sigma, prefix=''):
             theta[k] = numpyro.sample(f'{prefix}{k}', dist.Uniform(*_PX_BOUNDS))    # flat, site == name
         else:                                          # affine, wide Normal in z
             s = max(float(sigma[k]), 1e-30)
-            z = numpyro.sample(f'{prefix}z_{k}', dist.Normal(0.0, _AFFINE_Z_SD))
+            z = numpyro.sample(f'{prefix}z_{k}', dist.Normal(0.0, AFFINE_Z_SD))
             theta[k] = theta_0[k] + z * s
             numpyro.deterministic(f'{prefix}{k}', theta[k])   # transformed → emit
     return theta
 
+def sample_timing_theta_batched(key, sample_list, theta_0, sigma, num_samples, prefix='', AFFINE_Z_SD = 100.0):
+    """Pure-JAX batched draw mirroring sample_timing_theta's prior logic.
+
+    sample_list must be a tuple (hashable, so it's a valid static arg).
+    theta_0 / sigma are dicts of python floats or 0-d arrays.
+    Returns {name: array of shape (num_samples,)}.
+    """
+    keys = jax.random.split(key, len(sample_list))
+    theta = {}
+    for k, subkey in zip(sample_list, keys):
+        if k == 'SINI':
+            cosi = jax.random.uniform(subkey, (num_samples,), minval=-1.0, maxval=1.0)
+            theta[f'{prefix}cosi_{k}'] = cosi
+            theta[f'{prefix}{k}'] = jnp.sqrt(jnp.clip(1.0 - cosi**2, 1e-12, 1.0))
+        elif k == 'ECC':
+            theta[f'{prefix}{k}'] = jax.random.uniform(subkey, (num_samples,), minval=0.0, maxval=_ECC_HI)
+        elif k == 'M2':
+            lo, hi = _M2_BOUNDS
+            theta[f'{prefix}{k}'] = jax.random.uniform(subkey, (num_samples,), minval=lo, maxval=hi)
+        elif k == 'PX':
+            lo, hi = _PX_BOUNDS
+            theta[f'{prefix}{k}'] = jax.random.uniform(subkey, (num_samples,), minval=lo, maxval=hi)
+        else:
+            s = max(float(sigma[k]), 1e-30)
+            z = jax.random.normal(subkey, (num_samples,)) * AFFINE_Z_SD
+            theta[f'{prefix}z_{k}'] = z
+            theta[f'{prefix}{k}'] = theta_0[k] + z * s
+    return theta
 
 def timing_init_values(sample_list, theta_0, prefix=''):
     """Matching init dict (init_to_value) for ``sample_timing_theta`` priors."""
@@ -1036,7 +1071,8 @@ def setup_timing_model(par_path: str, tim_path: str,
         'jump_masks':   jump_masks,  # {JUMP{n}: bool array} — for diagnostics
         'Mmat': _timing_model_svd(Mmat),           # SVD basis of sample-list-stripped M
         'Mmat_param_names': Mmat_param_names,       # retained linear labels (pre-SVD, auditable)
-        'Cjug':_Cjug 
+        'Cjug': _Cjug,
+        'fittable_order': _fittable,   # JUG design-label order Cjug is indexed by
     }
     return delta_m_us, aux
 
@@ -1105,6 +1141,7 @@ class MultiPsrTimingModel:
         self.sample_list   = list(sample_list)
         self.scales        = scales
         self.nparams       = [len(lst) for lst in self.sample_list]
+        self.nparams_total       = sum(self.nparams)
         self.npulsars      = len(delta_m_list)
 
         ntoas = tuple(int(aux['n_toa']) for aux in aux_list)
@@ -1122,6 +1159,15 @@ class MultiPsrTimingModel:
         self.eps_starts = tuple(int(c) for c in cumulative_eps[:-1])
         self.eps_ends   = tuple(int(c) for c in cumulative_eps[1:])
 
+        self._prepare_family_index()
+
+        # Populated by prepare_dense_metric() -- unset until then, so
+        # build_gibbs_model/run_gibbs can fail with a clear message rather
+        # than a bare AttributeError if called first.
+        self.bound_names = None
+        self.OFFSET = self.AFFINE = self.BOUND = None
+        self.metric_cols = None
+        self.timing_metric_list = self.metric_order_list = self.metric_sites = None
         
     # ------------------------------------------------------------------
     # Parameter layout helpers
@@ -1327,10 +1373,10 @@ class MultiPsrTimingModel:
             parts.append(r_obs_p - tm_res)
             
             start_index = end_index
-        return jnp.concatenate(parts)                                    # [total_ntoas]
+        return jnp.concatenate(parts)                                   # [total_ntoas]
 
     @partial(jax.jit, static_argnums=0)
-    def residuals_per_pulsar(self, z_concat):
+    def timing_model_residuals_per_pulsar(self, z_concat):
         """Compute concatenated timing residuals for all pulsars.
 
         Parameters
@@ -1355,8 +1401,7 @@ class MultiPsrTimingModel:
             z_p     = z_concat[start_index : end_index]
             theta_p = self.z_to_theta(pidx, z_p)
             tm_res  = self.delta_m_list[pidx](theta_p) * 1e-6          # µs → s
-            r_obs_p = self.raw_residuals[pidx]
-            parts.append(r_obs_p - tm_res)
+            parts.append(tm_res)
             
             start_index = end_index
         return parts
@@ -1364,6 +1409,220 @@ class MultiPsrTimingModel:
     # ------------------------------------------------------------------
     # Production numpyro timing block — bounded proper priors (the single mechanism)
     # ------------------------------------------------------------------
+    def _prepare_family_index(self):
+        """Static (Python-level) grouping of every (pulsar, param) into its
+        bounded-prior family. Call once at construction — no JAX tracing here.
+        """
+        families = {'SINI': [], 'ECC': [], 'M2': [], 'PX': [], 'affine': []}
+        slot_map = []  # slot_map[pidx] = [(family, idx_in_family), ...] in sample order
+    
+        for pidx, sl in enumerate(self.sample_list):
+            theta_0 = self.aux_list[pidx]['theta_0']
+            sig     = self.aux_list[pidx]['sigJUG']
+            pulsar_slots = []
+            for k in sl:
+                fam = k if k in ('SINI', 'ECC', 'M2', 'PX') else 'affine'
+                idx = len(families[fam])
+                families[fam].append((pidx, k, theta_0[k],
+                                       sig[k] if fam == 'affine' else None))
+                pulsar_slots.append((fam, idx))
+            slot_map.append(pulsar_slots)
+    
+        self._fam_entries = families   # raw (pidx, k, theta0, sigma) — used by init_values
+        self._fam_size    = {f: len(v) for f, v in families.items()}
+        self._fam_theta0  = {f: jnp.asarray([e[2] for e in v]) for f, v in families.items() if v}
+        self._fam_sigma   = ({'affine': jnp.asarray([e[3] for e in families['affine']])}
+                              if families['affine'] else {})
+        self._slot_map    = slot_map
+
+    # ------------------------------------------------------------------
+    # Dense-mass-matrix preconditioning (ported from the single-pulsar
+    # JointProblem) — per-pulsar OFFSET/AFFINE/BOUND routing + a frozen
+    # dense NUTS mass matrix derived from JUG's own covariance.  This is
+    # what fixes NUTS step-size collapse: instead of letting warmup LEARN
+    # the parameter scale/orientation from scratch, it starts from JUG's
+    # actual covariance.  Cross-pulsar timing correlations are zero
+    # (independent TOA sets), so a per-pulsar dense block is the correct
+    # structure, not an approximation -- and much cheaper than one dense
+    # matrix over every pulsar's params combined.
+    # ------------------------------------------------------------------
+    def prepare_dense_metric(self, bound=DEFAULT_BOUND):
+        """Call once (after __init__) if you want to use build_gibbs_model /
+        run_gibbs instead of the family-batched sample_residuals path.
+        """
+        self.bound_names = tuple(bound)
+        self.OFFSET, self.AFFINE, self.BOUND = [], [], []
+        self.metric_cols = []
+        self.timing_metric_list, self.metric_order_list, self.metric_sites = [], [], []
+
+        for pidx in range(self.npulsars):
+            delta_m = self.delta_m_list[pidx]
+            aux     = self.aux_list[pidx]
+            sl      = self.sample_list[pidx]
+            th0     = aux['theta_0']
+            sigJUG  = aux['sigJUG']
+            Cjug    = aux['Cjug']
+            fittable_order = aux['fittable_order']
+            base_sampled = {k: jnp.asarray(float(th0[k])) for k in sl}
+
+            bound_p  = [k for k in bound if k in sl]
+            offset_p = [k for k in sl if k not in bound_p and
+                       route(k, float(th0[k]), sigJUG[k], delta_m, base_sampled)["bucket"] == "offset"]
+            affine_p = [k for k in sl if k not in offset_p + bound_p]
+            cols_p   = P.offset_columns(delta_m, base_sampled, offset_p) if offset_p else {}
+
+            SINI_0 = float(th0["SINI"]) if "SINI" in th0 else None
+            cosi_0 = (float(np.sqrt(max(1 - SINI_0 ** 2, 0.0))) if SINI_0 is not None else None)
+
+            order = [k for k in (offset_p + affine_p + ["M2", "SINI", "ECC"]) if k in sl]
+            idx   = [fittable_order.index(k) for k in order]
+            Cphys = Cjug[np.ix_(idx, idx)]
+            specs = {k: _BOUND_SPECS[k] for k in ("M2", "ECC") if k in order}
+            if "SINI" in order:
+                specs["SINI"] = ("sini", cosi_0, SINI_0)
+            D = P.coordinate_jacobian(order, {k: float(th0[k]) for k in order}, sigJUG, specs)
+            metric = P.jug_metric(Cphys, D) if order else None
+            sites  = [f"p{pidx}_{self._site_of(k, offset_p)}" for k in order]
+
+            self.OFFSET.append(offset_p); self.AFFINE.append(affine_p); self.BOUND.append(bound_p)
+            self.metric_cols.append(cols_p)
+            self.timing_metric_list.append(metric); self.metric_order_list.append(order)
+            self.metric_sites.append(sites)
+
+    @staticmethod
+    def _site_of(k, offset_p):
+        if k in offset_p: return f"u_{k}"
+        if k == "SINI": return "cosi"
+        if k in ("M2", "ECC"): return k
+        return f"z_{k}"
+
+    def build_gibbs_model(self, noise_loglik, sample_noise=True,
+                          fixed_noise_sites=None, z_prior_sd=1.0):
+        """One NumPyro model: per-pulsar OFFSET/AFFINE/BOUND timing sites
+        (preconditioned by prepare_dense_metric's dense blocks) -> concatenated
+        residual -> your noise_loglik(res_parts, sample_noise, fixed_noise_sites).
+        Requires prepare_dense_metric() to have been called first.
+        """
+        def model():
+            res_parts = []
+            for pidx in range(self.npulsars):
+                th0, sigJUG = self.aux_list[pidx]['theta_0'], self.aux_list[pidx]['sigJUG']
+                offset_p, affine_p, bound_p = self.OFFSET[pidx], self.AFFINE[pidx], self.BOUND[pidx]
+                cols, pfx = self.metric_cols[pidx], f"p{pidx}_"
+
+                theta, off = {}, 0.0
+                for k in offset_p:
+                    u = numpyro.sample(f"{pfx}u_{k}", dist.Normal(0., z_prior_sd))
+                    off = off + u * sigJUG[k] * cols[k]
+                    numpyro.deterministic(f"{pfx}d{k}", u * sigJUG[k])
+                for k in affine_p:
+                    z = numpyro.sample(f"{pfx}z_{k}", dist.Normal(0., z_prior_sd))
+                    theta[k] = float(th0[k]) + z * sigJUG[k]
+                    numpyro.deterministic(f"{pfx}{k}", theta[k])
+                if "SINI" in bound_p:
+                    cosi = numpyro.sample(f"{pfx}cosi", dist.Uniform(-1., 1.))
+                    theta["SINI"] = jnp.sqrt(jnp.clip(1 - cosi ** 2, 1e-12, 1.))
+                    numpyro.deterministic(f"{pfx}SINI", theta["SINI"])
+                if "M2" in bound_p:
+                    theta["M2"] = numpyro.sample(f"{pfx}M2", dist.Uniform(*_M2_BOUNDS))
+                if "ECC" in bound_p:
+                    theta["ECC"] = numpyro.sample(f"{pfx}ECC", dist.Uniform(0., _ECC_HI))
+
+                th = {k: jnp.asarray(float(th0[k])) for k in self.sample_list[pidx]}
+                th.update(theta)
+                tm_res = (self.delta_m_list[pidx](th) + off) * 1e-6
+                res_parts.append(self.raw_residuals[pidx] - tm_res)
+
+            numpyro.factor("lnpost", noise_loglik(res_parts, sample_noise, fixed_noise_sites))
+
+        return model
+
+    def gibbs_init_values(self):
+        iv = {}
+        for pidx in range(self.npulsars):
+            th0, pfx = self.aux_list[pidx]['theta_0'], f"p{pidx}_"
+            iv.update({f"{pfx}u_{k}": 0.0 for k in self.OFFSET[pidx]})
+            iv.update({f"{pfx}z_{k}": 0.0 for k in self.AFFINE[pidx]})
+            if "SINI" in self.BOUND[pidx]:
+                SINI_0 = float(th0["SINI"])
+                iv[f"{pfx}cosi"] = float(np.sqrt(max(1 - SINI_0 ** 2, 0.0)))
+            if "M2" in self.BOUND[pidx]:
+                iv[f"{pfx}M2"] = float(th0["M2"])
+            if "ECC" in self.BOUND[pidx]:
+                iv[f"{pfx}ECC"] = float(th0["ECC"])
+        return iv
+
+    def run_gibbs(self, model, noise_site_group=None, key=1, num_warmup=700,
+                 num_samples=1500, num_chains=2, target_accept_prob=0.9, progress_bar=False):
+        """2-block MultiHMCGibbs: [ all pulsars' timing sites, block-diagonal
+        frozen dense mass | noise sites, adaptive ]. Requires
+        prepare_dense_metric() to have been called first.
+        """
+        iv = self.gibbs_init_values()
+        dense_mass_groups = [tuple(s) for s in self.metric_sites if s]
+        inv_mass = {tuple(s): jnp.asarray(m) for s, m in zip(self.metric_sites, self.timing_metric_list)
+                   if s and m is not None}
+        all_timing_sites = [s for group in self.metric_sites for s in group]
+
+        kernels, groups = [], []
+        if all_timing_sites:
+            kernels.append(NUTS(model, target_accept_prob=target_accept_prob, max_tree_depth=9,
+                                dense_mass=dense_mass_groups, inverse_mass_matrix=inv_mass,
+                                adapt_mass_matrix=False, init_strategy=init_to_value(values=iv)))
+            groups.append(all_timing_sites)
+        if noise_site_group:
+            kernels.append(NUTS(model, target_accept_prob=target_accept_prob, max_tree_depth=8,
+                                dense_mass=False, init_strategy=init_to_value(values=iv)))
+            groups.append(list(noise_site_group))
+
+        mc = MCMC(MultiHMCGibbs(kernels, groups), num_warmup=num_warmup, num_samples=num_samples,
+                  num_chains=num_chains, chain_method="sequential", progress_bar=progress_bar)
+        mc.run(jax.random.PRNGKey(key))
+        return mc
+
+    def residuals_hybrid(self, AFFINE_Z_SD = 100.0):
+        """Bounded no-Jacobian priors for SINI/ECC/M2/PX (avoids the tanh/log
+        saturation that pathologically shrinks NUTS' step size in the
+        multi-pulsar case); single batched affine Normal for everything else.
+        Priors match sample_timing_theta exactly, just batched by family
+        instead of by (pulsar, param).
+        """
+        import numpyro
+        import numpyro.distributions as dist
+    
+        fam_vals = {}
+    
+        # --- bounded families: no saturating transform, no Jacobian needed ---
+        if self._fam_size['SINI']:
+            cosi = numpyro.sample('cosi_batch',
+                                   dist.Uniform(-1.0, 1.0).expand([self._fam_size['SINI']]))
+            fam_vals['SINI'] = jnp.sqrt(jnp.clip(1.0 - cosi**2, 1e-12, 1.0))
+            numpyro.deterministic('SINI_batch', fam_vals['SINI'])
+        if self._fam_size['ECC']:
+            fam_vals['ECC'] = numpyro.sample('ECC_batch',
+                                              dist.Uniform(0.0, _ECC_HI).expand([self._fam_size['ECC']]))
+        if self._fam_size['M2']:
+            fam_vals['M2'] = numpyro.sample('M2_batch',
+                                             dist.Uniform(*_M2_BOUNDS).expand([self._fam_size['M2']]))
+        if self._fam_size['PX']:
+            fam_vals['PX'] = numpyro.sample('PX_batch',
+                                             dist.Uniform(*_PX_BOUNDS).expand([self._fam_size['PX']]))
+    
+        # --- affine class: single flat vector, cheap to trace/compile ---
+        if self._fam_size['affine']:
+            z = numpyro.sample('z_affine_batch',
+                                dist.Normal(0.0, AFFINE_Z_SD).expand([self._fam_size['affine']]))
+            fam_vals['affine'] = self._fam_theta0['affine'] + z * self._fam_sigma['affine']
+            numpyro.deterministic('theta_affine_batch', fam_vals['affine'])
+    
+        parts = []
+        for pidx in range(self.npulsars):
+            theta_p = {k: fam_vals[fam][idx]
+                       for k, (fam, idx) in zip(self.sample_list[pidx], self._slot_map[pidx])}
+            tm_res = self.delta_m_list[pidx](theta_p) * 1e-6
+            parts.append(self.raw_residuals[pidx] - tm_res)
+        return jnp.concatenate(parts)
+    
     def sample_residuals(self):
         """numpyro block: sample every pulsar's timing params from the canonical
         bounded proper priors and return the concatenated stochastic residuals
@@ -1387,13 +1646,54 @@ class MultiPsrTimingModel:
             parts.append(self.raw_residuals[pidx] - tm_res)
         return jnp.concatenate(parts)
 
-    def init_values(self, prefix_each=True):
-        """init_to_value dict matching ``sample_residuals`` priors (all pulsars)."""
+    def sample_training_residuals(self, key, num_samples, pulsar_index, z_scale = 100):
+        """numpyro block: sample every pulsar's timing params from the canonical
+        bounded proper priors and return the concatenated stochastic residuals
+        (seconds).  This is the production timing Gibbs group; it imposes the
+        SAME bounded priors as the validation harnesses via ``sample_timing_theta``
+        and uses NO Jacobian factor.  Call inside a numpyro model.
+
+        Returns
+        -------
+        res : array [total_ntoas]   r_obs_p - delta_m_p(theta_p), per pulsar.
+        """
+        draws = sample_timing_theta_batched(key, 
+                                self.sample_list[pulsar_index], 
+                                self.aux_list[pulsar_index]['theta_0'], 
+                                self.aux_list[pulsar_index]['sigJUG'],
+                                num_samples=num_samples,
+                                AFFINE_Z_SD=z_scale)
+        tm_res = jax.vmap(lambda th: self.delta_m_list[pulsar_index](th))(draws)
+        return tm_res * 1e-6
+
+    def init_values(self):
+        """init_to_value dict matching the batched sample_residuals priors.
+        Same clipping/fallback logic as timing_init_values, just vectorised
+        per family instead of per (pulsar, param).
+        """
         iv = {}
-        for pidx in range(self.npulsars):
-            iv.update(timing_init_values(self.sample_list,
-                                         self.aux_list[pidx]['theta_0'],
-                                         prefix=f'p{pidx}_'))
+        if self._fam_size['SINI']:
+            iv['cosi_batch'] = jnp.asarray([
+                float(np.sqrt(max(1.0 - theta0 ** 2, 0.0)))
+                for (_, _, theta0, _) in self._fam_entries['SINI']
+            ])
+        if self._fam_size['ECC']:
+            iv['ECC_batch'] = jnp.asarray([
+                float(min(max(theta0, 0.0), _ECC_HI))
+                for (_, _, theta0, _) in self._fam_entries['ECC']
+            ])
+        if self._fam_size['M2']:
+            iv['M2_batch'] = jnp.asarray([
+                float(min(max(theta0, _M2_BOUNDS[0] + 1e-6), _M2_BOUNDS[1] - 1e-6))
+                for (_, _, theta0, _) in self._fam_entries['M2']
+            ])
+        if self._fam_size['PX']:
+            iv['PX_batch'] = jnp.asarray([
+                float(min(max(theta0, _PX_BOUNDS[0] + 1e-6), _PX_BOUNDS[1] - 1e-6))
+                for (_, _, theta0, _) in self._fam_entries['PX']
+            ])
+        if self._fam_size['affine']:
+            iv['z_affine_batch'] = jnp.zeros(self._fam_size['affine'])
         return iv
 
     # ------------------------------------------------------------------

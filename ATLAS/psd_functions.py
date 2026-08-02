@@ -7,6 +7,7 @@ import jax.scipy as jsp
 import scipy.constants as sc
 import jax.random as jr
 from functools import lru_cache, partial
+
 try:
     from interpax import interp1d
 except ImportError:
@@ -84,6 +85,16 @@ def free_spectrum(f, df, *halflog10_rho):
     """
     return 10 ** (2 * jnp.array(halflog10_rho))
 
+@jax.jit
+def gwb_free_spectrum(f, df, *halflog10_rho):
+    """
+    Free spectral model. PSD  amplitude at each frequency
+    is a free parameter. Model is parameterized by
+    S(f_i) = \rho_i^2 * T,
+    where \rho_i is the free parameter and T is the observation
+    length.
+    """
+    return 10 ** (2 * jnp.array(halflog10_rho))[:, None]
 
 ##############################################################################################
 @jax.jit

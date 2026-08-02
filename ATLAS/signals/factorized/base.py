@@ -7,8 +7,15 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 import jax.random as jrandom
 from ATLAS import parameterized
-
+from ATLAS.psd_functions import free_spectrum
+from tqdm import trange
 from functools import partial
+import numpy as np
+import random
+from sklearn.decomposition import TruncatedSVD
+from sklearn.decomposition import PCA
+from tqdm_joblib import ParallelPbar
+from joblib import delayed
 
 class Red:
     """A signal class for a factorized likelihood (not prior).
@@ -524,7 +531,162 @@ class Red:
         # Convert back to halflog10_rho parameters
         halflog10_rho = 0.5*jnp.log10(new_params).reshape(-1, self.ndraws) # [npsr*nfreqs, nfreqs]
         return halflog10_rho.T # [ndraws, nfreqs*npsrs]
+
+class GaussianTiming:
+    """A signal class for a factorized likelihood (not prior) for the timing model.
+
+    Attributes
+    ----------
+    name : str
+        The name of the signal.
+    init_params : dict
+        The parameters used for initialization, which can be useful for re-initialization.
+    parameter_names : list of str
+        A list of parameter names corresponding to the parameters of the signal.
+    n_parameters : int
+        The number of parameters in the signal.
+    parameter_range : array
+        An array of the lower and upper bounds for each parameter [n_parameters, 2].
+    allow_posterior_draw : bool
+        Whether to allow posterior draws for this signal.
+    sampling_method : str
+        The sampling method to use for the signal.
+    initialized : bool
+        Whether the signal has been fully initialized with data.
+    psr_toas : list of arrays
+        A reference to the list of TOA arrays for each pulsar [npsr, npsr_toas].
+    nfreqs : int
+        The number of frequency bins in the free spectrum.
+    nmodes : int
+        The number of modes in the Fourier design matrix (2*nfreqs for sine and cosine).
+    npsrs : int
+        The number of pulsars in the dataset.
+    use_pulsar_tspan : bool
+        Whether to use individual pulsar timespans for frequency calculation, or the PTA timespan.
+    tspans : array or float
+        The timespans used for frequency calculation. Either scalar or [npsrs]
+    freqs : array
+        The frequencies used in the Fourier design matrix. Either [nfreqs] or [npsrs, nfreqs]
+    log_prior_volume : float
+        The log of the prior volume for the parameters, used for uniform priors.
+    fixed_wn : bool
+        Whether the white noise is fixed, which can allow for optimization in computations.
+    _psd_range : array
+        The range of the power spectral density in linear space, used for computations.
+    _diag_idx : array
+        An array of diagonal indices for the Sigma matrix, used for efficient updates.
+    """
+    def __init__(self,
+                 name,
+                 data,
+                 nmodes,
+                 lower_bound_psd,
+                 upper_bound_psd,
+                 timing_model = None,
+                 basis = None,
+                 z_scale = 100, 
+                 num_trials_for_pca = 10,
+                 pca_seed_per_pulsar = None
+                ):
+        """
+        Parameters
+        ----------
+        name : str
+            The name of the signal.
+        data : Atlas.data.Data.PTA_Data
+            Atlas data object.
+        """
+        if nmodes % 2 != 0:
+            raise ValueError(f"Expected an even integer for `nmodes`, got {nmodes}.")
+
+        # PSD reparameterization
+        self.psd_function, self.psd_reparam_helper = make_irn_model(free_spectrum, 
+                                        lower_bound_array = lower_bound_psd, 
+                                        upper_bound_array = upper_bound_psd)
         
+        self.name = name
+        self.data = data
+        self.nmodes = nmodes
+        self.z_scale = z_scale
+        self.num_trials_for_pca = num_trials_for_pca
+
+        if pca_seed_per_pulsar is None:
+            self.pca_seeds = jrandom.split(jrandom.key(random.randint(0, 81982)), data.npsrs)
+        else:
+            self.pca_seeds = pca_seed_per_pulsar
+
+        if basis is None:
+            self.tm_model = timing_model
+            self.U, self.explained_variance_ratio = self._get_basis()
+
+        else:
+            self.U = basis
+
+        self.nfreqs = int(nmodes/2)
+        self.freqs = jnp.ones(self.nfreqs)
+
+    
+    def get_basis(self):
+        return self.U
+
+    def _fit_pulsar(self, tm_residuals_prior):
+
+        mask = (
+            np.isfinite(tm_residuals_prior).all(axis=-1)
+            # & ((tm_residuals_prior > -10) & (tm_residuals_prior < 10)).all(axis=-1)
+        )
+        tm_residuals_prior = tm_residuals_prior[mask]
+
+        if tm_residuals_prior.shape[0] < self.nmodes:
+            return None
+        else:
+            svd = PCA(
+                n_components=self.nmodes,
+                whiten=True,
+                random_state=random.randint(0, 18971),
+            )
+            svd.fit(tm_residuals_prior)
+            U = svd.components_.T * np.sqrt(svd.explained_variance_)[None, :]
+
+            norm = np.sqrt(np.sum(U**2, axis=0))
+            U = U / norm
+            U[:, norm == 0] = 0.
+            return (
+                U,
+                svd.explained_variance_ratio_.sum(),
+            )
+
+    def _get_basis(self):
+
+        timing_bases = []
+        explained_variance_ratio = []
+
+        pbar = trange(self.data.npsrs)
+        for pidx in pbar:
+            pbar.set_description(f"Generating prior samples and performing PCA for {self.data.psr_names[pidx]}")
+            
+            for num_iters in range(self.num_trials_for_pca):
+                timing_residual_training_set = self.tm_model.sample_training_residuals(key = self.pca_seeds[pidx], 
+                                                                                        num_samples = int(1e4),
+                                                                                        z_scale = self.z_scale,
+                                                                                        pulsar_index = pidx)
+                ans = self._fit_pulsar(timing_residual_training_set)
+                if ans is None:
+                    print('Not enough samples in the prior. Shrinking the prior...')
+                    self.z_scale = self.z_scale/10
+                    if num_iters == self.num_trials_for_pca - 1:
+                        raise ValueError(f"Cannot find prior samples for {self.data.psr_names[pidx]}")
+
+                    continue
+                    
+                else:
+                    timing_bases.append(ans[0])
+                    explained_variance_ratio.append(ans[1])
+                    break
+
+        return timing_bases, explained_variance_ratio
+
+
 class SuperSignal:
     """A signal class for a pulsar-independent free spectrum red noise (IRN) signal.
 
@@ -623,13 +785,16 @@ class SuperSignal:
         self.lowest_value_eq_to_zero = 1e-40
 
         self.signal_map = {s.name: s for s in signal_list}
-        self.has_unc = False; self.has_cor = False; self.has_dm = False
+        self.has_unc = False; self.has_cor = False 
+        self.has_dm = False; self.has_gtm = False
         if 'cor' in self.signal_map.keys():
             self.has_cor = True
         if 'unc' in self.signal_map.keys():
             self.has_unc = True
         if 'dm' in self.signal_map.keys():
             self.has_dm = True
+        if 'gtm' in self.signal_map.keys():
+            self.has_gtm = True
 
         self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
@@ -888,32 +1053,43 @@ class SuperSignal:
         model: Atlas.parameterized object.
             An instantiation of a parameterized object.
         """
+        model_kwargs = {'pulsar_names':self.data.psr_names}
+
+        if self.has_unc:
+            model_kwargs.update(
+                irn_psd_func          = self.signal_map['unc'].psd_function,
+                irn_helper_dictionary = self.signal_map['unc'].psd_reparam_helper,
+                irn_bins              = self.signal_map['unc'].nfreqs,
+                f_irn                 = self.signal_map['unc'].freqs,
+            )
+
+        if self.has_gtm:
+            model_kwargs.update(
+                gtm_psd_func          = self.signal_map['gtm'].psd_function,
+                gtm_helper_dictionary = self.signal_map['gtm'].psd_reparam_helper,
+                gtm_bins              = self.signal_map['gtm'].nfreqs,
+                f_gtm                 = self.signal_map['gtm'].freqs,
+            )
+
+        if self.has_dm:
+            model_kwargs.update(
+                dm_psd_func           = self.signal_map['dm'].psd_function,
+                dm_helper_dictionary  = self.signal_map['dm'].psd_reparam_helper,
+                dm_bins               = self.signal_map['dm'].nfreqs,
+                f_dm                  = self.signal_map['dm'].freqs,
+            )
+
         if not self.has_cor:
-            model_kwargs = dict(
+            model_kwargs.update(dict(
                 Npulsars                 = self.data.npsrs,
                 signal_indices           = self.signal_comb_idxs,
                 linear_timing_model_size = self.linear_timing_model_size,
             )
-
-            if self.has_unc:
-                model_kwargs.update(
-                    irn_psd_func          = self.signal_map['unc'].psd_function,
-                    irn_helper_dictionary = self.signal_map['unc'].psd_reparam_helper,
-                    irn_bins              = self.signal_map['unc'].nfreqs,
-                    f_irn                 = self.signal_map['unc'].freqs,
-                )
-
-            if self.has_dm:
-                model_kwargs.update(
-                    dm_psd_func           = self.signal_map['dm'].psd_function,
-                    dm_helper_dictionary  = self.signal_map['dm'].psd_reparam_helper,
-                    dm_bins               = self.signal_map['dm'].nfreqs,
-                    f_dm                  = self.signal_map['dm'].freqs,
-                )
-
+            )
             self.model = partial(parameterized.PerPulsarRedNoise, **model_kwargs)()
+            
         else:
-            model_kwargs = dict(
+            model_kwargs.update(dict(
                 psr_pos                  = self.data.psr_pos,
                 Npulsars                 = self.data.npsrs,
                 signal_indices           = self.signal_comb_idxs,
@@ -924,24 +1100,7 @@ class SuperSignal:
                 crn_bins                 = self.signal_map['cor'].nfreqs,
                 f_common                 = self.signal_map['cor'].freqs,
             )
-
-            if self.has_unc:
-                model_kwargs.update(
-                    irn_psd_func          = self.signal_map['unc'].psd_function,
-                    irn_helper_dictionary = self.signal_map['unc'].psd_reparam_helper,
-                    irn_bins              = self.signal_map['unc'].nfreqs,
-                    f_irn                 = self.signal_map['unc'].freqs,
-                )
-
-            # --- Optional DM kwargs ---
-            if self.has_dm:
-                model_kwargs.update(
-                    dm_psd_func           = self.signal_map['dm'].psd_function,
-                    dm_helper_dictionary  = self.signal_map['dm'].psd_reparam_helper,
-                    dm_bins               = self.signal_map['dm'].nfreqs,
-                    f_dm                  = self.signal_map['dm'].freqs,
-                )
-
+            )
             self.model = partial(parameterized.CorrelatedPulsarRedNoise, **model_kwargs)()
 
     def update_white_matrix_products_unjitted(self, red_noise_basis, N_list, white_noise_params, reff):
