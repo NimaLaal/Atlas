@@ -9,6 +9,29 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 import inspect
 
+def merge_slices(*slices):
+    """Combine slices into a single contiguous slice if possible (fast path),
+    otherwise return a concatenated index array covering the same positions."""
+    slices = sorted(slices, key=lambda s: s.start)
+    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
+    if contiguous:
+        return slice(slices[0].start, slices[-1].stop)
+    return jnp.concatenate([jnp.arange(s.start, s.stop) for s in slices])
+
+def block_slice(idx0, idx1=None):
+    """Return a (row, col) index pair usable as `TNT[:, row, col]` for a block
+    submatrix, whether idx0/idx1 are contiguous slices or 1-D index arrays."""
+    idx1 = idx0 if idx1 is None else idx1
+    if isinstance(idx0, slice) and isinstance(idx1, slice):
+        return idx0, idx1  # fast contiguous slicing, no fancy indexing
+    idx0 = jnp.arange(idx0.start, idx0.stop) if isinstance(idx0, slice) else idx0
+    idx1 = jnp.arange(idx1.start, idx1.stop) if isinstance(idx1, slice) else idx1
+    return idx0[:, None], idx1[None, :]
+
+def vec_slice(idx):
+    """Index a vector-like array (TNr) with either a slice or an index array."""
+    return idx  # slices and 1-D arrays both work directly here
+
 # Model utilities---------------------------------------------------------------
 def build_basis(signal_helper):
     """

@@ -707,10 +707,14 @@ def model_maker(raw_residuals,
     ######################################## Red Noise ########################################
     xs = numpyro.sample('red_noise', dist.Uniform(super_sig.model.lower_prior_lim_all, 
                                                   super_sig.model.upper_prior_lim_all))
-    z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes))) #the reparam coefficients
-
     # evaluate the posterior
+    # if super_sig.has_cor:
+    #     z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, 2*super_sig.data.num_gwb_bins)))
+    #     lprob, coeff = super_sig.partial_marg_lnposterior(helpers = helpers_now, red_params = xs, z = z_a)
+    # else:
+    z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes)))
     lprob, coeff = super_sig.lnposterior_reparam(helpers = helpers_now, red_params = xs, z = z_a)
+
     numpyro.factor('lnpost', lprob + 0.5 * jnp.sum(z_a**2))
     if save_red_coeff:
         numpyro.deterministic('coeff', coeff)

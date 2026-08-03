@@ -4,7 +4,6 @@ from ATLAS.utils import jit, jit_method
 from ATLAS.signals.signals_utils import _timing_model_svd
 
 import jax.numpy as jnp
-from tqdm import tqdm
 
 
 class PTA_Data:
@@ -12,15 +11,46 @@ class PTA_Data:
 
     This class is intended to hold all the static data attributes of the PTA
     dataset, such as the pulsar objects, their TOAs, positions, and timespans.
+    See the following attributes for details.
+
+    Attributes
+    ----------
+    psrs : list
+        A list of enterprise-like pulsar objects.
+    npsrs : int
+        The number of pulsars in the dataset.
+    psr_names : list
+        A list of pulsar names corresponding to the pulsar objects.
+    fixed_wn : bool
+        A flag indicating whether the white noise matrices are fixed.
+    toas : list of arrays
+        A list where each element is an array of TOAs for a pulsar. [npsrs, ntoas]
+    psr_pos : array
+        An array containing the positions of the pulsars in unit-Cartesian 
+        coordinates. [npsrs, 3]
+    pta_tspan : float
+        The total timespan covered by the PTA dataset, calculated as the
+        difference between the maximum and minimum TOAs across all pulsars.
+    psr_tspans : array
+        An array containing the individual timespans for each pulsar, calculated
+        as the difference between the maximum and minimum TOAs for each pulsar. [npsrs]
     """
 
     def __init__(self, 
-                psrs, 
-                fixed_white_noise_params = jnp.array([False]),
+                psrs,
+                adaptus_basis = None,
+                num_gwb_bins = None,
+                num_irn_bins = None,
+                num_dm_bins = None,
+                adaptus_size = None, 
+                fixed_white_noise_params = None,
                 linear_timing = False,
                 marg_timing = False,
                 diag_white_cov = False,
                 fixed_res = False,
+                timfiles = None,
+                parfiles = None,
+                noise_dict = None,
                 dm_ref_freq = 1400): 
         """The constructor for the PTA_Data class
 
@@ -30,20 +60,19 @@ class PTA_Data:
         Parameters
         ----------
         psrs : list
-            A list of pulsar objects.
-        fixed_white_noise_params : jnp.ndarray, optional
-            An array indicating which white noise parameters are fixed, by default jnp.array([False])
-        linear_timing : bool, optional
-            A flag indicating whether to use linear timing, by default False
-        marg_timing : bool, optional
-            A flag indicating whether to use marginalized timing, by default False
-        diag_white_cov : bool, optional
-            A flag indicating whether to use diagonal white noise covariance, by default False
-        fixed_res : bool, optional
-            A flag indicating whether to fix the residuals, by default False
-        dm_ref_freq : int, optional
-            The reference frequency for dispersion measure calculations, by default 1400
+            A list of enterprise-like pulsar objects.
+        fixed_wn : bool
+            Whether the white noise matrices are fixed, by default False.
         """
+        self.adaptus_basis = adaptus_basis
+        self.num_gwb_bins = num_gwb_bins
+        self.num_irn_bins = num_irn_bins
+        self.dm_bins = num_dm_bins
+        self.adaptus_size = adaptus_size
+
+        self.noise_dict = noise_dict
+        self.parfiles = parfiles
+        self.timfiles = timfiles
         self.psrs = psrs # List of pulsar objects
         self.npsrs = len(psrs) # Number of pulsars
         self.npairs = self.npsrs * (self.npsrs - 1) // 2 # Number of unique pulsar pairs
@@ -65,9 +94,13 @@ class PTA_Data:
         # Linear Timing Design Matrix
         self.Mmat = [_timing_model_svd(psr.Mmat) for psr in psrs]
 
+        # pulsar distances
+        # self.psr_dists_mean = jnp.array([psr.pdist[0] for psr in psrs])
+        # self.psr_dists_std = jnp.array([psr.pdist[1] for psr in psrs])
+        
         ######################PTA Data Analysis General Settings######################
         # Whether the white noise matrices are fixed (bool)
-        self.fixed_wn = True if fixed_white_noise_params.any() else False 
+        self.fixed_wn = fixed_white_noise_params 
         self.fixed_white_noise_params = fixed_white_noise_params
         # No residual subtraction?
         self.fixed_res = fixed_res

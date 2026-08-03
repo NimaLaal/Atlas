@@ -373,7 +373,10 @@ class PerPulsarRedNoise:
         self.irn_end_idx = self.num_IR_params
         self.dm_end_idx = self.irn_end_idx + self.num_DM_params
         self.gtm_end_idx = self.dm_end_idx + self.num_GTM_params
-
+        if self.gtm_end_idx == self.dm_end_idx:
+            self._do_not_vary_gtm = True
+        else:
+            self._do_not_vary_gtm = False
         # ------------------------------------------------------------------ #
         #  Prior bounds                                                        #
         # ------------------------------------------------------------------ #
@@ -517,8 +520,12 @@ class PerPulsarRedNoise:
             )
 
         if self.has_gtm:
+            if not self._do_not_vary_gtm:
+                gtm_psd = self._eval_gtm_psd_all(gtm_flat)
+            else:
+                gtm_psd = 1.
             phi_diag = phi_diag.at[self.GTM_slice].add(
-                self._eval_gtm_psd_all(gtm_flat)
+                gtm_psd
             )
 
         return phi_diag
@@ -950,6 +957,10 @@ class CorrelatedPulsarRedNoise:
         self.irn_end_idx = self.num_IR_params
         self.dm_end_idx = self.irn_end_idx + self.num_DM_params
         self.gtm_end_idx = self.dm_end_idx + self.num_GTM_params
+        if self.gtm_end_idx == self.dm_end_idx:
+            self._do_not_vary_gtm = True
+        else:
+            self._do_not_vary_gtm = False
         self.gwb_psd_end_idx = self.gtm_end_idx + int(len(self.gwb_varied_indxs))
 
         # ------------------------------------------------------------------ #
@@ -1100,7 +1111,10 @@ class CorrelatedPulsarRedNoise:
             phi_diag = phi_diag.at[self.DM_slice].add(dm_psd)
 
         if self.has_gtm:
-            gtm_psd = self._eval_gtm_psd_all(gtm_flat)          # (gtm_bins, Npulsars)
+            if not self._do_not_vary_gtm:
+                gtm_psd = self._eval_gtm_psd_all(gtm_flat)          # (gtm_bins, Npulsars)
+            else:
+                gtm_psd = 1.
             phi_diag = phi_diag.at[self.GTM_slice].add(gtm_psd)
 
         phi_diag = phi_diag.at[self.GWB_slice].add(psd_common)
@@ -1220,8 +1234,12 @@ class CorrelatedPulsarRedNoise:
                 self._eval_dm_psd_all(dm_flat)
             )
         if self.has_gtm:
+            if not self._do_not_vary_gtm:
+                gtm_psd = self._eval_gtm_psd_all(gtm_flat)
+            else:
+                gtm_psd = 1.
             phi_diag_non_gwb = phi_diag_non_gwb.at[gtm_local].add(
-                self._eval_gtm_psd_all(gtm_flat)
+                gtm_psd
             )
 
         phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
