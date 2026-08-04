@@ -217,10 +217,10 @@ def parse_basis_string(basis_string):
     Examples
     --------
     "unc+cor->unc"             # shared only, no timing model
-    "T|unc+cor->unc"           # shared only, with timing model prepended
-    "T|unc+cor->unc ; cw"      # shared + separate, with timing model
+    "ltm|unc+cor->unc"           # shared only, with timing model prepended
+    "ltm|unc+cor->unc ; cw"      # shared + separate, with timing model
     "unc ; cor,dm"             # no shared group, all separate, no timing model
-    "T|unc ; cor,dm"           # no shared group, all separate, with timing model
+    "ltm|unc ; cor,dm"           # no shared group, all separate, with timing model
     """
     # Check for timing model prefix
     include_timing = basis_string.startswith('ltm|')

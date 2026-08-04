@@ -5,6 +5,7 @@ from ATLAS.signals.factorized.base import Red, SuperSignal, GaussianTiming
 from ATLAS.signals.correlated.base import Correlated
 from ATLAS.signals.timing.base import build_multi_psr_timing_model
 from ATLAS.nMatrix.base import WhiteCov
+from ATLAS.signals.deterministic.base import Deterministic
 
 class ModelBuilder:
     def __init__(self,
@@ -39,6 +40,7 @@ class ModelBuilder:
                 use_pulsar_tspan = False,
                 irn_psd_function = None,
                 gwb_psd_function = None,
+                det_delay_function = None,
                 orf_function = None,
                 dm_psd_function = None,
                 irn_lower_bound_psd = None,
@@ -46,7 +48,8 @@ class ModelBuilder:
                 dm_lower_bound_psd = None,
                 dm_upper_bound_psd = None,
                 gwb_lower_bound_psd = None,
-                gwb_upper_bound_psd = None):
+                gwb_upper_bound_psd = None,
+                det_parameter_bounds = None):
         
         red_signal_names = sutils.parse_basis_string(red_noise_combination_string)['shared_names'] + \
                            sutils.parse_basis_string(red_noise_combination_string)['separate_names']
@@ -87,6 +90,13 @@ class ModelBuilder:
                         upper_bound_psd = dm_upper_bound_psd,
                         data = self.data,
                         use_pulsar_tspan = use_pulsar_tspan))
+
+        if 'det' in red_signal_names:
+            signals.append(Deterministic(name='det',
+                         data=self.data,
+                         get_delays_func=det_delay_function,
+                         det_parameter_bounds=det_parameter_bounds)
+            )
 
         return SuperSignal(signal_list = signals,
                         signal_combination_string = red_noise_combination_string,
