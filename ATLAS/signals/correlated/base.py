@@ -76,6 +76,8 @@ class Correlated:
                  orf_function,
                  upper_bound_psd,
                  lower_bound_psd,
+                 upper_bound_orf = None,
+                 lower_bound_orf = None,
                  orf='hd',
                  nfreqs=10, 
                  halflog10_rho_range=(-9,-2), 
@@ -125,7 +127,9 @@ class Correlated:
         self.psd_function, self.orf_function, self.psd_reparam_helper = make_gwb_model(psd_function,
                                         orf_function, 
                                         lower_bound_array = lower_bound_psd, 
-                                        upper_bound_array = upper_bound_psd)
+                                        upper_bound_array = upper_bound_psd,
+                                        lower_bound_orf = lower_bound_orf,
+                                        upper_bound_orf = upper_bound_orf)
 
         # Simple initialization-------------------------------------------------
         self.name = name

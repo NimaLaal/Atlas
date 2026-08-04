@@ -43,6 +43,8 @@ class ModelBuilder:
                 det_delay_function = None,
                 orf_function = None,
                 dm_psd_function = None,
+                upper_bound_orf = None,
+                lower_bound_orf = None,
                 irn_lower_bound_psd = None,
                 irn_upper_bound_psd = None,
                 dm_lower_bound_psd = None,
@@ -80,6 +82,8 @@ class ModelBuilder:
                 nfreqs=self.data.num_gwb_bins,
                 lower_bound_psd = gwb_lower_bound_psd,
                 upper_bound_psd = gwb_upper_bound_psd,
+                upper_bound_orf = upper_bound_orf,
+                lower_bound_orf = lower_bound_orf,
                 data = self.data))
 
         if 'dm' in red_signal_names:

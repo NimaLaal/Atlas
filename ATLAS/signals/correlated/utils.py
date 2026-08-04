@@ -34,6 +34,8 @@ def _param_order_help(
     lower_bound_array,
     upper_bound_array,
     list_of_psd_params,
+    lower_bound_orf = None,
+    upper_bound_orf = None,
     list_of_orf_params=(),
     fixed_psd_params=(),
     fixed_psd_param_values=(),
@@ -58,6 +60,10 @@ def _param_order_help(
 
     d["gwb_psd_param_lower_lim"] = lower_bound_array
     d["gwb_psd_param_upper_lim"] = upper_bound_array
+
+    d["orf_param_lower_lim"] = lower_bound_orf
+    d["orf_param_upper_lim"] = upper_bound_orf
+    
     return d
 
 
@@ -77,6 +83,8 @@ def make_gwb_model(
     orf_func,
     lower_bound_array,
     upper_bound_array,
+    lower_bound_orf = None,
+    upper_bound_orf = None,
     renorm_const=1.0,
     fixed_psd_params=(),
     fixed_psd_param_values=(),
@@ -101,7 +109,7 @@ def make_gwb_model(
     lower_bound_array, upper_bound_array : array-like
         Prior bounds for the *varied* parameters in the order::
 
-            [ varied_psd_params ..., free_orf_params ... ]
+            [ varied_psd_params]
 
         A ``renorm_const``-derived log-amplitude offset is applied
         automatically to every element (same convention as pandora).
@@ -137,6 +145,8 @@ def make_gwb_model(
     helper = _param_order_help(
         lower_bound_array    = lower,
         upper_bound_array    = upper,
+        lower_bound_orf      = lower_bound_orf,
+        upper_bound_orf      = upper_bound_orf,
         list_of_psd_params   = psd_params,
         list_of_orf_params   = list(orf_params) if len(orf_params) else (),
         fixed_psd_params     = fixed_psd_params,
