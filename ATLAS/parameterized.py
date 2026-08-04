@@ -1204,9 +1204,8 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def partial_reparm_helper(self, xs, pad_mask):
-        irn_flat, dm_flat, gtm_flat, gwb_params, _ = self._unpack(xs)
+        irn_flat, dm_flat, gtm_flat, gwb_params, orf_params = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
-        *_, orf_params = self._unpack(xs)
         orf_val = self.orf_val if self.orf_fixed else self.orf_func(self.xi, *orf_params)
 
         # non-GWB diagonal (IRN + DM + GTM rows only, no GWB rows)

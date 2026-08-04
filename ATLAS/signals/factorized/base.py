@@ -1409,7 +1409,7 @@ class SuperSignal:
         ln_likelihood = U + g.mT @ V - 0.5 * g.mT @ W_inv_without_prior @ g
         lnprior = -0.5 * (g.transpose(1, 2, 0) @ phiinv_G @ g.transpose(1, 0, 2)).sum()
 
-        result = jnp.sum(norm + ln_likelihood + lnprior + lndet_Jac)
+        result = norm + lnprior + lndet_Jac + jnp.sum(ln_likelihood)
         return result, g
 
 
