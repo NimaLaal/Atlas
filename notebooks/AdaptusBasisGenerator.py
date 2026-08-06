@@ -87,7 +87,7 @@ def doit(ID):
         data.add_timing_design_matrix(tm_model.Mmats)
 
         ## Red Noise Model
-        Udim  = 500
+        Udim  = 500 #the number of PCA components per pulsar
         sig_gtm = GaussianTiming(name='dm',
                     nmodes=Udim,
                     timing_model = tm_model,
