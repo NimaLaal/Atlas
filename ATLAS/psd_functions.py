@@ -7,6 +7,7 @@ import jax.scipy as jsp
 import scipy.constants as sc
 import jax.random as jr
 from functools import lru_cache, partial
+
 try:
     from interpax import interp1d
 except ImportError:
@@ -60,6 +61,31 @@ def clip_psd(psd, threshold=psd_low_threshold):
 Library for GWB PSD and ORF Functions.
 """
 
+@lru_cache(maxsize=None)
+def make_free_spectrum(n_bins):
+    """
+    Build a `free_spectrum` PSD function with `n_bins` explicit named
+    parameters (halflog10_rho_0, ..., halflog10_rho_{n_bins-1}) instead
+    of a *args signature.
+
+    Cached per n_bins: `_parse_psd_func` inspects this function's
+    signature at construction time, and repeated calls to
+    `make_free_spectrum(n_bins)` must return the SAME function object,
+    not a freshly `exec`'d one each time, or JAX will treat every call
+    as a distinct function identity and recompile/retrace on every use.
+    """
+    param_names = [f"halflog10_rho_{i}" for i in range(n_bins)]
+    args_str = ", ".join(param_names)
+    src = (
+        f"def free_spectrum(f, df, {args_str}):\n"
+        f"    rho = jnp.array([{args_str}])\n"
+        f"    return 10 ** (2 * rho)\n"
+    )
+    namespace = {"jnp": jnp}
+    exec(src, namespace)
+    fn = namespace["free_spectrum"]
+    fn.__name__ = f"free_spectrum_{n_bins}"
+    return fn
 
 @jax.jit
 def powerlaw(f, df, log10_A, gamma):
@@ -84,6 +110,16 @@ def free_spectrum(f, df, *halflog10_rho):
     """
     return 10 ** (2 * jnp.array(halflog10_rho))
 
+@jax.jit
+def gwb_free_spectrum(f, df, *halflog10_rho):
+    """
+    Free spectral model. PSD  amplitude at each frequency
+    is a free parameter. Model is parameterized by
+    S(f_i) = \rho_i^2 * T,
+    where \rho_i is the free parameter and T is the observation
+    length.
+    """
+    return 10 ** (2 * jnp.array(halflog10_rho))[:, None]
 
 ##############################################################################################
 @jax.jit

@@ -1,6 +1,6 @@
 from ATLAS.utils import jagged2padded, jit_method
 from ATLAS.utils import jit
-from ATLAS.signals.signals_utils import _timing_model_svd, stabelize_TNT, stabelize_TDNTD
+from ATLAS.signals.signals_utils import _timing_model_svd, stabilize_TNT, stabilize_TDNTD
 
 import numpy as np
 import itertools
@@ -915,7 +915,7 @@ class WhiteCov:
 
     def __init__(self, 
                 data,
-                stabelize_TNT = False,
+                stabilize_TNT = False,
                 efac_prior_bounds = (0.01, 10), # (low, high)
                 efac_prior_normal = (1., 0.25), # (mean, std)
                 log10equad_prior_bounds = (-9, -5), # (low, high)
@@ -939,7 +939,7 @@ class WhiteCov:
         self.diag_white_cov = self.data.diag_white_cov
         self.marg = self.data.marg
         self.npulsars = self.data.npsrs
-        self.stabelize = stabelize_TNT
+        self.stabilize = stabilize_TNT
 
         self.cov_matrices = []
         pbar = trange(self.npulsars)
@@ -1149,8 +1149,8 @@ class WhiteCov:
                 rNr += x
                 log_det_N += y
 
-            if self.stabelize:
-                return stabelize_TNT(FNF, FNF.shape[-1]), FNr, rNr[0, 0], log_det_N
+            if self.stabilize:
+                return stabilize_TNT(FNF, FNF.shape[-1]), FNr, rNr[0, 0], log_det_N
             else:
                 return FNF, FNr, rNr[0, 0], log_det_N
 
@@ -1239,9 +1239,9 @@ class WhiteCov:
 
             rNr += G[Ntot, Ntot]
             logdet_N += y
-        if self.stabelize:
-            return stabelize_TNT(TNT, TNT.shape[-1]), 
-            TNr, rNr, logdet_N, stabelize_TDNTD(TDNTD, TDNTD.shape[-1]), 
+        if self.stabilize:
+            return stabilize_TNT(TNT, TNT.shape[-1]), 
+            TNr, rNr, logdet_N, stabilize_TDNTD(TDNTD, TDNTD.shape[-1]), 
             TDNr, TNTD
         else:
             return TNT, TNr, rNr, logdet_N, TDNTD, TDNr, TNTD

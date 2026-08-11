@@ -28,6 +28,8 @@ from numpyro.infer.mcmc import MCMCKernel
 from numpyro.util import is_prng_key
 import numpyro.distributions as dist
 
+import numpyro
+import numpyro.distributions as dist
 # ---------------------------------------------------------------------------
 # Public state type
 # ---------------------------------------------------------------------------
@@ -153,7 +155,21 @@ class MultiHMCGibbs(MCMCKernel):
 
     def postprocess_fn(self, args, kwargs):
         _ = kwargs.pop("_cond_sites", {})
-        return self.inner_kernels[0].postprocess_fn(args, kwargs)
+
+        def combined(z):
+            constrained = {
+                name: self._site_bijectors[name](val)
+                for name, val in z.items()
+                if name in self._site_bijectors
+            }
+            model_trace = trace(substitute(self.model, data=constrained)).get_trace(*args, **kwargs)
+            out = dict(constrained)
+            for name, site in model_trace.items():
+                if site["type"] == "deterministic":
+                    out[name] = site["value"]
+            return out
+
+        return combined
 
     def check_gibbs_sites(self, model_args, model_kwargs):
         """Verify every sample site appears in exactly one Gibbs group."""
@@ -655,3 +671,51 @@ class MultiHMCGibbsWithAnalytic(MultiHMCGibbs):
             jnp.stack(rng_keys),
             hmc_state.potential_energy,
         )
+
+
+def model_maker(raw_residuals, 
+                super_sig,
+                marg_over_non_gwb,
+                vary_white = False,
+                wn_lower_bound = None,
+                wn_upper_bound = None,
+                tm_model = None,
+                helpers = None,
+                save_red_coeff = False,
+                fixed_white_noise_params = None,
+                ):
+                
+    ######################################## Timing Model ########################################
+    if tm_model:
+        lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
+        k = numpyro.sample("timing_k", dist.Normal(0, 50).expand([tm_model.nparams_total]))
+        stochastic_res = tm_model.residuals(k * lam)
+    else:
+        stochastic_res = raw_residuals
+
+    ######################################## White Noise ########################################
+    if vary_white:
+        theta_wn = numpyro.sample('white_noise', dist.Uniform(wn_lower_bound, wn_upper_bound))
+        helpers_now = super_sig.get_helpers(reff = stochastic_res,
+                                  white_noise_params = theta_wn)
+
+    elif not vary_white and tm_model:
+        helpers_now = super_sig.get_helpers(reff = stochastic_res,
+                                  white_noise_params = fixed_white_noise_params)
+    else:
+        helpers_now = helpers
+
+    ######################################## Red Noise ########################################
+    xs = numpyro.sample('red_noise', dist.Uniform(super_sig.model.lower_prior_lim_all, 
+                                                  super_sig.model.upper_prior_lim_all))
+    # evaluate the posterior
+    if marg_over_non_gwb:
+        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, 2*super_sig.data.num_gwb_bins)))
+        lprob, coeff = super_sig.partial_marg_lnposterior(helpers = helpers_now, red_params = xs, z = z_a)
+    else:
+        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes)))
+        lprob, coeff = super_sig.lnposterior_reparam(helpers = helpers_now, red_params = xs, z = z_a)
+
+    numpyro.factor('lnpost', lprob + 0.5 * jnp.sum(z_a**2))
+    if save_red_coeff:
+        numpyro.deterministic('coeff', coeff)

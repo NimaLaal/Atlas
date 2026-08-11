@@ -9,6 +9,29 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 import inspect
 
+def merge_slices(*slices):
+    """Combine slices into a single contiguous slice if possible (fast path),
+    otherwise return a concatenated index array covering the same positions."""
+    slices = sorted(slices, key=lambda s: s.start)
+    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
+    if contiguous:
+        return slice(slices[0].start, slices[-1].stop)
+    return jnp.concatenate([jnp.arange(s.start, s.stop) for s in slices])
+
+def block_slice(idx0, idx1=None):
+    """Return a (row, col) index pair usable as `TNT[:, row, col]` for a block
+    submatrix, whether idx0/idx1 are contiguous slices or 1-D index arrays."""
+    idx1 = idx0 if idx1 is None else idx1
+    if isinstance(idx0, slice) and isinstance(idx1, slice):
+        return idx0, idx1  # fast contiguous slicing, no fancy indexing
+    idx0 = jnp.arange(idx0.start, idx0.stop) if isinstance(idx0, slice) else idx0
+    idx1 = jnp.arange(idx1.start, idx1.stop) if isinstance(idx1, slice) else idx1
+    return idx0[:, None], idx1[None, :]
+
+def vec_slice(idx):
+    """Index a vector-like array (TNr) with either a slice or an index array."""
+    return idx  # slices and 1-D arrays both work directly here
+
 # Model utilities---------------------------------------------------------------
 def build_basis(signal_helper):
     """
@@ -95,7 +118,7 @@ def build_basis(signal_helper):
 
     return Fmat, signal_indices
 
-def stabelize_TNT(A, A_shape, eps=1e-9):
+def stabilize_TNT(A, A_shape, eps=1e-6):
     """
     This function stabelizes a batched of positve definite matricies
     by shifting the diagonals of the matricies by
@@ -117,8 +140,13 @@ def stabelize_TNT(A, A_shape, eps=1e-9):
     lowest = A.diagonal(axis1 = -2, axis2 = -1).min(axis = -1)[..., None]
     idxs = jnp.arange(A_shape)
     return A.at[:, idxs, idxs].add(eps * lowest)
+    
+    # diag = A.diagonal(axis1=-2, axis2=-1)
+    # lowest = jnp.where(diag > 0, diag, jnp.inf).min(axis=-1, keepdims=True)
+    # idxs = jnp.arange(A_shape)
+    # return A.at[:, idxs, idxs].add(eps * lowest)
 
-def stabelize_TDNTD(A, A_shape, eps=1e-9):
+def stabilize_TDNTD(A, A_shape, eps=1e-9):
     """
     This function stabelizes a batched of positve definite matricies
     by shifting the diagonals of the matricies by
@@ -189,10 +217,10 @@ def parse_basis_string(basis_string):
     Examples
     --------
     "unc+cor->unc"             # shared only, no timing model
-    "T|unc+cor->unc"           # shared only, with timing model prepended
-    "T|unc+cor->unc ; cw"      # shared + separate, with timing model
+    "ltm|unc+cor->unc"           # shared only, with timing model prepended
+    "ltm|unc+cor->unc ; cw"      # shared + separate, with timing model
     "unc ; cor,dm"             # no shared group, all separate, no timing model
-    "T|unc ; cor,dm"           # no shared group, all separate, with timing model
+    "ltm|unc ; cor,dm"           # no shared group, all separate, with timing model
     """
     # Check for timing model prefix
     include_timing = basis_string.startswith('ltm|')
