@@ -1,15 +1,15 @@
-# Created: 2026-07-20T09:26:19.926482
+# Created: 2026-07-28T09:45:49.111526
 # PINT_version: 1.1.5
 # User: kyleg
 # Host: ASLNX-BHQ7Z84.vuds.vanderbilt.edu
 # OS: Linux-6.11.0-24-generic-x86_64-with-glibc2.39
 # Python: 3.12.13 | packaged by conda-forge | (main, Mar  5 2026, 16:50:00) [GCC 14.3.0]
 # Format: pint
-# read_time: 2026-07-20T09:17:18.776111
+# read_time: 2026-07-28T09:38:36.480208
 # allow_tcb: False
 # convert_tcb: False
 # allow_T2: False
-# original_name: ../datasets/ideal_NG15/par/J1453+1902_ideal.par
+# original_name: ../../datasets/ideal_NG15/par/J1453+1902_ideal.par
 PSR                            J1453+1902
 EPHEM                               DE440
 CLOCK                        TT(BIPM2019)
@@ -33,6 +33,11 @@ POSEPOCH           57777.0000000000000000
 F0                   172.6429099076585066 1 9.129537247136143523e-13
 F1              -3.4740802737842562573e-16 1 3.4661654227637531374e-20
 PEPOCH             57777.0000000000000000
+TZRMJD             57222.9729474777095949
+TZRSITE                                AO
+TZRFRQ                            1163.65
+JUMP            -fe 430     9.426510221196192e-06 1 5.6981648871070685e-06
+JUMP            -fe L-wide                       0.0
 CORRECT_TROPOSPHERE                         Y
 PLANET_SHAPIRO                          Y
 NE_SW                                 0.0
@@ -249,8 +254,3 @@ DMXR2_0068         59040.0940289551726852
 DMX_0069            0.0003729039098479093 1 0.0005061214659506509
 DMXR1_0069         59055.9341705650731482
 DMXR2_0069         59056.0503580241856944
-TZRMJD             57222.9729474777095949
-TZRSITE                                AO
-TZRFRQ                            1163.65
-JUMP            -fe 430     9.426510221196192e-06 1 5.6981648871070685e-06
-JUMP            -fe L-wide                       0.0

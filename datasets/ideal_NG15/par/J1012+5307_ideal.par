@@ -1,15 +1,15 @@
-# Created: 2026-07-20T09:26:09.919223
+# Created: 2026-07-28T09:45:38.950617
 # PINT_version: 1.1.5
 # User: kyleg
 # Host: ASLNX-BHQ7Z84.vuds.vanderbilt.edu
 # OS: Linux-6.11.0-24-generic-x86_64-with-glibc2.39
 # Python: 3.12.13 | packaged by conda-forge | (main, Mar  5 2026, 16:50:00) [GCC 14.3.0]
 # Format: pint
-# read_time: 2026-07-20T09:16:56.946358
+# read_time: 2026-07-28T09:37:49.553729
 # allow_tcb: False
 # convert_tcb: False
 # allow_T2: False
-# original_name: ../datasets/ideal_NG15/par/J1012+5307_ideal.par
+# original_name: ../../datasets/ideal_NG15/par/J1012+5307_ideal.par
 PSR                            J1012+5307
 EPHEM                               DE440
 CLOCK                        TT(BIPM2019)
@@ -33,6 +33,10 @@ POSEPOCH           56104.0000000000000000
 F0                  190.26783733256112861 1 3.4134469233827898095e-13
 F1              -6.200427020471182849e-16 1 8.372284455492337895e-21
 PEPOCH             56104.0000000000000000
+TZRMJD             55578.4008005042764700
+TZRSITE                                GB
+TZRFRQ                            800.459
+JUMP            -fe Rcvr1_2   -4.0397522589928464e-05 1 2.4022053783797346e-07
 CORRECT_TROPOSPHERE                         Y
 PLANET_SHAPIRO                          Y
 NE_SW                                 0.0
@@ -587,7 +591,3 @@ FD1                 -0.000804956828089362 1 0.0001732803710349463
 FD2                 0.0008241172104737471 1 0.00017520742229741183
 FD3                 -0.000563034501795175 1 0.00011906879790604707
 FD4                0.00021838959039454026 1 4.708277267279978e-05
-TZRMJD             55578.4008005042764700
-TZRSITE                                GB
-TZRFRQ                            800.459
-JUMP            -fe Rcvr1_2   -4.0397522589928464e-05 1 2.4022053783797346e-07
