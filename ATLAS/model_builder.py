@@ -6,27 +6,31 @@ from ATLAS.signals.correlated.base import Correlated
 from ATLAS.signals.timing.base import build_multi_psr_timing_model
 from ATLAS.nMatrix.base import WhiteCov
 from ATLAS.signals.deterministic.base import Deterministic
+import jax.numpy as jnp
 
 class ModelBuilder:
     def __init__(self,
-                data):
+                data,
+                explicit_timing_model_params_to_sample = None):
     
         self.data = data
-
+        self.SAMPLE = explicit_timing_model_params_to_sample
+        
     def make_timing_model(self, enterprise_data = True):
-
-        if enterprise_data:    
-            SAMPLE = [self.data.psrs[pidx].fitpars[1:] for pidx in range(self.data.npsrs)]
-            for i, sublist in enumerate(SAMPLE):
-                for j, s in enumerate(sublist):
-                    SAMPLE[i][j] = s.replace('A1DOT', 'XDOT')
-        else:
-            SAMPLE = [self.data.psrs[pidx].fit_param_names for pidx in range(self.data.npsrs)]
-
-        load_how_many_in_parallel = min(self.data.npsrs, 10) 
+        
+        if self.SAMPLE is None:
+            if enterprise_data:    
+                self.SAMPLE = [self.data.psrs[pidx].fitpars[1:] for pidx in range(self.data.npsrs)]
+                for i, sublist in enumerate(self.SAMPLE):
+                    for j, s in enumerate(sublist):
+                        self.SAMPLE[i][j] = s.replace('A1DOT', 'XDOT')
+            else:
+                self.SAMPLE = [self.data.psrs[pidx].fit_param_names for pidx in range(self.data.npsrs)]
+                
+        load_how_many_in_parallel = min(self.data.npsrs, 10)
         return build_multi_psr_timing_model(self.data.parfiles, 
                                                 self.data.timfiles, 
-                                                SAMPLE, 
+                                                self.SAMPLE, 
                                                 load_how_many_in_parallel = load_how_many_in_parallel,
                                                 data = self.data)
 
@@ -70,8 +74,8 @@ class ModelBuilder:
             signals.append(GaussianTiming(name='gtm',
                         nmodes=self.data.adaptus_size,
                         timing_model = None,
-                        lower_bound_psd = None,
-                        upper_bound_psd = None,
+                        lower_bound_psd = None, #jnp.ones(int(self.data.adaptus_size/2))*-15,
+                        upper_bound_psd = None, #jnp.ones(int(self.data.adaptus_size/2))*2,
                         data = self.data,
                         basis = self.data.adaptus_basis))
 
