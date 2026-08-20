@@ -683,13 +683,17 @@ def model_maker(raw_residuals,
                 helpers = None,
                 save_red_coeff = False,
                 fixed_white_noise_params = None,
+                tm_direct_sampling_type = 'klam',
                 ):
                 
     ######################################## Timing Model ########################################
     if tm_model:
-        lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
-        k = numpyro.sample("timing_k", dist.Normal(0, 50).expand([tm_model.nparams_total]))
-        stochastic_res = tm_model.residuals(k * lam)
+        if tm_direct_sampling_type == 'klam':
+            lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
+            k = numpyro.sample("timing_k", dist.Normal(0, 50).expand([tm_model.nparams_total]))
+            stochastic_res = tm_model.residuals(k * lam)
+        else:
+            stochastic_res = tm_model.sample_residuals()
     else:
         stochastic_res = raw_residuals
 
