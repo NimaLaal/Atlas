@@ -182,8 +182,13 @@ class DiagSinglePulsarWhiteCov:
         self.toaerrs = psr.toaerrs
         self.marg = marg
         self.n_params = 0 # no EFAC/EQUAD/ECORR here -- nothing to sample
-        self.Mmat = _timing_model_svd(psr.Mmat)
-        self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
+        # See SinglePulsarWhiteCov: only _solve_marg reads these.
+        if self.marg:
+            self.Mmat = _timing_model_svd(psr.Mmat)
+            self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
+        else:
+            self.Mmat = None
+            self.Mprior = None
 
         #jitted function that returns (left.T N right)
         self.solve = self._solve_func_maker(return_logdet = False)
@@ -419,8 +424,16 @@ class SinglePulsarWhiteCov:
         self.marg = marg
         self.include_ecorr = include_ecorr
 
-        self.Mmat = _timing_model_svd(psr.Mmat)
-        self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
+        # Only _solve_marg reads these, so only build them when marginalising.
+        # PTA_Data already holds its own _timing_model_svd of the same design
+        # matrices; with marg=False this second copy is never read, and on the
+        # NANOGrav 15-year set it is ~1.1 GB of device memory that does nothing.
+        if self.marg:
+            self.Mmat = _timing_model_svd(psr.Mmat)
+            self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
+        else:
+            self.Mmat = None
+            self.Mprior = None
 
         # Static attributes ----------------------------------------------------
         self.psr_name = psr.name
