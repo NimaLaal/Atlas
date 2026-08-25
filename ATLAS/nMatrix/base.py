@@ -753,14 +753,20 @@ class SinglePulsarWhiteCov:
 
         # b is the number of blocks (epochs)
         # LAinv is (b, N), RAinv is (b, M) (Mask is used to zero out the padded values)
-        LAinv = jnp.einsum('biN,bi -> bN', left[self.U_pad,:], Ainv[self.U_pad]*self.U_mask) 
-        RAinv = jnp.einsum('biM,bi -> bM', right[self.U_pad,:], Ainv[self.U_pad]*self.U_mask)
+        epoch_Ainv = Ainv[self.U_pad]*self.U_mask                                    # (b, i)
+        LAinv = jnp.einsum('biN,bi -> bN', left[self.U_pad,:], epoch_Ainv)
+        RAinv = jnp.einsum('biM,bi -> bM', right[self.U_pad,:], epoch_Ainv)
 
-        # Numerator of sherman morrison update (b, N, M)
-        num = jnp.einsum('ni,nj -> nij', LAinv, RAinv*jvec[:,None]) # (b, N, M)
-        denom = 1.0 + jnp.einsum('n,nj -> n', jvec, Ainv[self.U_pad]*self.U_mask)  # (b)
-        term2 = jnp.sum(num / denom[:,None,None], axis=0) # Sum over blocks (N, M)
-        
+        # Sherman-Morrison correction, summed over epochs. Written as a single
+        # contraction rather than as a (b, N, M) outer product that is immediately
+        # reduced away: sum_b LAinv[b,n] * RAinv[b,m] * jvec[b] / denom[b] IS the
+        # matrix product below. XLA fuses the outer-product form so the (b, N, M)
+        # tensor is never materialised under jit, but the fused loop cannot reach
+        # cuBLAS and runs ~10x slower; it also forces a very long autotuning pass.
+        denom = 1.0 + jnp.einsum('n,nj -> n', jvec, epoch_Ainv)                      # (b)
+        term2 = LAinv.T @ (RAinv * (jvec / denom)[:, None])         # (N, M)
+
+
         solve_result = term1 - term2
 
         if return_logdet:

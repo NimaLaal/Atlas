@@ -990,70 +990,42 @@ class SuperSignal:
         needed for likelihood evaluation. Data analysis settings are extracted from the
         data object.
 
+        The T-matrix is passed to the jitted function as a *traced argument*, never
+        bound into the partial. Binding it makes it a compile-time constant, and XLA
+        then writes it into the executable as a literal -- twice over, since it also
+        keeps a pre-tiled copy for the GEMM, and again for every epoch-gather that
+        cannot be constant-folded once the white noise is a runtime value. On the
+        NANOGrav 15-year set that inflated the compiled helper build to 9.5 GB, past
+        what a 24 GB card will load. As an argument it is the buffer we already own.
+
         Returns
         -------
-        new_func: callable
-            Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
+        callable
+            Function which returns TNT, TNr, rNr, logdet_N, etc. helper arrays. It
+            accepts an optional ``red_noise_basis`` to override the default T-matrix
+            (used by the chromatic-index path, which rescales the DM columns).
         """
-        if not self.has_dm:
-            if self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        bound = dict(N_list = self.data.Nmat)
+        if self.fixed_wn:
+            bound['white_noise_params'] = self.data.fixed_white_noise_params
+        if self.fixed_res:
+            bound['reff'] = jnp.concat(self.data.raw_residuals)[:, None]
 
-            elif not self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        core = jit(partial(self.update_white_matrix_products_unjitted, **bound))
 
-            elif not self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        def get_helpers(red_noise_basis = None, **kwargs):
+            if red_noise_basis is None:
+                red_noise_basis = self.get_Fmat_concat
+            return core(red_noise_basis = red_noise_basis, **kwargs)
 
-            elif self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                red_noise_basis = self.get_Fmat_concat,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-                return jit(new_func)
-        else:
-            if self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        # The jitted core, so callers (and the profiler) can lower/compile it with the
+        # T-matrix as a genuine argument. NOTE: wrapping ``get_helpers`` in a further
+        # jit re-captures the default T-matrix as a compile-time constant, which is
+        # exactly what this change exists to avoid -- pass ``red_noise_basis``
+        # explicitly from the outermost jitted function instead.
+        get_helpers.core = core
 
-            elif not self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                )
-                return jit(new_func)
-
-            elif not self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],
-                                )
-                return jit(new_func)
-
-            elif self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-                return jit(new_func)
+        return get_helpers
 
     def model_maker(self):
         """Add a specific parameterization of the power spectral density based

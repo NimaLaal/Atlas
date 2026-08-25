@@ -251,7 +251,12 @@ def jit(func=None, static_argnums=None):
         @wraps(f)
         def wrapper(*args, **kwargs):
             return jit_func(*args, **kwargs)
-    
+
+        # functools.wraps hides jax's ahead-of-time API, so keep a handle on the
+        # jitted callable itself. Needed for .lower()/.compile() -- and hence for
+        # memory_analysis(), which is the only way to see an executable's size.
+        wrapper.jitted = jit_func
+
         return wrapper
     
     if func is None:

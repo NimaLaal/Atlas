@@ -673,7 +673,7 @@ class MultiHMCGibbsWithAnalytic(MultiHMCGibbs):
         )
 
 
-def model_maker(raw_residuals, 
+def model_maker(raw_residuals,
                 super_sig,
                 marg_over_non_gwb,
                 vary_white = False,
@@ -683,8 +683,25 @@ def model_maker(raw_residuals,
                 helpers = None,
                 save_red_coeff = False,
                 fixed_white_noise_params = None,
+                red_noise_basis = None,
                 ):
-                
+    """NumPyro model for the ATLAS global fit.
+
+    Parameters
+    ----------
+    red_noise_basis : array, optional
+        The T-matrix. Only consulted when the helpers are rebuilt inside the model
+        (``vary_white=True``, or a sampled timing model). Defaults to the signal's
+        own ``get_Fmat_concat``.
+
+        Pass it explicitly -- as a model argument through ``MCMC.run``, with
+        ``MCMC(..., jit_model_args=True)`` -- when the helpers are rebuilt every
+        leapfrog step. Left to default it is captured from the signal object and
+        XLA writes it into the potential-energy executable as a literal; on the
+        NANOGrav 15-year set that is several GB of generated code. As a model
+        argument it is traced, and the executable holds a pointer instead.
+    """
+
     ######################################## Timing Model ########################################
     if tm_model:
         lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
@@ -697,11 +714,13 @@ def model_maker(raw_residuals,
     if vary_white:
         theta_wn = numpyro.sample('white_noise', dist.Uniform(wn_lower_bound, wn_upper_bound))
         helpers_now = super_sig.get_helpers(reff = stochastic_res,
-                                  white_noise_params = theta_wn)
+                                  white_noise_params = theta_wn,
+                                  red_noise_basis = red_noise_basis)
 
     elif not vary_white and tm_model:
         helpers_now = super_sig.get_helpers(reff = stochastic_res,
-                                  white_noise_params = fixed_white_noise_params)
+                                  white_noise_params = fixed_white_noise_params,
+                                  red_noise_basis = red_noise_basis)
     else:
         helpers_now = helpers
 
