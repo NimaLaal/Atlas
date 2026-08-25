@@ -80,8 +80,17 @@ def _get_psr_WN_helpers(psr, dt=1.0):
 
     # U is a list of arrays of toa indices for each epoch
     # we need to convert this to a padded array for fast einsum computations
-    U_pad, U_mask = jagged2padded(U)
-    U_pad, U_mask = jnp.array(U_pad, dtype=int), jnp.array(U_mask, dtype=bool)
+    if len(U) == 0:
+        # No epoch holds more than one TOA (_get_epochs drops singletons), so
+        # there is no ECORR block structure at all -- e.g. a single-frequency
+        # campaign with one TOA per observing session. Empty (0, 1) helpers let
+        # the per-epoch einsums in the solvers reduce over an empty axis, which
+        # contributes exactly zero rather than raising in jagged2padded.
+        U_pad = jnp.zeros((0, 1), dtype=int)
+        U_mask = jnp.zeros((0, 1), dtype=bool)
+    else:
+        U_pad, U_mask = jagged2padded(U)
+        U_pad, U_mask = jnp.array(U_pad, dtype=int), jnp.array(U_mask, dtype=bool)
 
     # V is a list of backend indices for each epoch (i.e. which backend each epoch belongs to)
     V = jnp.array(V, dtype=int)
@@ -172,6 +181,7 @@ class DiagSinglePulsarWhiteCov:
         self.ntoas = len(psr.toas)
         self.toaerrs = psr.toaerrs
         self.marg = marg
+        self.n_params = 0 # no EFAC/EQUAD/ECORR here -- nothing to sample
         self.Mmat = _timing_model_svd(psr.Mmat)
         self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
 
@@ -365,11 +375,12 @@ class SinglePulsarWhiteCov:
     """
 
     def __init__(self, psr,
-                marg = False, 
+                marg = False,
                 efac_prior_bounds = (0.01, 10), # (low, high)
                 efac_prior_normal = (1., 0.25), # (mean, std)
                 log10equad_prior_bounds = (-9, -5), # (low, high)
-                log10ecorr_prior_bounds = (-9, -5) # (low, high)
+                log10ecorr_prior_bounds = (-9, -5), # (low, high)
+                include_ecorr = True
                 ):
         """A constructor for the full white noise covariance matrix.
 
@@ -383,10 +394,30 @@ class SinglePulsarWhiteCov:
 
         *prior_bounds : tuple, optional
             the lower and upper prior bounds for white noise params
+
+        include_ecorr : bool, optional
+            Whether to give each backend an ECORR parameter. Set this to False
+            for datasets whose epochs contain a single TOA each -- an epoch of
+            size one makes ECORR exactly degenerate with EQUAD, since the
+            rank-one per-epoch update collapses onto that TOA's own diagonal
+            entry. Sampling it anyway costs a parameter per backend and buys
+            an unidentifiable direction. With False, each backend has only
+            EFAC and log10_t2equad, and ``jvec`` is identically zero (which
+            makes the Sherman-Morrison correction and its log-determinant
+            contribution vanish exactly). Defaults to True.
         """
         backends, B, U_pad, U_mask, V = _get_psr_WN_helpers(psr, dt=EPOCH_THRESHOLD)
 
+        if include_ecorr and len(U_pad) == 0:
+            raise ValueError(
+                f"{psr.name}: no epoch contains more than one TOA (within "
+                f"{EPOCH_THRESHOLD} s), so ECORR has nothing to correlate and is "
+                "entirely unidentifiable -- sampling it would explore the prior "
+                "with a flat likelihood. Pass include_ecorr=False."
+            )
+
         self.marg = marg
+        self.include_ecorr = include_ecorr
 
         self.Mmat = _timing_model_svd(psr.Mmat)
         self.Mprior = self.Mmat.shape[1] * jnp.log(1e40)
@@ -399,6 +430,9 @@ class SinglePulsarWhiteCov:
 
         self.backends = backends
         self.n_backends = len(backends)
+        # Free parameters per backend: EFAC, EQUAD and (optionally) ECORR.
+        self.n_params_per_backend = 3 if self.include_ecorr else 2
+        self.n_params = self.n_params_per_backend * self.n_backends
         self.B = B # To construct nvec
         self.U_pad = U_pad
         self.U_mask = U_mask
@@ -480,10 +514,14 @@ class SinglePulsarWhiteCov:
             ef.append(numpyro.sample(f'{psr}_{b}_efac', efac_base_dist))
             eq.append(numpyro.sample(f'{psr}_{b}_log10_t2equad',
                                     dist.Uniform(self.lower_log10equad, self.upper_log10equad)))
-            ec.append(numpyro.sample(f'{psr}_{b}_log10_ecorr',
-                                    dist.Uniform(self.lower_log10ecorr, self.upper_log10ecorr)))
+            if self.include_ecorr:
+                ec.append(numpyro.sample(f'{psr}_{b}_log10_ecorr',
+                                        dist.Uniform(self.lower_log10ecorr, self.upper_log10ecorr)))
         # Concatenate in the same [ef | eq | ec] order that params_dict_to_vector uses
-        return jnp.concatenate([jnp.stack(ef), jnp.stack(eq), jnp.stack(ec)])
+        blocks = [jnp.stack(ef), jnp.stack(eq)]
+        if self.include_ecorr:
+            blocks.append(jnp.stack(ec))
+        return jnp.concatenate(blocks)
 
     def get_prior_bounds(self):
         """Return lower and upper bounds for all white-noise parameters.
@@ -498,14 +536,15 @@ class SinglePulsarWhiteCov:
         """
         low  = (
             [self.lower_efac]       * len(self.backends) +
-            [self.lower_log10equad] * len(self.backends) +
-            [self.lower_log10ecorr] * len(self.backends)
+            [self.lower_log10equad] * len(self.backends)
         )
         high = (
             [self.upper_efac]       * len(self.backends) +
-            [self.upper_log10equad] * len(self.backends) +
-            [self.upper_log10ecorr] * len(self.backends)
+            [self.upper_log10equad] * len(self.backends)
         )
+        if self.include_ecorr:
+            low  += [self.lower_log10ecorr] * len(self.backends)
+            high += [self.upper_log10ecorr] * len(self.backends)
         return low, high
 
     def prior_draw(self, uniform_efac = True):
@@ -539,9 +578,13 @@ class SinglePulsarWhiteCov:
                 ef.append(self.lower_efac + 
                         np.abs(np.random.normal(loc = self.center_efac, scale = self.sigma_efac)))
             eq.append(np.random.uniform(self.lower_log10equad, self.upper_log10equad))
-            ec.append(np.random.uniform(self.lower_log10ecorr, self.upper_log10ecorr))
+            if self.include_ecorr:
+                ec.append(np.random.uniform(self.lower_log10ecorr, self.upper_log10ecorr))
         # Concatenate in the same [ef | eq | ec] order that params_dict_to_vector uses
-        return jnp.concatenate([jnp.stack(ef), jnp.stack(eq), jnp.stack(ec)])
+        blocks = [jnp.stack(ef), jnp.stack(eq)]
+        if self.include_ecorr:
+            blocks.append(jnp.stack(ec))
+        return jnp.concatenate(blocks)
 
     def prior_draw_dictionary(self, 
                             param_values = np.array([False]), 
@@ -594,6 +637,8 @@ class SinglePulsarWhiteCov:
         # Params is a dictionary of parameter values for each backends
         ef = [f'{self.psr_name}_{b}_efac'           for b in self.backends]
         eq = [f'{self.psr_name}_{b}_log10_t2equad'   for b in self.backends]
+        if not self.include_ecorr:
+            return ef + eq
         ec = [f'{self.psr_name}_{b}_log10_ecorr'     for b in self.backends]
         return ef + eq + ec
 
@@ -626,14 +671,20 @@ class SinglePulsarWhiteCov:
         nb = len(self.backends)
         ef = wn_vec[:nb]
         eq = wn_vec[nb:2*nb]
-        ec = wn_vec[2*nb:]
 
         ef2 = ef ** 2
         eq2 = 10.0 ** (2.0 * eq)
-        ec2 = 10.0 ** (2.0 * ec)
 
         nvec = ef2[self.B] * (self.toaerrs ** 2 + eq2[self.B])
-        jvec = ec2[self.V]
+
+        if self.include_ecorr:
+            ec2 = 10.0 ** (2.0 * wn_vec[2*nb:])
+            jvec = ec2[self.V]
+        else:
+            # jvec == 0 makes the Sherman-Morrison numerator and the
+            # log(1 + jvec * epoch_sums) correction vanish identically, so the
+            # solvers reduce exactly to the diagonal case with no extra branch.
+            jvec = jnp.zeros_like(self.V, dtype=nvec.dtype)
 
         return nvec, jvec
 
@@ -919,7 +970,8 @@ class WhiteCov:
                 efac_prior_bounds = (0.01, 10), # (low, high)
                 efac_prior_normal = (1., 0.25), # (mean, std)
                 log10equad_prior_bounds = (-9, -5), # (low, high)
-                log10ecorr_prior_bounds = (-9, -5) # (low, high)
+                log10ecorr_prior_bounds = (-9, -5), # (low, high)
+                include_ecorr = True
                 ):
         """Construct a multi-pulsar white noise covariance handler.
 
@@ -933,6 +985,12 @@ class WhiteCov:
 
         diag_white_cov : bool
             do you want simple no backend diagonal white noise?
+
+        include_ecorr : bool
+            Give every backend an ECORR parameter? Set False when the epochs
+            hold one TOA each, which makes ECORR degenerate with EQUAD. See
+            ``SinglePulsarWhiteCov``. Ignored when ``data.diag_white_cov`` is
+            set, since that model has no free parameters at all.
         """
         # Extracting the data analysis settings
         self.data = data
@@ -940,6 +998,7 @@ class WhiteCov:
         self.marg = self.data.marg
         self.npulsars = self.data.npsrs
         self.stabilize = stabilize_TNT
+        self.include_ecorr = include_ecorr
 
         self.cov_matrices = []
         pbar = trange(self.npulsars)
@@ -953,7 +1012,8 @@ class WhiteCov:
                                                             efac_prior_bounds = efac_prior_bounds,
                                                             efac_prior_normal = efac_prior_normal,
                                                             log10equad_prior_bounds = log10equad_prior_bounds,
-                                                            log10ecorr_prior_bounds = log10ecorr_prior_bounds
+                                                            log10ecorr_prior_bounds = log10ecorr_prior_bounds,
+                                                            include_ecorr = include_ecorr
                                                             ))
             else:
                 self.cov_matrices.append(DiagSinglePulsarWhiteCov(psr, 
@@ -1131,7 +1191,7 @@ class WhiteCov:
                                             self.toa_starts, 
                                             self.toa_ends):
 
-                wn_params_end_idx = wn_params_start_idx + 3 * cov.n_backends
+                wn_params_end_idx = wn_params_start_idx + cov.n_params
                 wn_params = white_noise_params[wn_params_start_idx: wn_params_end_idx]
                 wn_params_start_idx = wn_params_end_idx
 
@@ -1215,7 +1275,7 @@ class WhiteCov:
             if self.diag_white_cov:
                 white_noise_helper = cov.get_nvec_jvec()
             else:
-                wn_params_end_idx = wn_params_start_idx + 3 * cov.n_backends
+                wn_params_end_idx = wn_params_start_idx + cov.n_params
                 wn_params = white_noise_params[wn_params_start_idx: wn_params_end_idx]
                 wn_params_start_idx = wn_params_end_idx
                 white_noise_helper = cov.get_nvec_jvec(wn_params)
