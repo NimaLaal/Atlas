@@ -31,11 +31,9 @@ with open(sim_path+'/injected_params.json', 'r') as f:
 from ATLAS.pulsar import load_pulsars
 from ATLAS.data import PTA_Data
 
-
-
-par = sorted(glob(sim_path+'/par/*.par'))
-tim = sorted(glob(sim_path+'/tim/*.tim'))
-psrs = load_pulsars(par, tim, use_enterprise=True)
+with open('psrs.pkl','rb') as f:
+    import pickle
+    psrs = pickle.load(f)
 
 data = PTA_Data(psrs, fixed_res = False, marg_timing = False, 
                 diag_white_cov = False, linear_timing = True)
@@ -149,5 +147,5 @@ samples = mcmc.get_samples()
 with open('output_samples.pkl', 'wb') as f:
     import pickle
     pickle.dump(samples, f)
-    
+
 
