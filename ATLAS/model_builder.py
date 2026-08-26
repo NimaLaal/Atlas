@@ -55,7 +55,8 @@ class ModelBuilder:
                 dm_upper_bound_psd = None,
                 gwb_lower_bound_psd = None,
                 gwb_upper_bound_psd = None,
-                det_parameter_bounds = None):
+                det_parameter_bounds = None,
+                gt_psd_val = None):
         
         red_signal_names = sutils.parse_basis_string(red_noise_combination_string)['shared_names'] + \
                            sutils.parse_basis_string(red_noise_combination_string)['separate_names']
@@ -74,6 +75,7 @@ class ModelBuilder:
             signals.append(GaussianTiming(name='gtm',
                         nmodes=self.data.adaptus_size,
                         timing_model = None,
+                        gtm_psd = gt_psd_val,
                         lower_bound_psd = None, #jnp.ones(int(self.data.adaptus_size/2))*-15,
                         upper_bound_psd = None, #jnp.ones(int(self.data.adaptus_size/2))*2,
                         data = self.data,
@@ -102,6 +104,7 @@ class ModelBuilder:
         if 'det' in red_signal_names:
             signals.append(Deterministic(name='det',
                          data=self.data,
+                         nfreqs_det = self.data.num_det_bins,
                          get_delays_func=det_delay_function,
                          det_parameter_bounds=det_parameter_bounds)
             )
