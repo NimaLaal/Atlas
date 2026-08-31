@@ -42,6 +42,7 @@ class PTA_Data:
                 num_gwb_bins = None,
                 num_irn_bins = None,
                 num_dm_bins = None,
+                num_det_bins = None,
                 adaptus_size = None, 
                 fixed_white_noise_params = None,
                 linear_timing = False,
@@ -66,6 +67,7 @@ class PTA_Data:
         """
         self.adaptus_basis = adaptus_basis
         self.num_gwb_bins = num_gwb_bins
+        self.num_det_bins = num_det_bins
         self.num_irn_bins = num_irn_bins
         self.dm_bins = num_dm_bins
         self.adaptus_size = adaptus_size

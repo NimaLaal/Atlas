@@ -684,6 +684,7 @@ def model_maker(raw_residuals,
                 save_red_coeff = False,
                 fixed_white_noise_params = None,
                 red_noise_basis = None,
+                tm_direct_sampling_type = 'klam',
                 ):
     """NumPyro model for the ATLAS global fit.
 
@@ -700,13 +701,23 @@ def model_maker(raw_residuals,
         XLA writes it into the potential-energy executable as a literal; on the
         NANOGrav 15-year set that is several GB of generated code. As a model
         argument it is traced, and the executable holds a pointer instead.
+
+    tm_direct_sampling_type : str, optional
+        How a sampled timing model is parameterised. ``'klam'`` (the default)
+        draws a global scale ``timing_lam`` and unit-scale coefficients
+        ``timing_k`` and forms the residuals from their product. Anything else
+        calls ``tm_model.sample_residuals()``, which samples each pulsar's
+        physical timing parameters directly from their bounded priors.
     """
 
     ######################################## Timing Model ########################################
     if tm_model:
-        lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
-        k = numpyro.sample("timing_k", dist.Normal(0, 50).expand([tm_model.nparams_total]))
-        stochastic_res = tm_model.residuals(k * lam)
+        if tm_direct_sampling_type == 'klam':
+            lam = numpyro.sample("timing_lam", dist.HalfNormal(10.0))
+            k = numpyro.sample("timing_k", dist.Normal(0, 50).expand([tm_model.nparams_total]))
+            stochastic_res = tm_model.residuals(k * lam)
+        else:
+            stochastic_res = tm_model.sample_residuals()
     else:
         stochastic_res = raw_residuals
 

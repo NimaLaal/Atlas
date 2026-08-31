@@ -18,6 +18,24 @@ def merge_slices(*slices):
         return slice(slices[0].start, slices[-1].stop)
     return jnp.concatenate([jnp.arange(s.start, s.stop) for s in slices])
 
+import numpy as np
+
+def merge_slices_unique(*slices):
+    """Combine slices into a single contiguous slice if possible (fast path),
+    otherwise return a concatenated, deduplicated, sorted index array covering
+    the same positions.
+
+    NOTE: slice.start/.stop must be static Python ints here (not traced values) —
+    this is resolved entirely at trace time and the result is embedded as a
+    constant, so it's safe to call from inside jit-compiled code.
+    """
+    slices = sorted(slices, key=lambda s: s.start)
+    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
+    if contiguous:
+        return slice(slices[0].start, slices[-1].stop)
+    idx = np.unique(np.concatenate([np.arange(s.start, s.stop) for s in slices]))
+    return jnp.array(idx)
+
 def block_slice(idx0, idx1=None):
     """Return a (row, col) index pair usable as `TNT[:, row, col]` for a block
     submatrix, whether idx0/idx1 are contiguous slices or 1-D index arrays."""
