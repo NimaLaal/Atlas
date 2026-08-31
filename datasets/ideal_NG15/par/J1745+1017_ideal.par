@@ -1,11 +1,11 @@
-# Created: 2026-07-28T09:46:30.142066
+# Created: 2026-08-31T14:40:13.830676
 # PINT_version: 1.1.5
 # User: kyleg
 # Host: ASLNX-BHQ7Z84.vuds.vanderbilt.edu
 # OS: Linux-6.11.0-24-generic-x86_64-with-glibc2.39
 # Python: 3.12.13 | packaged by conda-forge | (main, Mar  5 2026, 16:50:00) [GCC 14.3.0]
 # Format: pint
-# read_time: 2026-07-28T09:41:37.036908
+# read_time: 2026-08-31T14:25:48.626079
 # allow_tcb: False
 # convert_tcb: False
 # allow_T2: False
@@ -30,10 +30,6 @@ POSEPOCH           58221.0000000000000000
 F0                  377.05547588639046794 1 1.26955725192999222674e-11
 F1              -3.7028854210285968749e-16 1 2.7738444223196942192e-18
 PEPOCH             58221.0000000000000000
-TZRMJD             55400.0000000000000000
-TZRSITE                                 3
-TZRFRQ                             1451.0
-JUMP            -fe L-wide    -7.773463632349233e-06 1 4.290863516553347e-07
 CORRECT_TROPOSPHERE                         Y
 PLANET_SHAPIRO                          Y
 NE_SW                                 0.0
@@ -199,3 +195,7 @@ EPS2            -1.40484913515088743785e-05 1 1.1066499345586761221e-05
 # ECC             1.6656715228876007238e-05
 # OM                  212.49769384334598339
 FD1                -1.547769336963503e-05 1 1.8819820516724547e-06
+TZRMJD             55400.0000000000000000
+TZRSITE                                 3
+TZRFRQ                             1451.0
+JUMP            -fe L-wide    -7.773463632349233e-06 1 4.290863516553347e-07
