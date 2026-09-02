@@ -1,0 +1,87 @@
+{
+  "info": {
+    "host": "ASLNX-9HQ7Z84.vuds.vanderbilt.edu",
+    "platform": "cpu",
+    "device": "cpu:cpu",
+    "jax": "0.10.1",
+    "x64": true,
+    "loadavg": 1.57470703125,
+    "recorded": "2026-09-01T21:11:17",
+    "case": "ltm",
+    "model_string": "ltm|unc+cor->unc",
+    "fixture": "synth",
+    "npsr": 2,
+    "ntoa": 456,
+    "nmodes": 18,
+    "include_ecorr": true,
+    "latent_dims": 36,
+    "n_red_params": 6,
+    "n_wn_params": 12
+  },
+  "ratio": 3.3182041970943064,
+  "timings": [
+    {
+      "label": "helper build (forward)",
+      "median_ms": 0.02341430326648269,
+      "min_ms": 0.022650660486347545,
+      "max_ms": 0.02391988648595574,
+      "repeats": 4801,
+      "rounds": 3,
+      "loadavg": 1.68896484375,
+      "note": ""
+    },
+    {
+      "label": "grad, helpers FROZEN",
+      "median_ms": 0.029992903056429605,
+      "min_ms": 0.028115328355831488,
+      "max_ms": 0.034042269368816554,
+      "repeats": 2610,
+      "rounds": 3,
+      "loadavg": 1.68896484375,
+      "note": "vary_white=False leapfrog step"
+    },
+    {
+      "label": "grad, helpers REBUILT",
+      "median_ms": 0.09952257680488737,
+      "min_ms": 0.09749957415426916,
+      "max_ms": 0.10113030390128808,
+      "repeats": 1517,
+      "rounds": 3,
+      "loadavg": 1.68896484375,
+      "note": "vary_white=True leapfrog step"
+    },
+    {
+      "label": "grad, partial_marg (frozen helpers)",
+      "median_ms": 0.0399609550378068,
+      "min_ms": 0.03907224410081171,
+      "max_ms": 0.04073091248984061,
+      "repeats": 5805,
+      "rounds": 3,
+      "loadavg": 1.68896484375,
+      "note": ""
+    }
+  ],
+  "memory": {
+    "helper_build": {
+      "generated_code": 0,
+      "argument": 96,
+      "temp": 82360,
+      "output": 5520,
+      "alias": 0
+    },
+    "grad_frozen": {
+      "generated_code": 0,
+      "argument": 336,
+      "temp": 33040,
+      "output": 352,
+      "alias": 0
+    },
+    "grad_rebuilt": {
+      "generated_code": 0,
+      "argument": 432,
+      "temp": 191376,
+      "output": 456,
+      "alias": 0
+    }
+  }
+}
