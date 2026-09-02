@@ -3,7 +3,6 @@ import jax
 jax.config.update("jax_enable_x64", True)
 from ATLAS.signals.factorized.base import Red, SuperSignal, GaussianTiming
 from ATLAS.signals.correlated.base import Correlated
-from ATLAS.signals.timing.base import build_multi_psr_timing_model
 from ATLAS.nMatrix.base import WhiteCov
 from ATLAS.signals.deterministic.base import Deterministic
 import jax.numpy as jnp
@@ -17,7 +16,16 @@ class ModelBuilder:
         self.SAMPLE = explicit_timing_model_params_to_sample
         
     def make_timing_model(self, enterprise_data = True):
-        
+        """Build the non-linear timing model.
+
+        The JUG import is deliberately function-level. It is the only thing in
+        this module that needs JUG, and JUG is not installable from PyPI, so a
+        module-level import would make the entire likelihood construction path
+        -- PTA_Data, WhiteCov, make_red_noise -- unusable without it. Keeping it
+        here is what lets the test suite and CI run on a bare environment.
+        """
+        from ATLAS.signals.timing.base import build_multi_psr_timing_model
+
         if self.SAMPLE is None:
             if enterprise_data:    
                 self.SAMPLE = [self.data.psrs[pidx].fitpars[1:] for pidx in range(self.data.npsrs)]
