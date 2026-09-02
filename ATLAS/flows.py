@@ -10,6 +10,9 @@ from tqdm.auto import trange
 from functools import partial
 import random
 jax.config.update("jax_enable_x64", True)
+import pickle
+import os
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalisation helpers (pure numpy, used at init and in public API)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +182,8 @@ def _iter_batches_no_context(data, x_norm, batch_size, key):
         x_raw = np.asarray(data[idx], dtype=np.float64)
         x_batch = jnp.asarray(_from_coefficients_np(x_raw, x_norm))
         return x_batch
+
+
 
 class Flow:
     """
@@ -729,12 +734,32 @@ class Flow:
         mode = 'pre-loaded',
         num_epochs=100,
         batch_size=256,
+        checkpoint=None,
     ):
         """
         Train the model using mini-batch gradient descent.
+
+        mode : str
+        num_epochs : int
+        batch_size : int
+        checkpoint : path or None
+            Write training state here after every epoch if not None,
+            and resume from last epoch recorded here if it already exists. 
         """
+
+
         if mode == 'pre-loaded':
-            for _ in trange(num_epochs, colour = 'blue', desc = "Training the flow from pre-loaded data"):
+            # load from last checkpointed epoch
+            start_epoch = 0           
+            if checkpoint is not None and os.path.exists(checkpoint):
+                start_epoch = self._load_checkpoint(checkpoint, batch_size)
+                print(f"[flow] resuming from {checkpoint} at epoch "
+                        f"{start_epoch}/{num_epochs}", flush=True)
+            self.resumed_from = start_epoch # needed for interpreting wall-clock timing on a resumed run
+                 
+            for ep in trange(start_epoch, num_epochs, 
+                            initial=start_epoch, total=num_epochs,
+                            colour = 'blue', desc = "Training the flow from pre-loaded data"):
 
                 self.key, subkey = jr.split(self.key)
 
@@ -752,7 +777,13 @@ class Flow:
                         )
                     )
 
+                if checkpoint is not None:
+                    self._save_checkpoint(checkpoint, ep + 1, batch_size)
+
         if mode == 'from_disk':
+            if checkpoint is not None:
+                err = "Checkpointing is only supported for mode='pre-loaded'."
+                raise ValueError(err)
             for _ in trange(num_epochs, colour = 'blue', desc = "Training the flow from disk"):
                 rand_idx = random.randint(0, len(self.tset_paths) - 1)
                 training_set = jnp.load(self.tset_paths[rand_idx])
@@ -861,6 +892,69 @@ class Flow:
         _, treedef = jax.tree_util.tree_flatten(self.params)
         leaves = [jnp.asarray(data[f"leaf_{i}"]) for i in range(treedef.num_leaves)]
         self.params = jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+    # ------------- Checkpointing -----------
+    # To resume flow training if interrupted partway through
+
+    def _checkpoint_signature(self, batch_size):
+        # Configuration must match for a checkpoint to belong to this run.
+        # Prevents resuming into a different state
+        return dict(
+            N=int(self.N), D=int(self.D),
+            flow_num_layers=int(self.flow_num_layers),
+            hidden_sizes=[int(h) for h in self.hidden_sizes],
+            num_bins=int(self.num_bins),
+            learning_rate=float(self.learning_rate),
+            B=float(self.B), gamma=float(self.gamma),
+            batch_size=int(batch_size),
+        )
+
+    def _save_checkpoint(self, path, epoch, batch_size):
+        """Params, optimizer state, RNG key and epoch counter."""
+        # `opt_state` is saved, not just `params`.  `save_params` is deliberately
+        # not reused here: it writes the parameter leaves through `np.savez` plus
+        # a stringified treedef, which cannot carry an optax NamedTuple tree or a
+        # PRNG key.  Resuming without Adam's first and second moments would
+        # restart them at zero and put a visible transient in the loss.
+        blob = dict(
+            params=jax.tree_util.tree_map(np.asarray, self.params),
+            opt_state=jax.tree_util.tree_map(np.asarray, self.opt_state),
+            key=np.asarray(self.key),
+            epoch=int(epoch),
+            signature=self._checkpoint_signature(batch_size),
+        )
+        # Write to a temporary file and rename.  The atomic rename is the whole
+        # reason this is safe to interrupt: a kill during the write leaves the
+        # PREVIOUS checkpoint intact rather than a half-written file that cannot
+        # be unpickled -- which would turn one lost epoch into all of them.
+        tmp = f'{path}.tmp'
+        with open(tmp, 'wb') as f:
+            pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)       
+
+    def _load_checkpoint(self, path, batch_size):
+        """Restore training state; return the number of epochs already done."""
+        with open(path, 'rb') as f:
+            blob = pickle.load(f)
+
+        want, got = self._checkpoint_signature(batch_size), blob['signature']
+        if got != want:
+            differ = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
+            raise ValueError(
+                f"{path} was written by a different configuration: "
+                f"(checkpoint, this run) differ on {differ}.  Train into a "
+                f"different directory, or delete the checkpoint to start over.")
+
+        self.params = jax.tree_util.tree_map(jnp.asarray, blob['params'])
+        self.opt_state = jax.tree_util.tree_map(jnp.asarray, blob['opt_state'])
+        # Restoring the key is what makes a resume CONTINUE the RNG stream.
+        # Without it the resumed epochs would replay the batch order of the
+        # epochs already trained on.
+        self.key = jnp.asarray(blob['key'])
+        return int(blob['epoch'])
+
+    
 
 class ConditionalFlow:
     """
