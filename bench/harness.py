@@ -22,6 +22,7 @@ differently and conflating them overstates by roughly 2x.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -32,7 +33,8 @@ from pathlib import Path
 
 import jax
 
-__all__ = ["Timing", "timeit", "compiled_memory", "machine", "write_results"]
+__all__ = ["Timing", "timeit", "compiled_memory", "host_label", "machine",
+           "write_results"]
 
 
 @dataclass
@@ -112,10 +114,26 @@ def fmt_bytes(n):
         n /= 1024
 
 
+def host_label() -> str:
+    """A stable but non-identifying label for the machine.
+
+    Benchmark results need to answer "same machine or not?", which does not
+    require the hostname -- and a fully qualified internal hostname in a
+    committed artifact is an infrastructure detail that does not belong in a
+    public repository. This hashes it instead, so results taken on one machine
+    still group together. Set ATLAS_BENCH_HOST to use a readable label of your
+    own choosing (e.g. "workstation-4090").
+    """
+    override = os.environ.get("ATLAS_BENCH_HOST")
+    if override:
+        return override
+    return "host-" + hashlib.sha256(platform.node().encode()).hexdigest()[:8]
+
+
 def machine() -> dict:
     dev = jax.devices()[0]
     return dict(
-        host=platform.node(),
+        host=host_label(),
         platform=jax.default_backend(),
         device=f"{dev.platform}:{dev.device_kind}",
         jax=jax.__version__,
@@ -126,8 +144,13 @@ def machine() -> dict:
 
 
 def write_results(name, payload, outdir=None):
+    """Write results under a filename that carries no machine identifier.
+
+    The backend goes in the name because memory figures are only comparable
+    within one; the host label lives inside the file.
+    """
     outdir = Path(outdir or Path(__file__).resolve().parent / "results")
     outdir.mkdir(parents=True, exist_ok=True)
-    path = outdir / f"{name}-{machine()['host']}-{time.strftime('%Y%m%d')}.json"
+    path = outdir / f"{name}-{jax.default_backend()}-{time.strftime('%Y%m%d')}.json"
     path.write_text(json.dumps(payload, indent=2, default=str))
     return path

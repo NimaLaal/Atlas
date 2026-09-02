@@ -155,11 +155,30 @@ def compare(a_path, b_path):
         if x.shape != y.shape:
             rows.append((key, None, None, f"shape {x.shape} vs {y.shape}"))
             continue
+        # A NaN or Inf anywhere is a failure on its own terms, and must be
+        # caught here: `d.max()` and `rel.max()` would both come back non-finite,
+        # and a non-finite maximum compares False against any tolerance -- so a
+        # broken likelihood or gradient would slip through the gate silently.
+        n_a, n_b = int((~np.isfinite(x)).sum()), int((~np.isfinite(y)).sum())
+        if n_a or n_b:
+            rows.append((key, None, None,
+                         f"NON-FINITE: {n_a} in A, {n_b} in B, of {x.size}"))
+            continue
         d = np.abs(x - y)
         scale = np.maximum(np.abs(x), np.abs(y))
-        rel = np.where(scale > 0, d / np.where(scale > 0, scale, 1.0), 0.0)
+        rel = np.divide(d, scale, out=np.zeros_like(d), where=scale > 0)
         rows.append((key, float(d.max()), float(rel.max()), ""))
     return rows
+
+
+def _row_ok(row, tol):
+    """Whether one compared array passes the gate. Fails closed."""
+    key, _, mrel, note = row
+    if key in DESCRIPTIVE:
+        return note == "identical"
+    if mrel is None or not np.isfinite(mrel):
+        return False
+    return bool(note == "" and mrel <= tol)
 
 
 def main():
@@ -213,9 +232,13 @@ def main():
             rows = compare(*outs)
             worst = max((r[2] for r in rows if r[2] is not None and np.isfinite(r[2])),
                         default=0.0)
-            bad = [r for r in rows
-                   if r[3].startswith(("present", "shape", "CHANGED"))
-                   or (r[2] is not None and np.isfinite(r[2]) and r[2] > args.tol)]
+            # Fail closed: a row passes only if it is descriptive-and-identical,
+            # or carries a finite relative difference within tolerance. Anything
+            # else -- a missing array, a shape change, a non-finite value, an
+            # unparseable comparison -- is a failure. The previous form
+            # enumerated failure notes, so a note it did not know about read as
+            # a pass.
+            bad = [r for r in rows if not _row_ok(r, args.tol)]
             status = "PASS" if not bad else "FAIL"
             if bad:
                 failures += 1
@@ -224,9 +247,9 @@ def main():
             if args.markdown:
                 print("\n| array | max abs | max rel | note |")
                 print("|---|---|---|---|")
-            for key, mabs, mrel, note in rows:
-                flag = "" if (key in DESCRIPTIVE or mrel is None
-                              or not np.isfinite(mrel) or mrel <= args.tol) else "  <-- FAIL"
+            for row in rows:
+                key, mabs, mrel, note = row
+                flag = "" if _row_ok(row, args.tol) else "  <-- FAIL"
                 if args.markdown:
                     fa = "-" if mabs is None else f"{mabs:.3e}"
                     fr = "-" if mrel is None else f"{mrel:.3e}"

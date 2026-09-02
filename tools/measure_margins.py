@@ -10,7 +10,6 @@ characterised noise floors.  Run it on the machine whose floors you want.
 from __future__ import annotations
 
 import json
-import platform
 import sys
 import time
 from pathlib import Path
@@ -21,6 +20,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from bench.harness import host_label
 from tests import harness as H
 from tests import reference as ref
 
@@ -148,7 +148,7 @@ for case, kw in H.CORPUS.items():
 out = Path(__file__).resolve().parent / "noise_floors.json"
 out.write_text(json.dumps(dict(
     recorded=time.strftime("%Y-%m-%dT%H:%M:%S"),
-    host=platform.node(),
+    host=host_label(),
     platform=jax.default_backend(),
     jax=jax.__version__,
     numpy=np.__version__,
