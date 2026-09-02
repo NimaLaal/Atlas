@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-08-31T21:25:18",
+  "recorded": "2026-09-01T21:01:09",
   "host": "ASLNX-9HQ7Z84.vuds.vanderbilt.edu",
   "platform": "cpu",
   "jax": "0.10.1",
@@ -88,6 +88,42 @@
       "achieved": 1.75295227264493e-16,
       "asserted": 1e-09,
       "note": "tm cols [55, 40, 42]"
+    },
+    {
+      "identity": "partial_marg vs reparam [curn]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "12 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [curn-margtm]",
+      "achieved": 1.656978010039726e-16,
+      "asserted": 1e-09,
+      "note": "12 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm]",
+      "achieved": 1.5287184453593437e-16,
+      "asserted": 1e-09,
+      "note": "18 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm-dm]",
+      "achieved": 1.528718470391525e-16,
+      "asserted": 1e-09,
+      "note": "24 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm-gtm]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "26 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm-dm-gtm]",
+      "achieved": 1.528711893646603e-16,
+      "asserted": 1e-09,
+      "note": "32 cols"
     }
   ]
 }

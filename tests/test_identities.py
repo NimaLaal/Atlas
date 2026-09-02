@@ -14,6 +14,7 @@ from scipy.stats import multivariate_normal
 
 from . import harness as H
 from . import reference as ref
+from ATLAS.signals.signals_utils import _as_positions as H_positions
 from ATLAS.psd_functions import hd_orf as atlas_hd
 from ATLAS.signals.signals_utils import get_harmonic_frequencies, get_fourier_design_matrix
 
@@ -89,7 +90,7 @@ def test_curn_matches_dense_reference():
     atlas = float(m.rn.ln_likelihood_curn(m.helpers, red))
 
     T, N, Nfull, r = H.dense_bundle(m)
-    irn, gwb = H.psd_pieces(m, red)
+    irn, _, gwb = H.psd_pieces(m, red)
     phi = ref.build_phi(m.npsr, 2 * m.n_irn, 0, [0] * m.npsr, irn, gwb, orf=None)
     expected = ref.marginal_logL(r, T, phi, Nfull) + ref.atlas_offset(r.size)
     assert abs(atlas - expected) / abs(expected) < TIGHT
@@ -270,13 +271,28 @@ def test_grad_matches_finite_difference(fn_name):
 #  5. Known defects, pinned as xfail so a later stage sees them go green
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(reason="B3 (partial): signal_comb_idxs['timing'] and ['unc'] are "
-                          "indexed unguarded, so both reparameterised likelihoods "
-                          "require an 'ltm' prefix", raises=KeyError, strict=True)
 def test_reparam_without_timing_block():
-    m = H.build(model_string="unc+cor->unc", linear_timing=False)
+    """B3 regression: `partial_marg_lnposterior_helper` used to index
+    signal_comb_idxs['timing'] and ['unc'] unguarded, so both reparameterised
+    likelihoods raised KeyError for any model string without an 'ltm' prefix."""
+    m = H.build(model_string="unc+cor->unc", linear_timing=False, orf_name="zero")
+    red = m.red_params()
+    _, P_idx, _ = m.rn.partial_marg_lnposterior_helper
+    assert np.array_equal(np.asarray(H_positions(P_idx)), np.arange(m.rn.nmodes))
     z = jnp.zeros((m.npsr, m.rn.nmodes))
-    m.rn.lnposterior_reparam(m.helpers, m.red_params(), z)
+    lp, _ = m.rn.lnposterior_reparam(m.helpers, red, z)
+    assert np.isfinite(float(lp))
+    pm, _ = m.rn.partial_marg_lnposterior(m.helpers, red,
+                                          jnp.zeros((m.npsr, 2 * m.n_gwb)))
+    assert np.isfinite(float(pm))
+
+
+def test_empty_p_block_is_rejected():
+    """A model string with no non-GWB stochastic block should say so, not
+    fail deep inside a slice."""
+    with pytest.raises(ValueError, match="nothing to marginalise"):
+        m = H.build(model_string="cor", linear_timing=False, orf_name="zero")
+        m.rn.partial_marg_lnposterior_helper
 
 
 @pytest.mark.xfail(reason="build_basis emits cor=slice(18,26) into a 20-column basis "
@@ -288,10 +304,91 @@ def test_separate_cor_block():
     m.rn.lnposterior_reparam(m.helpers, m.red_params(), z)
 
 
-@pytest.mark.xfail(reason="B1: PTA_Data stores self.dm_bins, make_red_noise reads "
-                          "self.data.num_dm_bins", raises=AttributeError, strict=True)
-def test_dm_model_string_builds():
-    H.build(model_string="ltm|unc+cor->unc;dm")
+def test_dm_model_string_builds_and_evaluates():
+    """B1 regression: a model string containing `dm` used to be unreachable,
+    because PTA_Data stored `self.dm_bins` while make_red_noise read
+    `self.data.num_dm_bins`."""
+    m = H.build(model_string="ltm|unc+cor->unc;dm", n_dm=3)
+    assert "dm" in m.rn.signal_comb_idxs
+    assert m.rn.nmodes == m.n_tm + 2 * m.n_irn + 2 * m.n_dm
+    names = m.rn.model.get_param_names()
+    assert sum("_dm_" in n for n in names) == 2 * m.npsr
+    lp, _ = m.rn.lnposterior_reparam(m.helpers, m.red_params(),
+                                     jnp.zeros((m.npsr, m.rn.nmodes)))
+    assert np.isfinite(float(lp))
+
+
+def test_dm_bins_alias_still_reads():
+    m = H.build(model_string="ltm|unc+cor->unc;dm", n_dm=3)
+    assert m.data.dm_bins == m.data.num_dm_bins == 3
+
+
+@pytest.mark.xfail(reason="ln_likelihood_curn calls jnp.repeat(phi, 2) on a "
+                          "get_phi_mat_CURN result that a directly supplied "
+                          "gtm_psd has already promoted to mode resolution",
+                   raises=ValueError, strict=True)
+def test_curn_with_direct_gtm():
+    m = H.build(model_string="unc+cor->unc;gtm", linear_timing=False, n_gtm=8)
+    m.rn.ln_likelihood_curn(m.helpers, m.red_params())
+
+
+# --------------------------------------------------------------------------- #
+#  8. The whole model-string corpus
+# --------------------------------------------------------------------------- #
+
+CORPUS = [pytest.param(k, id=k) for k in H.CORPUS]
+
+
+@pytest.mark.parametrize("case", CORPUS)
+def test_reparam_density_matches_dense_conditional_corpus(case):
+    """Every working layout, against the dense joint.
+
+    This is the test that covers `;gtm` -- the production model string, and the
+    one whose `has_gtm_direct` branch switches the whole phi pipeline from bin
+    to mode resolution.
+    """
+    kw = dict(H.CORPUS[case])
+    if kw.get("marg_timing"):
+        pytest.skip("marg_timing folds the timing model into N, covered by "
+                    "test_marg_timing_solve_matches_dense")
+    m = H.build(orf_name="hd", **kw)
+    red = m.red_params(irn_overrides={1: (-14.7, 4.0)})
+    T, _, Nfull, r = H.dense_bundle(m)
+    phi = H.global_phi(m, red)
+    rng = np.random.default_rng(31)
+    deltas = []
+    for z in rng.normal(size=(4, m.npsr, m.rn.nmodes)):
+        lp, coeff = m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(z))
+        deltas.append(float(lp) - ref.conditional_logL(
+            r, T, np.asarray(coeff).ravel(), phi, Nfull))
+    deltas = np.array(deltas)
+    assert np.ptp(deltas) / abs(deltas.mean()) < LOOSE
+
+
+@pytest.mark.parametrize("case", CORPUS)
+def test_partial_marg_agrees_with_reparam_corpus(case):
+    # No case is skipped: this compares ATLAS against ATLAS, so it needs no
+    # dense reference and works on the marg_timing path too.
+    m = H.build(orf_name="zero", **H.CORPUS[case])
+    red = m.red_params(irn_overrides={1: (-14.7, 4.0)})
+    rng = np.random.default_rng(32)
+    zr = rng.normal(size=(m.npsr, m.rn.nmodes))
+    zp = rng.normal(size=(m.npsr, 2 * m.n_gwb))
+    v_r = float(m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(zr))[0]) \
+        + 0.5 * np.sum(zr ** 2)
+    v_p = float(m.rn.partial_marg_lnposterior(m.helpers, red, jnp.asarray(zp))[0]) \
+        + 0.5 * np.sum(zp ** 2)
+    assert abs(v_r - v_p) / abs(v_r) < LOOSE
+
+
+@pytest.mark.parametrize("case", CORPUS)
+def test_corpus_gradients_are_finite(case):
+    """Cheap smoke over the corpus: a NaN gradient anywhere is a dead sampler."""
+    m = H.build(orf_name="hd", **H.CORPUS[case])
+    red = m.red_params()
+    z = jnp.zeros((m.npsr, m.rn.nmodes))
+    g = jax.grad(lambda q: m.rn.lnposterior_reparam(m.helpers, q, z)[0])(red)
+    assert np.all(np.isfinite(np.asarray(g)))
 
 
 # --------------------------------------------------------------------------- #
@@ -380,7 +477,7 @@ def test_curn_matches_dense_reference_real_data(fixture, ecorr):
     red = m.red_params()
     atlas = float(m.rn.ln_likelihood_curn(m.helpers, red))
     T, N, Nfull, r = H.dense_bundle(m)
-    irn, gwb = H.psd_pieces(m, red)
+    irn, _, gwb = H.psd_pieces(m, red)
     phi = ref.build_phi(m.npsr, 2 * m.n_irn, 0, [0] * m.npsr, irn, gwb, orf=None)
     expected = ref.marginal_logL(r, T, phi, Nfull) + ref.atlas_offset(r.size)
     assert abs(atlas - expected) / abs(expected) < LOOSE

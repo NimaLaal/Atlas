@@ -1319,8 +1319,12 @@ class WhiteCov:
             rNr += G[Ntot, Ntot]
             logdet_N += y
         if self.stabilize:
-            return stabilize_TNT(TNT, TNT.shape[-1]), 
-            TNr, rNr, logdet_N, stabilize_TDNTD(TDNTD, TDNTD.shape[-1]), 
-            TDNr, TNTD
+            # The parentheses are load-bearing: without them the trailing comma
+            # ended the return statement after the first element and the next
+            # two lines parsed as unreachable expression statements, so this
+            # branch returned a 1-tuple and every caller failed to unpack it.
+            return (stabilize_TNT(TNT, TNT.shape[-1]),
+                    TNr, rNr, logdet_N, stabilize_TDNTD(TDNTD, TDNTD.shape[-1]),
+                    TDNr, TNTD)
         else:
             return TNT, TNr, rNr, logdet_N, TDNTD, TDNr, TNTD

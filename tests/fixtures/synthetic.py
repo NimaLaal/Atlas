@@ -164,3 +164,37 @@ def make_synth_pta(
         )
 
     return psrs
+
+
+def make_adaptus_basis(psrs, nmodes=8, seed=SYNTH2_SEED + 1):
+    """A synthetic stand-in for an Adaptus (``gtm``) timing basis.
+
+    The real thing PCAs prior-predictive timing residuals and keeps the leading
+    components, scaled by ``sqrt(explained_variance)`` -- so columns are
+    orthogonal with geometrically decreasing norm.  This mimics that shape
+    using smooth Chebyshev-like functions of normalised time, skipping the
+    constant and linear terms the timing model already carries, then
+    orthonormalising.
+
+    Returns ``(basis, gtm_psd)`` where ``basis`` is a list of ``[ntoa, nmodes]``
+    arrays and ``gtm_psd`` is ``[nmodes, npsr]`` -- the shape
+    ``parameterized`` asserts for a directly supplied ``gtm_psd``.
+    """
+    if nmodes % 2 != 0:
+        raise ValueError(f"nmodes must be even, got {nmodes}")
+    rng = np.random.default_rng(seed)
+    basis = []
+    for p in psrs:
+        t = np.asarray(p.toas, dtype=np.float64)
+        x = 2 * (t - t.min()) / (t.max() - t.min()) - 1.0
+        cols = [np.cos(k * np.arccos(np.clip(x, -1, 1))) for k in range(2, nmodes + 2)]
+        M = np.column_stack(cols)
+        # Nudge off exact degeneracy so the QR is not artificially perfect.
+        M += rng.normal(scale=1e-6, size=M.shape)
+        Q, _ = np.linalg.qr(M)
+        scale = 1e-6 * 10.0 ** (-0.15 * np.arange(nmodes))
+        basis.append(Q[:, :nmodes] * scale[None, :])
+    # Non-constant across modes AND pulsars, so a mis-sliced gtm block shows up.
+    gtm_psd = np.array([[10.0 ** (-0.1 * m - 0.05 * i) for i in range(len(psrs))]
+                        for m in range(nmodes)])
+    return basis, gtm_psd

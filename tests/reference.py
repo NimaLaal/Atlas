@@ -179,6 +179,8 @@ def build_phi(
     irn_psd,
     gwb_psd=None,
     orf=None,
+    dm_psd=None,
+    gtm_psd=None,
     tm_prior=1e40,
     pad_prior=1.0,
 ):
@@ -199,6 +201,14 @@ def build_phi(
     orf : (npsr, npsr) array or None
         Overlap reduction function, ``orf[i, i] == 1``.
 
+    dm_psd : (nbin_dm, npsr) array or None
+        Per-pulsar DM PSD at bin resolution, occupying its own block after the
+        IRN block -- the layout ``";dm"`` produces.
+    gtm_psd : (n_gtm_modes, npsr) array or None
+        Adaptus prior variance, already at *mode* resolution (a directly
+        supplied ``gtm_psd`` is not duplicated across quadratures), in its own
+        block after IRN and DM.
+
     The GWB occupies the *first* ``2 * nbin_gwb`` Fourier columns, nested at
     the head of the IRN block -- the layout ``"unc+cor->unc"`` produces.
     """
@@ -218,6 +228,22 @@ def build_phi(
     for p in range(npsr):
         base = p * ncol + n_tm
         phi[base:base + n_irn_modes, base:base + n_irn_modes] += np.diag(irn_modes[:, p])
+
+    # DM and Adaptus: separate blocks after the IRN block, in that order.
+    offset = n_irn_modes
+    if dm_psd is not None:
+        dm_modes = np.repeat(np.asarray(dm_psd, dtype=np.float64), 2, axis=0)
+        for p in range(npsr):
+            base = p * ncol + n_tm + offset
+            phi[base:base + dm_modes.shape[0], base:base + dm_modes.shape[0]] += \
+                np.diag(dm_modes[:, p])
+        offset += dm_modes.shape[0]
+    if gtm_psd is not None:
+        gtm = np.asarray(gtm_psd, dtype=np.float64)
+        for p in range(npsr):
+            base = p * ncol + n_tm + offset
+            phi[base:base + gtm.shape[0], base:base + gtm.shape[0]] += np.diag(gtm[:, p])
+        offset += gtm.shape[0]
 
     # GWB: nested at the head of the IRN block, with ORF cross-terms.
     if gwb_psd is not None:

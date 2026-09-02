@@ -1218,13 +1218,26 @@ class SuperSignal:
         # 'cor' and 'det' are already single slices, so they stay contiguous
         # by construction — no conversion needed.
         cor_idx = self.signal_comb_idxs['cor']
-        timing_slice = self.signal_comb_idxs['timing']
-        unc_slice = self.signal_comb_idxs['unc']
-        if self.has_gtm:
-            gtm_slice = self.signal_comb_idxs['gtm']
-            P_idx = sutils.merge_slices(timing_slice, unc_slice, gtm_slice)  # 'P' = timing + unc + gtm
-        else:
-             P_idx = sutils.merge_slices(timing_slice, unc_slice)  # 'P' = timing + unc
+        # 'P' is every non-GWB stochastic block: the linear timing model, the
+        # intrinsic red noise, DM noise and the Adaptus basis, in column order.
+        # `dm` was missing here, so with a `dm` block in the model string the
+        # reparameterised index set omitted its columns entirely and the phi
+        # diagonal no longer matched the sliced TNT -- DM noise could be built
+        # but never evaluated.
+        # Every key is optional: a model string need not carry an 'ltm' prefix,
+        # and need not include every stochastic block. Indexing these
+        # unconditionally is what made both reparameterised likelihoods raise
+        # KeyError('timing') for any string without 'ltm'.
+        P_parts = [self.signal_comb_idxs[k]
+                   for k in ('timing', 'unc', 'dm', 'gtm')
+                   if k in self.signal_comb_idxs]
+        if not P_parts:
+            raise ValueError(
+                f"model string {self.signal_combination_string!r} has no "
+                "non-GWB stochastic block, so there is nothing to marginalise "
+                "or reparameterise over"
+            )
+        P_idx = sutils.merge_slices(*P_parts)
         det_idx = None
         if self.has_det:
             det_idx = self.signal_comb_idxs['det']

@@ -40,7 +40,7 @@ m = H.build(model_string="unc+cor->unc", linear_timing=False, orf_name="zero")
 red = m.red_params(irn_overrides={1: (-14.7, 4.0)})
 atlas = float(m.rn.ln_likelihood_curn(m.helpers, red))
 T, N, Nfull, r = H.dense_bundle(m)
-irn, gwb = H.psd_pieces(m, red)
+irn, _, gwb = H.psd_pieces(m, red)
 phi = ref.build_phi(m.npsr, 2 * m.n_irn, 0, [0] * m.npsr, irn, gwb, orf=None)
 exp = ref.marginal_logL(r, T, phi, Nfull) + ref.atlas_offset(r.size)
 record("ln_likelihood_curn vs dense marginal", abs(atlas - exp) / abs(exp), 1e-12)
@@ -116,7 +116,7 @@ for fx, ec in (("mdc1_5", False), ("ng15_3", True)):
     rr2 = mr.red_params()
     a2 = float(mr.rn.ln_likelihood_curn(mr.helpers, rr2))
     Tr, Nr_, Nfr, rr3 = H.dense_bundle(mr)
-    ir, gw = H.psd_pieces(mr, rr2)
+    ir, _, gw = H.psd_pieces(mr, rr2)
     phr = ref.build_phi(mr.npsr, 2 * mr.n_irn, 0, [0] * mr.npsr, ir, gw, orf=None)
     e2 = ref.marginal_logL(rr3, Tr, phr, Nfr) + ref.atlas_offset(rr3.size)
     record(f"ln_likelihood_curn vs dense [{fx}]", abs(a2 - e2) / abs(e2), 1e-9,
@@ -131,6 +131,19 @@ for fx, ec in (("mdc1_5", False), ("ng15_3", True)):
     vp2 = float(mq.rn.partial_marg_lnposterior(mq.helpers, rq, jnp.asarray(zp2))[0]) + 0.5 * np.sum(zp2 ** 2)
     record(f"partial_marg vs reparam [{fx}]", abs(vr2 - vp2) / abs(vr2), 1e-9,
            f"tm cols {mq.tm_widths}")
+
+# Per model string: the corpus the Stage 1 bit-identity harness will run over.
+print("\nModel-string corpus")
+for case, kw in H.CORPUS.items():
+    mc = H.build(orf_name="zero", **kw)
+    rc = mc.red_params(irn_overrides={1: (-14.7, 4.0)})
+    rgc = np.random.default_rng(32)
+    zrc = rgc.normal(size=(mc.npsr, mc.rn.nmodes))
+    zpc = rgc.normal(size=(mc.npsr, 2 * mc.n_gwb))
+    vrc = float(mc.rn.lnposterior_reparam(mc.helpers, rc, jnp.asarray(zrc))[0]) + 0.5 * np.sum(zrc ** 2)
+    vpc = float(mc.rn.partial_marg_lnposterior(mc.helpers, rc, jnp.asarray(zpc))[0]) + 0.5 * np.sum(zpc ** 2)
+    record(f"partial_marg vs reparam [{case}]", abs(vrc - vpc) / abs(vrc), 1e-9,
+           f"{mc.rn.nmodes} cols")
 
 out = Path(__file__).resolve().parent / "noise_floors.json"
 out.write_text(json.dumps(dict(

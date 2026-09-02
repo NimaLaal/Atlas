@@ -9,32 +9,49 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 import inspect
 
-def merge_slices(*slices):
-    """Combine slices into a single contiguous slice if possible (fast path),
-    otherwise return a concatenated index array covering the same positions."""
-    slices = sorted(slices, key=lambda s: s.start)
-    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
-    if contiguous:
-        return slice(slices[0].start, slices[-1].stop)
-    return jnp.concatenate([jnp.arange(s.start, s.stop) for s in slices])
-
 import numpy as np
 
-def merge_slices_unique(*slices):
-    """Combine slices into a single contiguous slice if possible (fast path),
-    otherwise return a concatenated, deduplicated, sorted index array covering
-    the same positions.
 
-    NOTE: slice.start/.stop must be static Python ints here (not traced values) —
-    this is resolved entirely at trace time and the result is embedded as a
-    constant, so it's safe to call from inside jit-compiled code.
+def _as_positions(x):
+    """A slice or an index array -> a static 1-D numpy array of positions.
+
+    Column bookkeeping is resolved at trace time and embedded as a constant, so
+    it must stay in numpy: returning a jnp array here makes the result a tracer
+    when it is first built inside a jitted function, and any later code that
+    reads ``.start`` off it then fails with a confusing
+    ``DynamicJaxprTracer has no attribute start``.
     """
-    slices = sorted(slices, key=lambda s: s.start)
-    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
-    if contiguous:
-        return slice(slices[0].start, slices[-1].stop)
-    idx = np.unique(np.concatenate([np.arange(s.start, s.stop) for s in slices]))
-    return jnp.array(idx)
+    if isinstance(x, slice):
+        return np.arange(x.start, x.stop)
+    return np.asarray(x)
+
+
+def merge_slices(*slices):
+    """Combine slices into a single contiguous slice if possible (fast path),
+    otherwise return a concatenated index array covering the same positions.
+
+    Accepts slices or index arrays, and composes with itself: the result of one
+    ``merge_slices`` can be an argument to another.
+    """
+    if all(isinstance(s, slice) for s in slices):
+        ordered = sorted(slices, key=lambda s: s.start)
+        if all(prev.stop == nxt.start for prev, nxt in zip(ordered[:-1], ordered[1:])):
+            return slice(ordered[0].start, ordered[-1].stop)
+    return np.concatenate([_as_positions(s) for s in slices])
+
+
+def merge_slices_unique(*slices):
+    """Like :func:`merge_slices`, but deduplicated and sorted.
+
+    Used where the inputs may overlap -- notably the P block and ``cor``, whose
+    columns are shared rather than adjacent when the model string reads
+    ``"unc+cor->unc"``.
+    """
+    if all(isinstance(s, slice) for s in slices):
+        ordered = sorted(slices, key=lambda s: s.start)
+        if all(prev.stop == nxt.start for prev, nxt in zip(ordered[:-1], ordered[1:])):
+            return slice(ordered[0].start, ordered[-1].stop)
+    return np.unique(np.concatenate([_as_positions(s) for s in slices]))
 
 def block_slice(idx0, idx1=None):
     """Return a (row, col) index pair usable as `TNT[:, row, col]` for a block
