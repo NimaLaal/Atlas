@@ -23,6 +23,11 @@ dependencies = [
     "numpyro",
     "enterprise-pulsar",
     "joblib",
+    # Hard, module-level imports on the main path, previously undeclared:
+    "scikit-learn",   # signals/factorized/base.py (TruncatedSVD, PCA)
+    "tqdm",           # nMatrix/base.py, signals/factorized/base.py, sim.py
+    "tqdm-joblib",    # pulsar.py, sim.py, signals/factorized/base.py
+    "pint-pulsar",    # pulsar.py imports pint.logging directly
 ]
 
 [project.optional-dependencies]
@@ -36,8 +41,17 @@ test = [
 notebooks = [
     "corner",
     "matplotlib",
-    "tqdm",
-    "tqdm_joblib",
+]
+
+# ATLAS/experimental/: the normalising-flow and SMBH-population code that
+# Stage 7 of the development plan will promote back. `torch` is used only by
+# astro.py for SobolEngine during offline training-set generation and must
+# never be reachable at sampling time.
+experimental = [
+    "dm-haiku",
+    "distrax",
+    "optax",
+    "torch",
 ]
 
 [tool.setuptools.packages.find]
