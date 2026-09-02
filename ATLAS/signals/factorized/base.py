@@ -581,6 +581,7 @@ class GaussianTiming:
                  name,
                  data,
                  nmodes,
+                 gtm_psd = None,
                  lower_bound_psd = None,
                  upper_bound_psd = None,
                  timing_model = None,
@@ -601,7 +602,8 @@ class GaussianTiming:
             raise ValueError(f"Expected an even integer for `nmodes`, got {nmodes}.")
         self.nmodes = nmodes
         self.nfreqs = int(nmodes/2)
-
+        self.gtm_psd = gtm_psd
+        
         # PSD reparameterization
         if lower_bound_psd is None and upper_bound_psd is None:
             psd_function = make_free_spectrum(self.nfreqs)
@@ -628,7 +630,7 @@ class GaussianTiming:
 
         if basis is None:
             self.tm_model = timing_model
-            self.U, self.explained_variance_ratio = self._get_basis()
+            self.U, self.explained_variance_ratio, self.timing_residual_training_set = self._get_basis()
 
         else:
             self.U = basis
@@ -692,7 +694,7 @@ class GaussianTiming:
                     explained_variance_ratio.append(ans[1])
                     break
 
-        return timing_bases, explained_variance_ratio
+        return timing_bases, explained_variance_ratio, timing_residual_training_set
 
 class SuperSignal:
     """A signal class for a pulsar-independent free spectrum red noise (IRN) signal.
@@ -990,70 +992,42 @@ class SuperSignal:
         needed for likelihood evaluation. Data analysis settings are extracted from the
         data object.
 
+        The T-matrix is passed to the jitted function as a *traced argument*, never
+        bound into the partial. Binding it makes it a compile-time constant, and XLA
+        then writes it into the executable as a literal -- twice over, since it also
+        keeps a pre-tiled copy for the GEMM, and again for every epoch-gather that
+        cannot be constant-folded once the white noise is a runtime value. On the
+        NANOGrav 15-year set that inflated the compiled helper build to 9.5 GB, past
+        what a 24 GB card will load. As an argument it is the buffer we already own.
+
         Returns
         -------
-        new_func: callable
-            Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
+        callable
+            Function which returns TNT, TNr, rNr, logdet_N, etc. helper arrays. It
+            accepts an optional ``red_noise_basis`` to override the default T-matrix
+            (used by the chromatic-index path, which rescales the DM columns).
         """
-        if not self.has_dm:
-            if self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        bound = dict(N_list = self.data.Nmat)
+        if self.fixed_wn:
+            bound['white_noise_params'] = self.data.fixed_white_noise_params
+        if self.fixed_res:
+            bound['reff'] = jnp.concat(self.data.raw_residuals)[:, None]
 
-            elif not self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        core = jit(partial(self.update_white_matrix_products_unjitted, **bound))
 
-            elif not self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        def get_helpers(red_noise_basis = None, **kwargs):
+            if red_noise_basis is None:
+                red_noise_basis = self.get_Fmat_concat
+            return core(red_noise_basis = red_noise_basis, **kwargs)
 
-            elif self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                red_noise_basis = self.get_Fmat_concat,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-                return jit(new_func)
-        else:
-            if self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                red_noise_basis = self.get_Fmat_concat,
-                                )
-                return jit(new_func)
+        # The jitted core, so callers (and the profiler) can lower/compile it with the
+        # T-matrix as a genuine argument. NOTE: wrapping ``get_helpers`` in a further
+        # jit re-captures the default T-matrix as a compile-time constant, which is
+        # exactly what this change exists to avoid -- pass ``red_noise_basis``
+        # explicitly from the outermost jitted function instead.
+        get_helpers.core = core
 
-            elif not self.fixed_wn and not self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                )
-                return jit(new_func)
-
-            elif not self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],
-                                )
-                return jit(new_func)
-
-            elif self.fixed_wn and self.fixed_res:
-                new_func = partial(self.update_white_matrix_products_unjitted,
-                                N_list = self.data.Nmat,
-                                white_noise_params = self.data.fixed_white_noise_params,
-                                reff = jnp.concat(self.data.raw_residuals)[:, None],)
-                return jit(new_func)
+        return get_helpers
 
     def model_maker(self):
         """Add a specific parameterization of the power spectral density based
@@ -1080,6 +1054,7 @@ class SuperSignal:
                 gtm_helper_dictionary = self.signal_map['gtm'].psd_reparam_helper,
                 gtm_bins              = self.signal_map['gtm'].nfreqs,
                 f_gtm                 = self.signal_map['gtm'].freqs,
+                gtm_psd               = self.signal_map['gtm'].gtm_psd 
             )
 
         if self.has_dm:
@@ -1198,84 +1173,6 @@ class SuperSignal:
         # just make each individual pulsar's Sigma matrix instead
         Sigma = TNT.at[:, self._diag_idx, self._diag_idx].add(phiinv) # [npsr, nmodes, nmodes]
         return Sigma # List of arrays [npsr, nmodes, nmodes]
-        
-    @jit_method
-    def lnposterior_reparam(self, helpers, red_params, z):
-        """
-        This method evaluates the posterior under a reparameterization of the Fourier
-        coefficients. The coefficients represent Gaussian processes described by phi_cube.
-        Call this method within gradient-based samplers.
-        NOTE: the reparameterization is based on the posterior of the coeffcients.
-        Parameters
-        ----------
-        helpers : tuple
-            The helper objects (TNT, TNr, rNr, logdet_N) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        red_noise_cov : array
-            The red noise covaraince matrix
-            over FREQUENCY! [nfreqs, npsr, npsr]
-        z : array
-            "Whitened coefficients", [npsr, nmode]
-        Returns
-        -------
-        tuple
-            Fourier coefficients with variance imposed by spectral model [npsr, nmodes] and
-            the log-determinant of the Jacobian of the coordinate transformation [float].
-        """
-        TNT, TNr, rNr, logdet_N = helpers
-        red_noise_cov = self.model.get_phi_mat_full(red_params)
-        if self.npsrs == 1:
-            phiinvs_diags = jnp.repeat(1/red_noise_cov, 2, axis = 0) #[nmodes, npsrs]
-            logdet_phimat = 2 * jnp.sum(jnp.log(red_noise_cov)) #2 is to account for 2*nfreq=nmodes
-        else:
-            phiinvs, logdet_phimat = self.model.get_phi_mat_inv(red_noise_cov)
-            phiinvs_diags = phiinvs.diagonal(axis1 = -2, axis2 = -1) #[nmodes, npsrs]
-
-        if self.linear_timing and not self.marg_tm:
-            phiinvs_diags_ltm = jnp.full(shape = (self.nmodes, self.npsrs), fill_value = self.lowest_value_eq_to_zero)
-            phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
-            # set prior variance of padded parameters to one for stable transformation
-            phiinvs_diags = phiinvs_diags.at[:self.linear_timing_model_size, :].add(self._pad_mask.T)
-
-        # Posterior precision Cholesky (cho_factor equivalent), batched over pulsars
-        Sigma_inv = TNT.at[:, self._diag_idx , self._diag_idx ].add(phiinvs_diags.T)     # [npsr, nmodes, nmodes]
-        Sigma_inv_L = jsl.cho_factor(Sigma_inv, lower = True)  # [npsr, nmodes, nmodes]
-
-        # MAP coefficients via cho_solve pattern: forward then back substitution
-        a_hat = jsl.cho_solve(Sigma_inv_L, TNr[..., None])
-
-        # Standardizing transform via back substitution
-        Lz = jax.lax.linalg.triangular_solve(
-            Sigma_inv_L[0], z[..., None], left_side=True, lower=True, transpose_a=True,
-        )  # L^T Lz = z
-
-        coeff = a_hat + Lz  # [npsr, nmodes, 1]
-
-        lndet_Jac = -jnp.sum(jnp.log(Sigma_inv_L[0].diagonal(axis1=-2, axis2=-1)))
-
-        # Log-likelihood
-        aFNr      = jnp.sum(coeff[..., 0] * TNr)
-        aFNFa     = jnp.sum(coeff.mT @ TNT @ coeff)
-        lnlike_value = aFNr - 0.5 * aFNFa
-
-        if self.npsrs == 1:
-            lnprior_value = -0.5 * ((coeff[:, self.linear_timing_model_size:, 0]**2 * phiinvs_diags[self.linear_timing_model_size:, :].T).sum() + logdet_phimat)
-        else:
-            aG = coeff[:, self.linear_timing_model_size:] #[npsr, 2 * nfreq, 1]
-            lnprior_value = -0.5 * ((aG.transpose(1, 2, 0) @ phiinvs @ aG.transpose(1, 0, 2)).sum() + logdet_phimat)
-
-        if self.linear_timing and not self.marg_tm:
-            # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
-            # these parameters do not impact the likelihood, prior, and are uncorrelated with all other parameters
-            # so this should not effect parameter estimation, but merely provides some curvature for HMC to latch
-            # onto when sampling 
-            padded_logpdf = -0.5 * jnp.sum((self._pad_mask * coeff[:, :self.linear_timing_model_size, 0])**2)
-        else:
-            padded_logpdf = 0.
-
-        log_density = lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N) + padded_logpdf
-
-        return log_density, coeff[..., 0]
 
     def ln_likelihood_curn(self, helpers, params):
         """Get the Fourier coefficient marginalized likelihood function for 
@@ -1323,22 +1220,16 @@ class SuperSignal:
         cor_idx = self.signal_comb_idxs['cor']
         timing_slice = self.signal_comb_idxs['timing']
         unc_slice = self.signal_comb_idxs['unc']
-        gtm_slice = self.signal_comb_idxs['gtm']
-
-        P_idx = sutils.merge_slices(timing_slice, unc_slice, gtm_slice)  # 'P' = timing + unc + gtm
-
+        if self.has_gtm:
+            gtm_slice = self.signal_comb_idxs['gtm']
+            P_idx = sutils.merge_slices(timing_slice, unc_slice, gtm_slice)  # 'P' = timing + unc + gtm
+        else:
+             P_idx = sutils.merge_slices(timing_slice, unc_slice)  # 'P' = timing + unc
         det_idx = None
         if self.has_det:
             det_idx = self.signal_comb_idxs['det']
 
         return cor_idx, P_idx, det_idx
-
-    def partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
-        """Public entry point — dispatches to the cached jitted implementation."""
-        if self.has_det:
-            return self._jitted_partial_marg_lnposterior(helpers, red_params, z, D_params)
-        else:
-            return self._jitted_partial_marg_lnposterior(helpers, red_params, z)
 
     @cached_property
     def _jitted_partial_marg_lnposterior(self):
@@ -1347,6 +1238,173 @@ class SuperSignal:
             return jit(self.__partial_marg_lnposterior)
         else:
             return jit(partial(self.__partial_marg_lnposterior, D_params=None))
+
+    @cached_property
+    def lnposterior_reparam_helper(self):
+        """Index slices for lnposterior_reparam.
+
+        Unlike partial_marg_lnposterior, lnposterior_reparam jointly
+        reparameterizes ALL non-det modes (timing [+ gtm] + unc + cor) via z —
+        there's no analytic marginalization here, so 'cor' and 'P' don't need
+        to stay separate. Merge them into one contiguous 'reparam' block,
+        with the merge order matching how partial_marg_lnposterior_helper
+        itself is built (P = timing+unc+[gtm] first, cor appended after) so
+        that `linear_timing_model_size`-based slicing of the timing-model
+        prefix still lines up correctly.
+
+        ASSUMPTION: this assumes the underlying T matrix column order is
+        [timing (+unc+gtm) | cor | det] i.e. matches partial_marg's P/cor/det
+        layout. If your T matrix actually orders columns differently, adjust
+        the merge_slices call below accordingly.
+        """
+        cor_idx, P_idx, det_idx = self.partial_marg_lnposterior_helper
+        reparam_idx = sutils.merge_slices_unique(P_idx, cor_idx)
+        return reparam_idx, det_idx
+
+    @cached_property
+    def _jitted_lnposterior_reparam(self):
+        """Built once per instance and reused — avoids re-tracing on every call."""
+        if self.has_det:
+            return jit(self.__lnposterior_reparam)
+        else:
+            return jit(partial(self.__lnposterior_reparam, D_params=None))
+
+    def partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
+        """Public entry point — dispatches to the cached jitted implementation."""
+        if self.has_det:
+            return self._jitted_partial_marg_lnposterior(helpers, red_params, z, D_params)
+        else:
+            return self._jitted_partial_marg_lnposterior(helpers, red_params, z)
+            
+    def lnposterior_reparam(self, helpers, red_params, z, D_params=None):
+        """Public entry point — dispatches to the cached jitted implementation.
+
+        Mirrors partial_marg_lnposterior: det signal is only touched when
+        self.has_det is True, in which case D_params = (det_params,
+        psr_phases, psr_dists) must be supplied.
+        """
+        if self.has_det:
+            return self._jitted_lnposterior_reparam(helpers, red_params, z, D_params)
+        else:
+            return self._jitted_lnposterior_reparam(helpers, red_params, z)
+
+    def __lnposterior_reparam(self, helpers, red_params, z, D_params=None):
+        """
+        Evaluates the posterior under a reparameterization of the Fourier
+        coefficients (Gaussian processes described by phi_cube), jointly with
+        an optional deterministic (e.g. CW) signal. Call within gradient-based
+        samplers.
+
+        Parameters
+        ----------
+        helpers : tuple
+            (TNT, TNr, rNr, logdet_N) for each pulsar, over the FULL unified
+            design matrix (timing [+ gtm] + unc + cor [+ det], whichever are
+            present) — the same TNT/TNr used by partial_marg_lnposterior.
+            [npsr, nmode_total, nmode_total], [npsr, nmode_total]
+        red_params : array
+            Spectral model parameters for the red noise / GWB covariance.
+        z : array
+            "Whitened coefficients" for the reparameterized (non-det) modes,
+            [npsr, n_reparam].
+        D_params : tuple or None
+            (det_params, psr_phases, psr_dists). Required iff self.has_det.
+
+        Returns
+        -------
+        tuple
+            (log_density, coeff) — coeff are the reparameterized (non-det)
+            Fourier coefficients, [npsr, n_reparam].
+        """
+        TNT, TNr, rNr, logdet_N = helpers
+        reparam_idx, det_idx = self.lnposterior_reparam_helper
+
+        # slice out the jointly-reparameterized block (timing [+gtm] + unc + cor)
+        RR = TNT[:, *sutils.block_slice(reparam_idx)]        # [npsr, nreparam, nreparam]
+        Rr = TNr[:, sutils.vec_slice(reparam_idx), None]      # [npsr, nreparam, 1]
+
+        red_noise_cov = self.model.get_phi_mat_full(red_params)
+        if self.npsrs == 1:
+            if self.has_gtm:
+                phiinvs_diags = 1 / red_noise_cov  # [nmodes, npsrs]
+                logdet_phimat = jnp.sum(jnp.log(red_noise_cov))
+            else:
+                phiinvs_diags = jnp.repeat(1 / red_noise_cov, 2, axis=0)  # [nmodes, npsrs]
+                logdet_phimat = 2 * jnp.sum(jnp.log(red_noise_cov))  # 2 accounts for 2*nfreq=nmodes
+        else:
+            phiinvs, logdet_phimat = self.model.get_phi_mat_inv(red_noise_cov)
+            phiinvs_diags = phiinvs.diagonal(axis1=-2, axis2=-1)  # [nmodes, npsrs]
+
+        if self.linear_timing and not self.marg_tm:
+            phiinvs_diags_ltm = jnp.full(shape=(self.nmodes, self.npsrs),
+                                        fill_value=self.lowest_value_eq_to_zero)
+            phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
+            # set prior variance of padded parameters to one for stable transformation
+            phiinvs_diags = phiinvs_diags.at[:self.linear_timing_model_size, :].add(self._pad_mask.T)
+
+        # deterministic signal, sliced directly out of the same unified TNT/TNr
+        # (no separately-built design matrix / helper tensors)
+        if self.has_det:
+            det_params, psr_phases, psr_dists = D_params
+            a_det = self.det_signal.get_coeffs_func(det_params, psr_phases, psr_dists)[..., None]  # [npsr, ndet, 1]
+
+            DD = TNT[:, *sutils.block_slice(det_idx)]                    # [npsr, ndet, ndet]
+            RD = TNT[:, *sutils.block_slice(reparam_idx, det_idx)]       # [npsr, nreparam, ndet]
+            Dr = TNr[:, sutils.vec_slice(det_idx), None]                 # [npsr, ndet, 1]
+
+            RDas = RD @ a_det  # [npsr, nreparam, 1]
+        else:
+            RDas = 0.
+
+        # Posterior precision Cholesky (cho_factor equivalent), batched over pulsars
+        diag_idx = jnp.arange(RR.shape[-1])
+        Sigma_inv = RR.at[:, diag_idx, diag_idx].add(phiinvs_diags.T)  # [npsr, nreparam, nreparam]
+        Sigma_inv_L = jsl.cho_factor(Sigma_inv, lower=True)
+
+        # MAP coefficients — shifted by the deterministic signal's contribution when present
+        a_hat = jsl.cho_solve(Sigma_inv_L, Rr - RDas)
+
+        # Standardizing transform via back substitution
+        Lz = jax.lax.linalg.triangular_solve(
+            Sigma_inv_L[0], z[..., None], left_side=True, lower=True, transpose_a=True,
+        )  # L^T Lz = z
+
+        coeff = a_hat + Lz  # [npsr, nreparam, 1]
+
+        lndet_Jac = -jnp.sum(jnp.log(Sigma_inv_L[0].diagonal(axis1=-2, axis2=-1)))
+
+        # Log-likelihood (non-det part)
+        aFNr = jnp.sum(coeff[..., 0] * Rr[..., 0])
+        aFNFa = jnp.sum(coeff.mT @ RR @ coeff)
+        lnlike_value = aFNr - 0.5 * aFNFa
+
+        if self.npsrs == 1:
+            lnprior_value = -0.5 * ((coeff[:, self.linear_timing_model_size:, 0]**2 * phiinvs_diags[self.linear_timing_model_size:, :].T).sum() + logdet_phimat)
+        else:
+            aG = coeff[:, self.linear_timing_model_size:]  # [npsr, 2*nfreq, 1]
+            lnprior_value = -0.5 * ((aG.transpose(1, 2, 0) @ phiinvs @ aG.transpose(1, 0, 2)).sum() + logdet_phimat)
+
+        if self.linear_timing and not self.marg_tm:
+            # add probability density for padded (i.e. zero-ed) timing model parameters for HMC sampler
+            # these parameters do not impact the likelihood, prior, and are uncorrelated with all other
+            # parameters so this should not affect parameter estimation, but merely provides some
+            # curvature for HMC to latch onto when sampling
+            padded_logpdf = -0.5 * jnp.sum((self._pad_mask * coeff[:, :self.linear_timing_model_size, 0])**2)
+        else:
+            padded_logpdf = 0.
+
+        # deterministic (e.g. CW) contribution
+        if self.has_det:
+            lnlike_det_add = jnp.sum(a_det.mT @ Dr) \
+                - jnp.sum(coeff.mT @ RDas) \
+                - 0.5 * jnp.sum(a_det.mT @ DD @ a_det)
+        else:
+            lnlike_det_add = 0.
+
+        log_density = lnlike_value + lnprior_value + lndet_Jac - 0.5 * (rNr + logdet_N) \
+            + padded_logpdf + lnlike_det_add
+
+        return log_density, coeff[..., 0]
 
     def __partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
 
@@ -1411,6 +1469,3 @@ class SuperSignal:
 
         result = norm + lnprior + lndet_Jac + jnp.sum(ln_likelihood)
         return result, g
-
-
-    

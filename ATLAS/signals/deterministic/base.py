@@ -106,9 +106,9 @@ class Deterministic:
                                                 self.num_coeff_det + 2, endpoint=False)
                                     for _ in range(self.data.npsrs)])
         self.sparse_toas_det_jax = jnp.array(sparse_toas_det)
-        sparse_toas_scaled_shifted_np = [(sparse_toas - dutils.tref) * dutils.cw_renorm
-                                         for sparse_toas in sparse_toas_det]
-        self.sparse_toas_shifted_scaled = jnp.array(sparse_toas_scaled_shifted_np)
+        # sparse_toas_scaled_shifted_np = [(sparse_toas - dutils.tref) * dutils.cw_renorm
+        #                                  for sparse_toas in sparse_toas_det]
+        # self.sparse_toas_shifted_scaled = jnp.array(sparse_toas_scaled_shifted_np)
         self.Nsparse = sparse_toas_det.shape[1]
         self.freqs_forFFT = jnp.array([np.fft.fftfreq(self.Nsparse, Tspan_ext / self.Nsparse)
                                        for _ in range(self.data.npsrs)])
@@ -159,7 +159,7 @@ class Deterministic:
         """
 
         # get timing delays induced by the deterministic signal over "sparse" (evenly-spaced) TOAs
-        det_residuals = self.get_delays_func(self.sparse_toas_shifted_scaled, self.data.psr_pos,
+        det_residuals = self.get_delays_func(self.sparse_toas_det_jax, self.data.psr_pos,
                                                     det_params, psr_phases, psr_dists)
         # window residuals over extended observation
         det_residuals_windowed = self.Tukey_det * det_residuals
@@ -317,10 +317,10 @@ class JointDeterministic(SuperSignal):
         sparse_toas_det = np.array([np.linspace(first_toa - window_ext, last_toa + window_ext,
                                                 self.num_coeff_det + 2, endpoint=False)
                                     for _ in range(self.data.npsrs)])
-        self.sparse_toas_det_jax = jnp.array(sparse_toas_det)
-        sparse_toas_scaled_shifted_np = [(sparse_toas - dutils.tref) * dutils.cw_renorm
-                                         for sparse_toas in sparse_toas_det]
-        self.sparse_toas_shifted_scaled = jnp.array(sparse_toas_scaled_shifted_np)
+        self.sparse_toas_det_jax = jnp.array(sparse_toas_det) - dutils.tref
+        # sparse_toas_scaled_shifted_np = [(sparse_toas - dutils.tref) * dutils.cw_renorm
+        #                                  for sparse_toas in sparse_toas_det]
+        # self.sparse_toas_shifted_scaled = jnp.array(sparse_toas_scaled_shifted_np)
         self.Nsparse = sparse_toas_det.shape[1]
         self.freqs_forFFT = jnp.array([np.fft.fftfreq(self.Nsparse, Tspan_ext / self.Nsparse)
                                        for _ in range(self.data.npsrs)])
@@ -332,7 +332,7 @@ class JointDeterministic(SuperSignal):
         self.Fs_det_concat = jnp.concat(Fs_det, axis=0)
 
 
-    def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
+    def update_white_matrix_products_unjitted(self, red_noise_basis, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
         This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
@@ -360,7 +360,7 @@ class JointDeterministic(SuperSignal):
             The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar.
             [npsr, nmode, nmode], [npsr, nmode]
         """
-        return N_list.get_red_det_helpers(red_noise_basis = self.get_Fmat_concat,
+        return N_list.get_red_det_helpers(red_noise_basis = red_noise_basis,
                                           det_signal_basis = self.Fs_det_concat,
                                           residuals = reff,
                                           white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN, FDNFD, FDNr, FNFD]
@@ -399,7 +399,7 @@ class JointDeterministic(SuperSignal):
         """
 
         # get timing delays induced by the deterministic signal over "sparse" (evenly-spaced) TOAs
-        det_residuals = self.get_delays_func(self.sparse_toas_shifted_scaled, self.data.psr_pos,
+        det_residuals = self.get_delays_func(self.sparse_toas_det_jax, self.data.psr_pos,
                                                     det_params, psr_phases, psr_dists)
         # window residuals over extended observation
         det_residuals_windowed = self.Tukey_det * det_residuals

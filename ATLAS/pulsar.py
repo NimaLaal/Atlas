@@ -15,8 +15,22 @@ import logging
 
 MAX_JOBS = 8
 LINEAR_PARAMS = ['offset','f','dm','fd','jump'] # Matt also said NE_SW, but I dunno what that is
+TEMPO2_ALIASES = ('tempo2', 't2', 'libstempo')
 
-def load_pulsars(par, tim, use_enterprise=True):
+def _backend_flags(psr):
+    """Backend flags for an enterprise pulsar, tolerant of flagless TOAs.
+
+    enterprise's ``backend_flags`` raises when the TOAs carry no flags at all,
+    which is the case for the IPTA mock data challenge sets read through
+    tempo2. Fall back to a single unnamed backend -- what the PINT reader
+    yields for the very same files.
+    """
+    try:
+        return list(psr.backend_flags)
+    except (ValueError, AttributeError):
+        return [''] * len(psr.toas)
+
+def load_pulsars(par, tim, use_enterprise=True, timing_package='pint'):
     # par could be a list of par files, a directory string, or a single par file string
     if isinstance(par, list): # list of par file strings
         par_files = par
@@ -43,11 +57,14 @@ def load_pulsars(par, tim, use_enterprise=True):
     assert len(par_files) == len(tim_files), 'Number of par files must match number of tim files'
 
     def foo(i):
-        pname = par_files[i].split('/')[-1].split('_')[0]
-        tname = tim_files[i].split('/')[-1].split('_')[0]
+        # strip the extension before splitting, so that datasets named plainly
+        # ("J0030+0451.par") pair up as well as NANOGrav's "{PSR}_PINT_DMX.par"
+        pname = par_files[i].split('/')[-1].rsplit('.', 1)[0].split('_')[0]
+        tname = tim_files[i].split('/')[-1].rsplit('.', 1)[0].split('_')[0]
         assert pname == tname, f'Par file {par_files[i]} and tim file {tim_files[i]} do not match'
 
-        psr = Pulsar(par_files[i], tim_files[i], use_enterprise=use_enterprise)
+        psr = Pulsar(par_files[i], tim_files[i], use_enterprise=use_enterprise,
+                     timing_package=timing_package)
         return psr
     
     psrs = ParallelPbar("Loading pulsars...")(n_jobs=MAX_JOBS)(
@@ -57,17 +74,26 @@ def load_pulsars(par, tim, use_enterprise=True):
     return psrs
 
 class Pulsar:
-    def __init__(self, par, tim, use_enterprise=True):
+    def __init__(self, par, tim, use_enterprise=True, timing_package='pint'):
         self.par_file = par
         self.tim_file = tim
+        self.timing_package = timing_package
 
         # Construct the pulsar using enterprise
-        # when we can construct Mmat with JUG, we can use that entirely 
+        # when we can construct Mmat with JUG, we can use that entirely
         if use_enterprise:
             pint.logging.setup(level="ERROR")
             logging.getLogger('enterprise').setLevel(logging.ERROR)
 
-            psr = E_Pulsar(par, tim, sort=False, drop_pintpsr=False) # keeps psr.model
+            use_tempo2 = str(timing_package).lower() in TEMPO2_ALIASES
+            if use_tempo2:
+                # tempo2 reads TCB par files and every BINARY model (including
+                # tempo2's own auto-dispatching "BINARY T2") natively, so it
+                # loads datasets PINT refuses or silently mis-scales.
+                psr = E_Pulsar(par, tim, timing_package='tempo2',
+                               sort=False, drop_t2pulsar=False) # keeps psr.t2pulsar
+            else:
+                psr = E_Pulsar(par, tim, sort=False, drop_pintpsr=False) # keeps psr.model
 
             self.name = psr.name
 
@@ -76,7 +102,7 @@ class Pulsar:
             self.residuals = jnp.array(psr.residuals)
             self.toaerrs = jnp.array(psr.toaerrs)
             self.freqs = jnp.array(psr.freqs)
-            self.backend_flags = list(psr.backend_flags) # Can't store as jnp array
+            self.backend_flags = _backend_flags(psr) # Can't store as jnp array
 
             # Position stuffs
             self.raj = jnp.double(psr._raj)
@@ -85,8 +111,12 @@ class Pulsar:
 
             # Timing model parameters
             self.fit_param_names = list(psr.fitpars)[1:] # Ignore the offset
-            self.fit_param_values = jnp.array([psr.model[k].value for k in self.fit_param_names], dtype=jnp.float64)
-            self.fit_param_uncertainties = jnp.array([psr.model[k].uncertainty_value for k in self.fit_param_names], dtype=jnp.float64)
+            if use_tempo2:
+                self.fit_param_values = jnp.array([psr.t2pulsar[k].val for k in self.fit_param_names], dtype=jnp.float64)
+                self.fit_param_uncertainties = jnp.array([psr.t2pulsar[k].err for k in self.fit_param_names], dtype=jnp.float64)
+            else:
+                self.fit_param_values = jnp.array([psr.model[k].value for k in self.fit_param_names], dtype=jnp.float64)
+                self.fit_param_uncertainties = jnp.array([psr.model[k].uncertainty_value for k in self.fit_param_names], dtype=jnp.float64)
 
             # Linearized design matrix
             self.Mmat = jnp.array(psr.Mmat)
