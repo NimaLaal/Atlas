@@ -1,216 +1,252 @@
 # ATLAS
 
-A JAX/NumPyro **pulsar-timing-array global fit**.
+Bayesian inference for pulsar timing arrays in JAX, with gradient-based sampling
+over the full parameter space.
 
-A PTA measures nanohertz gravitational waves by looking for a spatially
-correlated red-noise process with the Hellings–Downs signature in the timing
-residuals of tens of millisecond pulsars.
+Standard PTA analyses proceed in stages: fix the timing solution, fit the white
+noise per pulsar, linearise the timing model and marginalise it analytically,
+then sample the red-noise and gravitational-wave-background parameters. The
+staging is a computational convenience, and it means timing and white-noise
+uncertainties never propagate into the background posterior. ATLAS samples
+everything jointly — non-linear timing parameters, EFAC/EQUAD/ECORR, per-pulsar
+intrinsic red noise, DM noise, deterministic sources and the correlated
+background — in a single NumPyro model, using NUTS or HMC-within-Gibbs.
 
-**The thesis.** Conventional PTA analysis *stages* the fit: freeze the timing
-solution, then freeze the white noise, then linearise and marginalise the timing
-model, then sample the red noise and GWB. Timing-model and white-noise
-uncertainty therefore never propagate into the GWB posterior. ATLAS refuses that
-staging and puts every parameter in **one** posterior simultaneously —
-non-linear timing parameters, EFAC/EQUAD/ECORR white noise, per-pulsar intrinsic
-red noise, DM noise, deterministic sources and the correlated background —
-sampled with gradient methods in JAX.
+Most of the design follows from that requirement. The timing kernels are
+differentiable, the Gaussian-process coefficients are sampled non-centred, the
+mass matrix for the non-linear timing block is frozen from JUG's own covariance,
+and the per-pulsar blocks are marginalised analytically wherever possible, all so
+that a posterior of this dimension remains tractable.
 
-Nearly every design decision follows from that. Differentiable timing kernels,
-non-centred reparameterisations, frozen dense mass matrices and analytic block
-marginalisation all exist to make a posterior of this dimension actually
-samplable.
+## Installation
 
----
+```
+pip install -e .              # inference
+pip install -e .[test]        # + pytest
+pip install -e .[notebooks]   # + matplotlib, corner
+```
 
-## The one thing to internalise: the funnel
+Two dependencies are not on PyPI and are therefore not declared in
+`pyproject.toml`:
 
-Every piece of data compresses, exactly once per likelihood evaluation, into
-four arrays — collectively `helpers`:
+- **JUG**, the timing back end, needed for the non-linear timing model and for
+  generating Adaptus bases:
+  `pip install git+https://github.com/MattTMiles/jug.git@dev`.
+  PyPI also hosts an unrelated package called `jug`, so `import jug` succeeding
+  proves nothing; check `import jug.delays.barycentric_jax`.
+- **tempo2**, required by `libstempo`, which `enterprise` imports when it is
+  available. `$TEMPO2` must point at a tempo2 runtime directory. Loading with
+  `timing_package='tempo2'` handles TCB par files and tempo2's `BINARY T2`
+  model, neither of which PINT reads.
 
-| array | shape | meaning |
-|---|---|---|
-| `TNT` | `[npsr, ncol, ncol]` | `Tᵀ N⁻¹ T` |
-| `TNr` | `[npsr, ncol]` | `Tᵀ N⁻¹ r` |
-| `rNr` | scalar | `rᵀ N⁻¹ r`, **summed over the whole array** |
-| `logdet_N` | scalar | `ln det N`, summed over the whole array |
+Neither is needed to build a model or evaluate a likelihood. Only `ATLAS.pulsar`
+and `ATLAS.signals.timing` import them, which is why the test suite runs on a
+bare environment.
 
-**Nothing downstream of `helpers` ever touches a TOA again.** Understand what
-builds them and what consumes them and you understand ATLAS.
+## Quick start
+
+```python
+import jax.numpy as jnp, jax.random as jrandom
+from numpyro.infer import MCMC, NUTS
+
+from ATLAS.data import PTA_Data
+from ATLAS.model import model_maker
+from ATLAS.model_builder import ModelBuilder
+from ATLAS.psd_functions import hd_orf, powerlaw
+from ATLAS.pulsar import load_pulsars
+
+psrs = load_pulsars(parfiles, timfiles, timing_package="pint")
+
+data = PTA_Data(psrs, num_gwb_bins=14, num_irn_bins=30,
+                linear_timing=True, marg_timing=False)
+
+m  = ModelBuilder(data=data)
+wn = m.make_white_noise(stabilize_TNT=True)      # before make_red_noise
+rn = m.make_red_noise("ltm|unc+cor->unc",
+                      irn_psd_function=powerlaw,
+                      gwb_psd_function=powerlaw,
+                      orf_function=hd_orf,
+                      irn_lower_bound_psd=jnp.array([-18., 0.]),
+                      irn_upper_bound_psd=jnp.array([-11., 7.]),
+                      gwb_lower_bound_psd=jnp.array([-18., 0.]),
+                      gwb_upper_bound_psd=jnp.array([-11., 7.]))
+
+raw = jnp.concat(data.raw_residuals)
+lo, hi = wn.get_prior_bounds()
+
+mcmc = MCMC(NUTS(model_maker, max_tree_depth=8), num_warmup=700, num_samples=700)
+mcmc.run(jrandom.key(170817), raw_residuals=raw, super_sig=rn,
+         vary_white=True, wn_lower_bound=lo, wn_upper_bound=hi,
+         tm_model=None, helpers=None, marg_over_non_gwb=False)
+```
+
+White noise must be constructed before red noise. `WhiteCov.__init__` registers
+itself on the data object and `SuperSignal` reads it during construction; the
+reverse order raises an `AttributeError` from inside a `functools.partial`.
+Nothing enforces the ordering.
+
+## Likelihood
+
+For pulsar *a* the residuals are modelled as
+
+```
+    δt_a = M_a ε_a + T_a c_a + n_a ,        n_a ~ N(0, N_a) ,  c ~ N(0, φ)
+```
+
+where `M` is the timing design matrix, `T` collects the Fourier and low-rank
+bases, and `N` carries EFAC, EQUAD and ECORR. Marginalising the Gaussian-process
+coefficients gives the usual Woodbury form (van Haasteren & Levin 2013; van
+Haasteren & Vallisneri 2014), with `C = N + TφTᵀ` and
+`Σ = TᵀN⁻¹T + φ⁻¹`. For the background, `φ_ab(f) = Γ_ab P(f)` with `Γ` the
+Hellings–Downs curve.
+
+All of the data enters the likelihood through four arrays, computed once per
+evaluation and referred to throughout the code as `helpers`:
+
+```
+    TNT        [npsr, ncol, ncol]     Tᵀ N⁻¹ T
+    TNr        [npsr, ncol]           Tᵀ N⁻¹ δt
+    rNr        scalar                 δtᵀ N⁻¹ δt,  summed over the array
+    logdet_N   scalar                 ln det N,    summed over the array
+```
+
+Nothing downstream of `helpers` touches a TOA.
 
 ```
                         PTA_Data  (data.py)
                        /                   \
        WhiteCov (nMatrix/base.py)       SuperSignal (signals/factorized/base.py)
-       N = EFAC²(σ² + EQUAD²)           T = [ M | F_unc | F_dm | U_gtm ]
-         + ECORR, Sherman–Morrison      column-slice map per signal
+       N = EFAC²(σ² + EQUAD²) + ECORR   T = [ M | F_unc | F_dm | U_gtm ]
+       Sherman–Morrison per epoch       column-slice map per signal
                        \                   /
-                        \                 /
                      helpers = (TNT, TNr, rNr, logdet_N)
                                   |
-             SuperSignal.lnposterior_reparam   (or partial_marg_lnposterior)
-             Σ⁻¹ = TNT + φ⁻¹  ->  non-centred draw  ->  log density
+              lnposterior_reparam   /   partial_marg_lnposterior
                                   |
-                     model_maker  (ATLAS/model.py)
+                          model_maker  (model.py)
                                   |
                   NUTS / MultiHMCGibbs  (samplers/canetoadracing.py)
 ```
 
-Two traps in that picture, both real:
+With `vary_white=False` the helpers are built once outside the sampler and
+passed in as a constant. With `vary_white=True` they are rebuilt at every
+leapfrog step, over TOA-length arrays, and that rebuild dominates the cost of a
+joint fit. `bench/bench_gradient.py` measures the ratio for a given
+configuration.
 
-* **Construction order is load-bearing and unenforced.** `WhiteCov.__init__`
-  ends by mutating the data object (`data.add_white_noise_cov(self)`), and
-  `SuperSignal` reads `data.Nmat` during *its* construction. **Build white noise
-  before red noise**, or you get an `AttributeError` from inside a
-  `functools.partial`.
-* With `vary_white=False` the helpers are built **once, outside** the sampler and
-  passed in as a constant. With `vary_white=True` they are rebuilt on **every
-  leapfrog step**, which is the dominant cost of a global fit.
+Three entry points consume the helpers:
 
----
+- `ln_likelihood_curn` marginalises all coefficients with a diagonal `φ`, i.e.
+  the common-uncorrelated-red-noise model. Useful as an exact reference.
+- `lnposterior_reparam` samples all coefficients non-centred, with the full
+  ORF-correlated `φ`.
+- `partial_marg_lnposterior` marginalises the per-pulsar block analytically
+  (timing, intrinsic red noise, DM, Adaptus) and keeps only the background modes
+  explicit. On a 67-pulsar configuration this reduces roughly 37,600 latent
+  coefficients to about 1,900.
 
-## The model string
+The standardising transform in the latter two is built from the diagonal of
+`φ⁻¹`, so it whitens exactly only when the ORF vanishes; with a non-trivial ORF
+it acts as a CURN preconditioner. The densities are correct either way.
 
-The single most important abstraction is the string passed to `make_red_noise`.
-It is a small einsum-flavoured mini-language:
+## Signal specification
+
+Signals are declared with a compact string passed to `make_red_noise`:
 
 ```
-"ltm|unc+cor->unc;gtm"
- └┬┘ └───┬───┘└┬┘ └┬┘
-  │      │     │   └── separate blocks, each gets its own columns
-  │      │     └────── representative: whose basis the shared group uses
-  │      └──────────── shared group: these signals SHARE columns
-  └─────────────────── prepend the linear timing-model design matrix M
+    "ltm|unc+cor->unc;gtm"
+     └┬┘ └───┬───┘└┬┘ └┬┘
+      │      │     │   └── separate blocks, each with its own columns
+      │      │     └────── representative: whose basis the shared group uses
+      │      └──────────── shared group: these signals share columns
+      └─────────────────── prepend the linear timing design matrix M
 ```
 
-Five recognised signal names: `unc` (per-pulsar intrinsic red noise), `cor`
-(correlated GWB), `dm` (dispersion-measure noise), `gtm` (the Gaussian/Adaptus
-timing basis) and `det` (deterministic signal).
+Recognised names are `unc` (intrinsic red noise), `cor` (correlated background),
+`dm` (dispersion measure), `gtm` (Adaptus timing basis) and `det`
+(deterministic).
 
-**"Shared" means overlapping, not adjacent.** When `unc` and `cor` share a
-basis, `cor`'s slice is *nested inside* `unc`'s — the GWB is modelled only in
-the lowest frequency bins, so it occupies the first `2 × n_gwb` columns of the
-IRN block. Two independent Gaussian processes ride the same basis columns with
-distinct coefficient vectors. In φ the overlap becomes an addition; only the
-GWB bins acquire off-diagonal ORF-weighted cross-pulsar terms, and the rest get
-a cheap reciprocal inverse instead of a Cholesky.
+Signals in a shared group *overlap* rather than sit adjacent. The background is
+modelled only in the lowest frequency bins, so `cor` occupies the first
+`2 n_gwb` columns of the `unc` block: two independent processes on the same
+basis columns, with distinct coefficient vectors. In `φ` the overlap is an
+addition, and only the background bins acquire off-diagonal ORF terms — the
+remainder are inverted by reciprocal rather than Cholesky.
 
-Worked layout for `"ltm|unc+cor->unc;dm,gtm"` at 4 GWB bins, 6 IRN bins, 3 DM
+For `"ltm|unc+cor->unc;dm,gtm"` with 4 background bins, 6 red-noise bins, 3 DM
 bins, 8 Adaptus modes and a 6-column timing block:
 
 ```
-col   0 ..  5   timing   M, zero-padded to the array-wide maximum width
-col   6 .. 17   unc      F_irn         <- cor occupies cols 6..13, nested
-col  18 .. 23   dm       F_dm
-col  24 .. 31   gtm      U_adaptus
+    col   0 ..  5    timing    M, zero-padded to the array-wide maximum
+    col   6 .. 17    unc       F_irn        (cor occupies 6..13, nested)
+    col  18 .. 23    dm        F_dm
+    col  24 .. 31    gtm       U_adaptus
 ```
 
-**Padding.** Every pulsar's timing design matrix is padded to a common width so
-the whole thing is one batched `[npsr, ntoa, ncol]` tensor for the GPU. Padded
-columns are identically zero in `T` and are given prior precision 1 (not the
-`1e-40` the real ones get), so HMC sees unit curvature instead of a flat,
-infinitely wide direction.
+Timing design matrices are zero-padded to a common width so the array is one
+batched `[npsr, ntoa, ncol]` tensor. Padded columns carry unit prior precision
+rather than the near-flat `1e-40` given to real timing columns, so that HMC sees
+curvature instead of an unbounded flat direction.
 
-> **Shelf life.** This section describes the pre-registry code. Stage 1 of the
-> development plan replaces the five hardcoded names with a component registry
-> and makes the column map self-describing via `pta.summary()`, at which point
-> the table above should be generated rather than written down.
+This layout is hardcoded around the five signal names above. Adding a sixth
+requires edits in both `parameterized.py` classes as well as
+`signals/factorized/base.py`; replacing it with a component registry is planned.
 
----
+## Timing model
 
-## Four timing-model philosophies
+Four treatments coexist, selected by different flags:
 
-Four mutually exclusive treatments of the timing model coexist in the tree,
-selected by different flags in different places. This is the largest single
-source of confusion in the repository.
+| treatment | selected by | notes |
+|---|---|---|
+| marginalised into `N` | `marg_timing=True` | projection inside the noise matrix; no timing columns in `T`; best conditioned, `cond(Σ) ~ 5×10⁵` |
+| linear, sampled | `linear_timing=True` | `M` prepended to `T`, coefficients sampled under a near-flat prior; currently the production path; `cond(Σ)` reaches `10¹⁸` |
+| non-linear | pass `tm_model` to `model_maker` | physical timing parameters through differentiable JUG kernels; needs a frozen dense mass matrix |
+| Adaptus | `;gtm` in the model string | PCA of prior-predictive timing residuals used as a GP basis; combines with either linear option |
 
-| philosophy | how to select | what it does | status |
-|---|---|---|---|
-| **Marginalise in N** | `marg_timing=True` | absorbs `M` into `N` via a projection; no timing columns in `T` | fastest; `cond(Σ) ≈ 5×10⁵` |
-| **Linear, sampled** | `linear_timing=True` | `M` is prepended to `T`; coefficients sampled with a near-flat `φ⁻¹ = 1e-40` prior | **the current production path**; `cond(Σ)` up to `10¹⁸` |
-| **Non-linear (JUG)** | pass a `tm_model` to `model_maker` | samples physical timing parameters through differentiable JUG kernels | works; needs a frozen dense mass matrix |
-| **Adaptus** | `;gtm` in the model string | PCA of prior-predictive timing residuals, used as a GP design basis | works; combines with either linear option |
+The first two are mutually exclusive and nothing currently enforces that.
 
-Exactly one of the first two should be active. Nothing currently enforces that.
+## Normalisation
 
----
+All three likelihoods drop the same additive constants, so they are mutually
+consistent but are not normalised log-densities:
 
-## Installation
+1. `−(N_toa/2) ln 2π` from the likelihood. Values are larger than normalised
+   ones by that amount — of order `5.5×10⁵` at NANOGrav 15-year scale.
+2. On the `linear_timing=True` path only, `−½ n_tm ln(10⁴⁰)` per pulsar over
+   real (unpadded) timing columns. The flat timing prior enters `Σ` as
+   `φ⁻¹ = 10⁻⁴⁰`, but its log-determinant is never added.
 
-```bash
-pip install -e .            # the sampling path
-pip install -e .[test]      # + pytest
-pip install -e .[notebooks] # + matplotlib, corner
-```
-
-Two dependencies are not installable from PyPI and are therefore not declared:
-
-* **JUG** — the timing back end, needed only for the non-linear timing path and
-  for Adaptus basis generation:
-  `pip install git+https://github.com/MattTMiles/jug.git@dev`.
-  Note the name collision: PyPI's `jug` is an unrelated task-parallelism
-  package, so `import jug` succeeding tells you nothing. Check
-  `import jug.delays.barycentric_jax`.
-* **tempo2** — `ATLAS.pulsar` imports `enterprise`, which imports `libstempo`
-  when it is available, which requires `$TEMPO2` to point at a tempo2 runtime
-  directory. Loading with `timing_package='tempo2'` reads TCB par files and
-  tempo2's auto-dispatching `BINARY T2` model, both of which PINT cannot.
-
-`MultiHMCGibbs` is vendored in `samplers/canetoadracing.py` and is not a
-dependency.
-
-**The likelihood core needs none of that.** `ATLAS.data`,
-`ATLAS.model_builder`, `ATLAS.nMatrix` and `ATLAS.signals.factorized` import
-cleanly without JUG, libstempo, PINT or `$TEMPO2`; only `ATLAS.pulsar` and
-`ATLAS.signals.timing` need them. That is what lets the test suite run on a
-plain CI runner.
-
----
-
-## Normalisation: what the likelihoods drop
-
-All three likelihoods omit constants, and they omit the **same** ones — which is
-why they are comparable with each other but are **not** normalised
-log-densities:
-
-1. `-(N_toa/2) ln 2π` from the likelihood. ATLAS's value is therefore *larger*
-   than a normalised one. At NG15 scale that is ~5.5×10⁵ nats.
-2. On `linear_timing=True` only: `-0.5 · n_tm · ln(1e40)` per pulsar over real
-   (unpadded) timing columns. The flat timing prior enters `Σ` as
-   `φ⁻¹ = 1e-40`, but its log-determinant is never added.
-
-Both are constant in every sampled parameter, so neither affects a posterior, an
-MCMC acceptance ratio, or a Bayes factor between models fitted to the same data.
-They **do** affect any absolute evidence, any comparison across different
-`N_toa` (including "with and without J1713"), and any comparison against a code
-that normalises properly.
-
-`tests/reference.py`'s module docstring is the authoritative statement of this,
-and `tests/test_identities.py` asserts the offset rather than assuming it.
-
----
+Both are parameter-independent, so posteriors, acceptance ratios and Bayes
+factors at fixed `N_toa` are unaffected. Absolute evidences are not, nor are
+comparisons across different `N_toa` (for instance including or excluding a
+pulsar), nor comparisons against codes that normalise fully. The module
+docstring of `tests/reference.py` states the conventions precisely, and the test
+suite asserts the offset rather than assuming it.
 
 ## Tests
 
-```bash
+```
 pip install -e .[test]
-pytest                                  # ~11 s on CPU, no GPU or data needed
-python tools/measure_margins.py         # achieved margins -> tools/noise_floors.json
-python tools/regress.py --null          # harness self-test: must be exactly 0.0
+pytest                            # ~30 s, CPU, no data files required
+pytest -m golden                  # + a 36-pulsar MDC1 fit (GPU, ~10 min)
+python tools/measure_margins.py   # achieved margins -> tools/noise_floors.json
+python tools/regress.py --null    # harness self-test; must be exactly 0.0
 python tools/regress.py --ref-a HEAD~1 --ref-b HEAD
+python bench/bench_gradient.py --case ltm-gtm --fixture ng15_3
 ```
 
-The suite anchors on `tests/reference.py` — a dense float64 NumPy implementation
-of `log N(r; 0, N + TφTᵀ)` that shares no code with ATLAS. Everything else hangs
-off comparisons against it, so "the refactor is correct" never means "correct
-relative to a baseline that may itself be wrong".
+The suite is anchored on `tests/reference.py`, a dense float64 NumPy evaluation
+of `ln N(δt; 0, N + TφTᵀ)` that shares no code with the package. Agreement is
+currently at the `10⁻¹⁶`–`10⁻¹⁵` level for the likelihoods and `3×10⁻⁸` for
+gradients against central differences.
 
-Fixtures are duck-typed: `tests/fixtures/pulsar.py` defines the eight attributes
-ATLAS actually reads off a pulsar object. `tests/fixtures/data/*.npz` carry real
-MDC1 and NG15 data (268 kB, with provenance); regenerate with
-`tools/make_fixtures.py`, which is the only part that needs PINT or tempo2.
+Fixtures are duck-typed rather than `enterprise` objects: `tests/fixtures/`
+defines the eight attributes ATLAS reads from a pulsar and stores real MDC1 and
+NANOGrav data as small `.npz` files with provenance. Regenerating them
+(`tools/make_fixtures.py`) requires PINT or tempo2; using them does not.
 
-`tests/harness.py:CORPUS` is the single definition of "every currently-working
-model string", shared with the regression harness:
+`tests/harness.py:CORPUS` is the reference list of working model strings, shared
+with the regression harness:
 
 | case | model string | columns |
 |---|---|---|
@@ -221,48 +257,52 @@ model string", shared with the regression harness:
 | `ltm-gtm` | `ltm\|unc+cor->unc;gtm` | 26 |
 | `ltm-dm-gtm` | `ltm\|unc+cor->unc;dm,gtm` | 32 |
 
----
+`tools/regress.py` compares two git revisions' log-densities and gradients
+elementwise, and is intended as a gate before refactoring.
 
-## Layout
+## Package layout
 
-| path | lines | what |
+| path | lines | contents |
 |---|---|---|
-| `data.py` | 141 | `PTA_Data` — immutable-ish data plus run flags |
-| `model_builder.py` | 114 | `ModelBuilder` — the public construction API |
-| `model.py` | 84 | `model_maker` — the NumPyro model, top of a run |
-| `nMatrix/base.py` | 1329 | white-noise covariance and its solves |
-| `signals/factorized/base.py` | 1494 | `Red`, `GaussianTiming`, `SuperSignal`, the likelihoods |
-| `parameterized.py` | 1623 | φ assembly and its inverse, per model class |
-| `signals/signals_utils.py` | 480 | basis-string parser, column bookkeeping, SVD |
-| `signals/correlated/base.py` | 608 | `Correlated` — the GWB signal and its ORF |
-| `signals/timing/` | 2266 | non-linear timing model via JUG |
-| `signals/deterministic/` | 713 | CW / deterministic signals |
+| `data.py` | 144 | `PTA_Data`: arrays plus run configuration |
+| `model_builder.py` | 122 | `ModelBuilder`: the construction API |
+| `model.py` | 104 | `model_maker`: the NumPyro model |
+| `nMatrix/base.py` | 1330 | white-noise covariance and its solves |
+| `signals/factorized/base.py` | 1495 | `Red`, `GaussianTiming`, `SuperSignal`, the likelihoods |
+| `parameterized.py` | 1624 | `φ` assembly and inversion |
+| `signals/signals_utils.py` | 565 | model-string parser, column bookkeeping, timing SVD |
+| `signals/correlated/base.py` | 609 | `Correlated`: background signal and ORF |
+| `signals/timing/` | 2268 | non-linear timing model (JUG) |
+| `signals/deterministic/` | 714 | continuous-wave and other deterministic signals |
 | `samplers/canetoadracing.py` | 678 | vendored `MultiHMCGibbs` kernels |
-| `psd_functions.py` | 501 | PSD and ORF library |
+| `psd_functions.py` | 502 | PSD and ORF library |
 | `sim.py` | 357 | simulation |
-| `experimental/` | 4720 | reachable from nothing — see its `__init__` docstring |
+| `experimental/` | 4741 | not reachable from any entry point; see its docstring |
 
----
+Total 15,253 lines across 33 modules.
 
-## Known broken
+## Known issues
 
-Kept honest rather than hidden. The identity suite pins these with
-`xfail(strict=True)` where it can, so a later stage sees them go green.
-
-* **There is no working end-to-end CW path.** `JointDeterministic` cannot be
-  constructed (it calls `super().__init__(signal_helper=…)` against a signature
-  that takes `(signal_list, signal_combination_string, data)`), the CW delay
-  function and its caller disagree about whether `tref` has already been
-  subtracted, and `model_maker` never samples deterministic parameters.
-* **`"ltm|unc;cor"`** — a *separate*, non-overlapping `cor` block — emits column
+- No end-to-end continuous-wave path currently runs. `JointDeterministic`
+  cannot be constructed, the CW delay function and its caller disagree over
+  whether `tref` has already been subtracted, and `model_maker` does not sample
+  deterministic parameters.
+- A separate, non-overlapping `cor` block (`"ltm|unc;cor"`) produces column
   slices past the end of the basis.
-* **`ln_likelihood_curn` cannot be used with `gtm`**: it calls
-  `jnp.repeat(φ, 2)` on a `get_phi_mat_CURN` result that a directly supplied
-  `gtm_psd` has already promoted to mode resolution. The two `parameterized`
-  classes also disagree on whether that method returns an array or a tuple.
-* **The chromatic index is plumbed but connected to nothing.**
+- `ln_likelihood_curn` cannot be used together with a directly supplied
+  `gtm_psd`; the two `parameterized` classes also differ over whether
+  `get_phi_mat_CURN` returns an array or a tuple.
+- The chromatic index is implemented but connected to nothing:
   `SuperSignal.update_red_basis` has no callers.
-* `stabilize_TNT(eps=1e-6)` is a silent no-op for any pulsar with padded timing
-  columns, because padded columns of `T` are exactly zero so `min(diag(TNT))` is
-  exactly 0. Its docstring describes an eigenvalue algorithm that is commented
-  out.
+- `stabilize_TNT` is a no-op for any pulsar with padded timing columns, since
+  those columns are exactly zero and the shift is proportional to
+  `min(diag(TNT))`.
+
+## References
+
+- Hellings & Downs 1983, ApJ 265, L39
+- Lentati et al. 2013, PRD 87, 104021
+- van Haasteren & Levin 2013, MNRAS 428, 1147
+- van Haasteren & Vallisneri 2014, PRD 90, 104012
+- Taylor 2021, *The Nanohertz Gravitational Wave Astronomer*, arXiv:2105.13270
+- Agazie et al. 2023, ApJL 951, L8
