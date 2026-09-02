@@ -32,6 +32,10 @@ OUT = ROOT / "tests" / "fixtures" / "data"
 # are still sub-second.
 NG15_PULSARS = ["J0557+1551", "J0605+3757", "J1012-4235"]
 MDC1_N = 5
+# The full MDC1 array, for the golden run. Small enough to commit (~4,700 TOAs
+# across 36 pulsars over 4.94 yr), which makes the golden fit reproducible
+# without a tempo2 runtime.
+MDC1_ALL = 36
 
 
 def _git_sha():
@@ -66,12 +70,13 @@ def from_enterprise(psr):
 def make_mdc1():
     src = ROOT / "notebooks" / "psrs_mdc1_t2_36psr.pkl"
     if not src.exists():
-        print(f"  skip mdc1_5: {src} not present")
+        print(f"  skip mdc1: {src} not present")
         return
     with open(src, "rb") as fin:
-        psrs = pickle.load(fin)
-    psrs = sorted(psrs, key=lambda p: len(p.toas))[:MDC1_N]
-    fx = [from_enterprise(p) for p in psrs]
+        allpsrs = pickle.load(fin)
+
+    small = sorted(allpsrs, key=lambda p: len(p.toas))[:MDC1_N]
+    fx = [from_enterprise(p) for p in small]
     path = save_fixture(fx, OUT / "mdc1_5.npz", provenance=dict(
         source=str(src.relative_to(ROOT)),
         description="IPTA MDC1 Open-1, loaded via tempo2 (TCB-correct); 5 smallest pulsars",
@@ -79,6 +84,20 @@ def make_mdc1():
     ))
     print(f"  mdc1_5.npz   {path.stat().st_size/1e3:7.1f} kB  "
           + ", ".join(f"{p.name}({p.ntoa})" for p in fx))
+
+    fx = [from_enterprise(p) for p in sorted(allpsrs, key=lambda p: p.name)]
+    path = save_fixture(fx, OUT / "mdc1_36.npz", provenance=dict(
+        source=str(src.relative_to(ROOT)),
+        description=("IPTA MDC1 Open-1, all 36 pulsars, loaded via tempo2. "
+                     "Must be loaded with tempo2, not PINT: the par files carry "
+                     "EPHVER 5 and no UNITS line, so PINT reads TCB as TDB and "
+                     "the residuals become a uniform hash over one pulse period. "
+                     "This is the fixture the golden run uses."),
+        injected_gwb_log10_A=-13.301, injected_gwb_gamma=13 / 3,
+        atlas_sha=_git_sha(),
+    ))
+    print(f"  mdc1_36.npz  {path.stat().st_size/1e3:7.1f} kB  "
+          f"{len(fx)} pulsars, {sum(p.ntoa for p in fx)} TOAs")
 
 
 def make_ng15():
