@@ -1439,14 +1439,24 @@ class SuperSignal:
         Sigma_P = jsl.cho_solve(Sigma_inv_P_chol, I_P)
         logdet_Sigma_inv_P = 2 * jnp.sum(jnp.log(jnp.diagonal(Sigma_inv_P_chol[0], axis1=-2, axis2=-1)))
 
-        # build quadratic form of log-posterior
-        U = 0.5 * Pr.mT @ Sigma_P @ Pr - 0.5 * rNr
+        # Build the quadratic form of the log-posterior.  Every term here stays
+        # PER-PULSAR, shape [npsr, 1, 1], and must stay that way until the single
+        # `jnp.sum` at the end.  Two traps, both of which were live:
+        #   * `rNr` is the ARRAY-WIDE total, accumulated across pulsars inside
+        #     `get_red_helpers`.  Folding it into this per-pulsar array subtracts
+        #     it once per pulsar.  It is applied exactly once, outside the sum.
+        #   * collapsing `U` to a scalar here lets it broadcast back across the
+        #     per-pulsar axis when it is added to `g.mT @ V` below, so the final
+        #     `jnp.sum` counts it `npsr` times over.
+        # Together those scaled the P-block evidence term by `npsr` and `rNr` by
+        # `npsr**2` -- and because `Sigma_P` depends on the red-noise parameters,
+        # that is a parameter-dependent bias, not a constant offset.
+        U = 0.5 * Pr.mT @ Sigma_P @ Pr
         V = -GP @ Sigma_P @ Pr + Gr
         if self.has_det:
             U = U + 0.5 * d.mT @ PD.mT @ Sigma_P @ PD @ d \
                 - Pr.mT @ Sigma_P @ PD @ d - 0.5 * d.mT @ DD @ d + d.mT @ Dr
             V = V + GP @ Sigma_P @ PD @ d - GD @ d
-        U = jnp.sum(U)
 
         W_inv_without_prior = -GP @ Sigma_P @ GP.mT + GG
 
@@ -1467,5 +1477,6 @@ class SuperSignal:
         ln_likelihood = U + g.mT @ V - 0.5 * g.mT @ W_inv_without_prior @ g
         lnprior = -0.5 * (g.transpose(1, 2, 0) @ phiinv_G @ g.transpose(1, 0, 2)).sum()
 
-        result = norm + lnprior + lndet_Jac + jnp.sum(ln_likelihood)
+        # `rNr` enters exactly once, here, outside the per-pulsar sum.
+        result = norm + lnprior + lndet_Jac + jnp.sum(ln_likelihood) - 0.5 * rNr
         return result, g

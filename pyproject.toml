@@ -26,6 +26,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Test suite. Deliberately does NOT need jug / libstempo / $TEMPO2: the tests
+# build models from serialized fixtures and never import ATLAS.pulsar.
+test = [
+    "pytest",
+]
+
 # Extras used only by the demonstration notebooks / plotting.
 notebooks = [
     "corner",
@@ -36,3 +42,12 @@ notebooks = [
 
 [tool.setuptools.packages.find]
 include = ["ATLAS*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: takes more than a few seconds",
+    "gpu: needs a GPU",
+    "golden: full sampling run checked against a recorded posterior",
+    "needs_data: reads par/tim files, so needs PINT or tempo2",
+]
