@@ -332,7 +332,7 @@ class JointDeterministic(SuperSignal):
         self.Fs_det_concat = jnp.concat(Fs_det, axis=0)
 
 
-    def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
+    def update_white_matrix_products_unjitted(self, red_noise_basis, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
         This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
@@ -360,7 +360,7 @@ class JointDeterministic(SuperSignal):
             The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar.
             [npsr, nmode, nmode], [npsr, nmode]
         """
-        return N_list.get_red_det_helpers(red_noise_basis = self.get_Fmat_concat,
+        return N_list.get_red_det_helpers(red_noise_basis = red_noise_basis,
                                           det_signal_basis = self.Fs_det_concat,
                                           residuals = reff,
                                           white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN, FDNFD, FDNr, FNFD]
