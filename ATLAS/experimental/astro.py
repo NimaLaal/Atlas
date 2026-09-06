@@ -31,7 +31,7 @@ import jax.random as jr
 import torch
 import math
 import random
-from ATLAS.flows import ConditionalFlow, Flow
+from ATLAS.experimental.flows import ConditionalFlow, Flow
 
 # -----------------------------
 # Astronomical / physical constants

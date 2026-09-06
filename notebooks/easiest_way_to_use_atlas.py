@@ -89,8 +89,10 @@ rn = m.make_red_noise("ltm|unc+cor->unc;gtm",
                 dm_upper_bound_psd = None,
                 gwb_lower_bound_psd = jnp.array([-18]),
                 gwb_upper_bound_psd = jnp.array([-11]),
-                upper_bound_orf = jnp.ones(7) * -.95,
-                lower_bound_orf = jnp.ones(7) * .95,
+                # These were swapped: upper was -0.95 and lower +0.95, which
+                # gives dist.Uniform(low=0.95, high=-0.95) -- empty support.
+                lower_bound_orf = jnp.ones(7) * -.95,
+                upper_bound_orf = jnp.ones(7) * .95,
                  )
 
 raw_res = jnp.concat(data.raw_residuals)

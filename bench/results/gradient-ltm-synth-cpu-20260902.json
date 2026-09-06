@@ -1,0 +1,87 @@
+{
+  "info": {
+    "host": "host-024b234d",
+    "platform": "cpu",
+    "device": "cpu:cpu",
+    "jax": "0.10.1",
+    "x64": true,
+    "loadavg": 0.37744140625,
+    "recorded": "2026-09-02T09:35:18",
+    "case": "ltm",
+    "model_string": "ltm|unc+cor->unc",
+    "fixture": "synth",
+    "npsr": 2,
+    "ntoa": 456,
+    "nmodes": 18,
+    "include_ecorr": true,
+    "latent_dims": 36,
+    "n_red_params": 6,
+    "n_wn_params": 12
+  },
+  "ratio": 3.0977550616699436,
+  "timings": [
+    {
+      "label": "helper build (forward)",
+      "median_ms": 0.02364542555394881,
+      "min_ms": 0.02352571867438362,
+      "max_ms": 0.024665487852181915,
+      "repeats": 9839,
+      "rounds": 3,
+      "loadavg": 0.37744140625,
+      "note": ""
+    },
+    {
+      "label": "grad, helpers FROZEN",
+      "median_ms": 0.030993554658192375,
+      "min_ms": 0.030575178474201676,
+      "max_ms": 0.03151980161716516,
+      "repeats": 2964,
+      "rounds": 3,
+      "loadavg": 0.37744140625,
+      "note": "vary_white=False leapfrog step"
+    },
+    {
+      "label": "grad, helpers REBUILT",
+      "median_ms": 0.09601044082155949,
+      "min_ms": 0.09548980053953086,
+      "max_ms": 0.10128042777068913,
+      "repeats": 1910,
+      "rounds": 3,
+      "loadavg": 0.37744140625,
+      "note": "vary_white=True leapfrog step"
+    },
+    {
+      "label": "grad, partial_marg (frozen helpers)",
+      "median_ms": 0.04186653640027336,
+      "min_ms": 0.039413959577832634,
+      "max_ms": 0.04472648973391851,
+      "repeats": 1607,
+      "rounds": 3,
+      "loadavg": 0.37744140625,
+      "note": ""
+    }
+  ],
+  "memory": {
+    "helper_build": {
+      "generated_code": 0,
+      "argument": 96,
+      "temp": 82360,
+      "output": 5520,
+      "alias": 0
+    },
+    "grad_frozen": {
+      "generated_code": 0,
+      "argument": 336,
+      "temp": 33040,
+      "output": 352,
+      "alias": 0
+    },
+    "grad_rebuilt": {
+      "generated_code": 0,
+      "argument": 432,
+      "temp": 191376,
+      "output": 456,
+      "alias": 0
+    }
+  }
+}

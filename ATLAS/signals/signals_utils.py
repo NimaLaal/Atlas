@@ -9,32 +9,48 @@ import jax.scipy.linalg as jsl
 import jax.random as jrandom
 import inspect
 
+
+
+def _as_positions(x):
+    """A slice or an index array -> a static 1-D numpy array of positions.
+
+    Column bookkeeping is resolved at trace time and embedded as a constant, so
+    it must stay in numpy: returning a jnp array here makes the result a tracer
+    when it is first built inside a jitted function, and any later code that
+    reads ``.start`` off it then fails with a confusing
+    ``DynamicJaxprTracer has no attribute start``.
+    """
+    if isinstance(x, slice):
+        return np.arange(x.start, x.stop)
+    return np.asarray(x)
+
+
 def merge_slices(*slices):
     """Combine slices into a single contiguous slice if possible (fast path),
-    otherwise return a concatenated index array covering the same positions."""
-    slices = sorted(slices, key=lambda s: s.start)
-    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
-    if contiguous:
-        return slice(slices[0].start, slices[-1].stop)
-    return jnp.concatenate([jnp.arange(s.start, s.stop) for s in slices])
+    otherwise return a concatenated index array covering the same positions.
 
-import numpy as np
+    Accepts slices or index arrays, and composes with itself: the result of one
+    ``merge_slices`` can be an argument to another.
+    """
+    if all(isinstance(s, slice) for s in slices):
+        ordered = sorted(slices, key=lambda s: s.start)
+        if all(prev.stop == nxt.start for prev, nxt in zip(ordered[:-1], ordered[1:])):
+            return slice(ordered[0].start, ordered[-1].stop)
+    return np.concatenate([_as_positions(s) for s in slices])
+
 
 def merge_slices_unique(*slices):
-    """Combine slices into a single contiguous slice if possible (fast path),
-    otherwise return a concatenated, deduplicated, sorted index array covering
-    the same positions.
+    """Like :func:`merge_slices`, but deduplicated and sorted.
 
-    NOTE: slice.start/.stop must be static Python ints here (not traced values) —
-    this is resolved entirely at trace time and the result is embedded as a
-    constant, so it's safe to call from inside jit-compiled code.
+    Used where the inputs may overlap -- notably the P block and ``cor``, whose
+    columns are shared rather than adjacent when the model string reads
+    ``"unc+cor->unc"``.
     """
-    slices = sorted(slices, key=lambda s: s.start)
-    contiguous = all(prev.stop == nxt.start for prev, nxt in zip(slices[:-1], slices[1:]))
-    if contiguous:
-        return slice(slices[0].start, slices[-1].stop)
-    idx = np.unique(np.concatenate([np.arange(s.start, s.stop) for s in slices]))
-    return jnp.array(idx)
+    if all(isinstance(s, slice) for s in slices):
+        ordered = sorted(slices, key=lambda s: s.start)
+        if all(prev.stop == nxt.start for prev, nxt in zip(ordered[:-1], ordered[1:])):
+            return slice(ordered[0].start, ordered[-1].stop)
+    return np.unique(np.concatenate([_as_positions(s) for s in slices]))
 
 def block_slice(idx0, idx1=None):
     """Return a (row, col) index pair usable as `TNT[:, row, col]` for a block
@@ -51,90 +67,13 @@ def vec_slice(idx):
     return idx  # slices and 1-D arrays both work directly here
 
 # Model utilities---------------------------------------------------------------
-def build_basis(signal_helper):
-    """
-    Build the combined Fourier basis matrix and a dict mapping each signal
-    name to its column slice in the final F-matrix (and therefore in FNF).
-
-    Parameters
-    ----------
-    signal_helper : dict with keys
-        'shared_basis' : {
-            'signal_list': [...] or None,
-            'index_of_signal_used_for_basis': int
-        }  or None
-        'separate' : {
-            'signal_list': [...] or None
-        }  or None
-        'order' : comma-separated signal names, e.g. 'dm,unc,cor'
-
-    Returns
-    -------
-    Fmat : jnp.ndarray, shape (n_toas, total_basis_cols)
-    signal_indices : dict[str, slice]
-        Maps each signal name to its column slice in Fmat / FNF.
-    """
-    if not signal_helper['order'].endswith('cor'):
-        raise ValueError(
-            f"`cor` MUST be the last signal."
-        )
-
-    shared_cfg   = signal_helper.get('shared_basis') or {}
-    separate_cfg = signal_helper.get('separate') or {}
-    order = [s.strip() for s in signal_helper['order'].split(',')]
-
-    # --- Shared group ---
-    shared_signals = shared_cfg.get('signal_list') or []
-    shared_idx     = shared_cfg.get('index_of_signal_used_for_basis', 0)
-    shared_names   = {sig.name for sig in shared_signals}
-
-    shared_Fmat = (
-        jnp.concat(shared_signals[shared_idx].get_basis())
-        if shared_signals else None
-    )
-
-    # --- Separate signals ---
-    separate_signals = separate_cfg.get('signal_list') or []
-    separate_map = {
-        sig.name: jnp.concat(sig.get_basis())
-        for sig in separate_signals
-    }
-
-    # --- Validate order covers exactly the declared signals ---
-    declared = shared_names | set(separate_map)
-    if set(order) != declared:
-        raise ValueError(
-            f"'order' signals {set(order)} do not match declared signals {declared}"
-        )
-
-    # --- Assemble columns in user-specified order ---
-    Fmats          = []
-    signal_indices = {}
-    col            = 0
-
-    shared_block_placed = False
-    shared_start        = None
-    shared_signal_ct = 0
-    for name in order:
-        if name in shared_names:
-            if not shared_block_placed:
-                n_cols = shared_Fmat.shape[1]
-                Fmats.append(shared_Fmat)
-                shared_start        = col
-                shared_block_placed = True
-                col += n_cols
-            signal_indices[name] = slice(shared_start, shared_start + shared_signals[shared_signal_ct].nmodes)
-            shared_signal_ct+=1
-        else:
-            F      = separate_map[name]
-            n_cols = F.shape[1]
-            Fmats.append(F)
-            signal_indices[name] = slice(col, col + n_cols)
-            col += n_cols
-
-    Fmat = jnp.concat(Fmats, axis=1)
-
-    return Fmat, signal_indices
+# NOTE: a superseded `build_basis(signal_helper)` used to live here. It consumed
+# an older dict schema -- {'shared_basis': ..., 'separate': ..., 'order': 'unc,cor'}
+# -- and was replaced by `SuperSignal.build_basis`, which parses the basis-string
+# grammar instead. It had no live callers; the only code still building that dict
+# was the stranded CW subsystem (see B8) and notebooks/CW_demo.ipynb. Retrieve it
+# with `git show f52a0d4:ATLAS/signals/signals_utils.py` if Stage 4 needs the old
+# schema while unifying the deterministic-signal path.
 
 def stabilize_TNT(A, A_shape, eps=1e-6):
     """

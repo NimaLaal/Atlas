@@ -23,16 +23,45 @@ dependencies = [
     "numpyro",
     "enterprise-pulsar",
     "joblib",
+    # Hard, module-level imports on the main path, previously undeclared:
+    "scikit-learn",   # signals/factorized/base.py (TruncatedSVD, PCA)
+    "tqdm",           # nMatrix/base.py, signals/factorized/base.py, sim.py
+    "tqdm-joblib",    # pulsar.py, sim.py, signals/factorized/base.py
+    "pint-pulsar",    # pulsar.py imports pint.logging directly
 ]
 
 [project.optional-dependencies]
+# Test suite. Deliberately does NOT need jug / libstempo / $TEMPO2: the tests
+# build models from serialized fixtures and never import ATLAS.pulsar.
+test = [
+    "pytest",
+]
+
 # Extras used only by the demonstration notebooks / plotting.
 notebooks = [
     "corner",
     "matplotlib",
-    "tqdm",
-    "tqdm_joblib",
+]
+
+# ATLAS/experimental/: the normalising-flow and SMBH-population code that
+# Stage 7 of the development plan will promote back. `torch` is used only by
+# astro.py for SobolEngine during offline training-set generation and must
+# never be reachable at sampling time.
+experimental = [
+    "dm-haiku",
+    "distrax",
+    "optax",
+    "torch",
 ]
 
 [tool.setuptools.packages.find]
 include = ["ATLAS*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: takes more than a few seconds",
+    "gpu: needs a GPU",
+    "golden: full sampling run checked against a recorded posterior",
+    "needs_data: reads par/tim files, so needs PINT or tempo2",
+]

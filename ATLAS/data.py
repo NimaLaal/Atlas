@@ -69,7 +69,7 @@ class PTA_Data:
         self.num_gwb_bins = num_gwb_bins
         self.num_det_bins = num_det_bins
         self.num_irn_bins = num_irn_bins
-        self.dm_bins = num_dm_bins
+        self.num_dm_bins = num_dm_bins
         self.adaptus_size = adaptus_size
 
         self.noise_dict = noise_dict
@@ -123,6 +123,18 @@ class PTA_Data:
             self.dm_exploder_idxs.append(ct * jnp.ones(len(self.toas[pidx])))
             ct+=1
         self.dm_exploder_idxs = jnp.concat(self.dm_exploder_idxs).astype(int)
+
+    @property
+    def dm_bins(self):
+        """Deprecated alias for :attr:`num_dm_bins`.
+
+        The attribute used to be spelled ``dm_bins`` here while
+        ``make_red_noise`` read ``num_dm_bins``, so any model string containing
+        ``dm`` raised ``AttributeError`` and DM noise was unreachable through
+        the public API. Kept as an alias so external scripts that read the old
+        name still work.
+        """
+        return self.num_dm_bins
 
     def add_white_noise_cov(self, white_noise_cov):
         self.Nmat = white_noise_cov
