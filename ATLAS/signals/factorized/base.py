@@ -1217,7 +1217,14 @@ class SuperSignal:
     def partial_marg_lnposterior_helper(self):
         # 'cor' and 'det' are already single slices, so they stay contiguous
         # by construction — no conversion needed.
-        cor_idx = self.signal_comb_idxs['cor']
+        #
+        # 'cor' is optional. `partial_marg_lnposterior` genuinely requires it --
+        # it keeps the GWB block and marginalises the rest analytically -- and
+        # guards for it at its own entry point. `lnposterior_reparam` does not:
+        # it merges 'cor' straight back into one block. Indexing it here
+        # unconditionally is what made every GWB-free model unusable from
+        # a40d71a onward, single-pulsar noise runs included.
+        cor_idx = self.signal_comb_idxs.get('cor')
         # 'P' is every non-GWB stochastic block: the linear timing model, the
         # intrinsic red noise, DM noise and the Adaptus basis, in column order.
         # `dm` was missing here, so with a `dm` block in the model string the
@@ -1271,7 +1278,10 @@ class SuperSignal:
         the merge_slices call below accordingly.
         """
         cor_idx, P_idx, det_idx = self.partial_marg_lnposterior_helper
-        reparam_idx = sutils.merge_slices_unique(P_idx, cor_idx)
+        # A model string with no 'cor' block is fine here: P is then the whole
+        # reparameterised set, and nothing below this line consults cor_idx.
+        reparam_idx = P_idx if cor_idx is None else \
+            sutils.merge_slices_unique(P_idx, cor_idx)
         return reparam_idx, det_idx
 
     @cached_property
@@ -1283,7 +1293,21 @@ class SuperSignal:
             return jit(partial(self.__lnposterior_reparam, D_params=None))
 
     def partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
-        """Public entry point — dispatches to the cached jitted implementation."""
+        """Public entry point — dispatches to the cached jitted implementation.
+
+        Requires a 'cor' block, unlike `lnposterior_reparam`. Checked here
+        rather than in `partial_marg_lnposterior_helper`, which
+        `lnposterior_reparam_helper` shares and which must stay usable without
+        one. Without this the failure is a `TypeError: 'NoneType' object is not
+        subscriptable` from inside `block_slice`, several frames down.
+        """
+        if self.signal_comb_idxs.get('cor') is None:
+            raise ValueError(
+                "partial_marg_lnposterior keeps the 'cor' (GWB) block and "
+                "marginalises the rest analytically, so it requires one; model "
+                f"string {self.signal_combination_string!r} has none. Use "
+                "lnposterior_reparam instead."
+            )
         if self.has_det:
             return self._jitted_partial_marg_lnposterior(helpers, red_params, z, D_params)
         else:

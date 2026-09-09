@@ -295,6 +295,73 @@ def test_empty_p_block_is_rejected():
         m.rn.partial_marg_lnposterior_helper
 
 
+@pytest.mark.parametrize("npsr", [1, 2])
+def test_reparam_without_cor_block(npsr):
+    """A GWB-free model must evaluate.
+
+    `partial_marg_lnposterior_helper` indexed signal_comb_idxs['cor']
+    unguarded, so `lnposterior_reparam` -- which merges 'cor' straight back
+    into one block and never consults it separately -- raised KeyError('cor')
+    for every model string without a correlated process.  A regression from
+    a40d71a, where the deterministic-signal rewrite began sourcing the reparam
+    indices from the partial-marginalisation helper; before that the function
+    used the whole TNT and had no index lookup at all.
+
+    A single pulsar is the case that motivates it: a common process is
+    unidentifiable from intrinsic red noise in one pulsar, so requiring one
+    buys two unconstrained parameters and a flat ridge.  npsr=1 is also the
+    only coverage the `if self.npsrs == 1` branch of `__lnposterior_reparam`
+    has.
+    """
+    m = H.build(npsr=npsr, model_string="unc", linear_timing=False)
+    assert not m.rn.has_cor
+    assert "cor" not in m.rn.signal_comb_idxs
+    assert len(m.rn.model.get_param_names()) == 2 * m.npsr
+
+    # With no 'cor' block, P is the whole reparameterised set.
+    reparam_idx, det_idx = m.rn.lnposterior_reparam_helper
+    assert det_idx is None
+    assert np.array_equal(np.asarray(H_positions(reparam_idx)),
+                          np.arange(m.rn.nmodes))
+
+    red = jnp.array([-15.0, 3.5] * m.npsr)      # IRN only -- no GWB parameters
+
+    # Dense reference: phi is block-diagonal IRN, no GWB, no timing prefix.
+    f_irn = np.arange(1, m.n_irn + 1) / m.data.pta_tspan
+    irn = np.column_stack([
+        ref.powerlaw_psd(f_irn, 1.0 / m.data.pta_tspan, -15.0, 3.5)
+        for _ in range(m.npsr)])
+    phi = ref.build_phi(m.npsr, 2 * m.n_irn, 0, [0] * m.npsr, irn,
+                        gwb_psd=None, orf=None)
+    T = H.design_blocks(m, include_timing=False)
+    Nfull = H.dense_bundle(m)[2]
+
+    rng = np.random.default_rng(41)
+    deltas = []
+    for z in rng.normal(size=(4, m.npsr, m.rn.nmodes)):
+        lp, coeff = m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(z))
+        deltas.append(float(lp) - ref.conditional_logL(
+            m.residuals, T, np.asarray(coeff).ravel(), phi, Nfull))
+    deltas = np.array(deltas)
+    assert np.ptp(deltas) / abs(deltas.mean()) < LOOSE
+
+    g = jax.grad(lambda q: m.rn.lnposterior_reparam(
+        m.helpers, q, jnp.zeros((m.npsr, m.rn.nmodes)))[0])(red)
+    assert np.all(np.isfinite(np.asarray(g)))
+
+
+def test_partial_marg_requires_cor_block():
+    """`partial_marg_lnposterior` keeps the GWB block and marginalises the
+    rest, so it genuinely needs one.  With 'cor' merely made optional it would
+    instead fail as `TypeError: 'NoneType' object is not subscriptable` inside
+    `block_slice`, several frames below the cause."""
+    m = H.build(model_string="unc", linear_timing=False)
+    with pytest.raises(ValueError, match="requires one"):
+        m.rn.partial_marg_lnposterior(
+            m.helpers, jnp.array([-15.0, 3.5] * m.npsr),
+            jnp.zeros((m.npsr, 2 * m.n_gwb)))
+
+
 @pytest.mark.xfail(reason="build_basis emits cor=slice(18,26) into a 20-column basis "
                           "for a separate (non-overlapping) cor block",
                    raises=ValueError, strict=True)
