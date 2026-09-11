@@ -1,0 +1,129 @@
+{
+  "recorded": "2026-09-02T09:35:39",
+  "host": "host-024b234d",
+  "platform": "cpu",
+  "jax": "0.10.1",
+  "numpy": "2.4.6",
+  "rows": [
+    {
+      "identity": "ln_likelihood_curn vs dense marginal",
+      "achieved": 2.9901585576887283e-16,
+      "asserted": 1e-12,
+      "note": ""
+    },
+    {
+      "identity": "lnposterior_reparam vs dense joint [zero]",
+      "achieved": 5.16647312517987e-15,
+      "asserted": 1e-12,
+      "note": "difference-in-z"
+    },
+    {
+      "identity": "lnposterior_reparam vs dense joint [hd]",
+      "achieved": 5.167235583567104e-15,
+      "asserted": 1e-12,
+      "note": "difference-in-z"
+    },
+    {
+      "identity": "reparam dropped-constant prediction",
+      "achieved": 1.7439788273760871e-15,
+      "asserted": 1e-09,
+      "note": "= 912.634777"
+    },
+    {
+      "identity": "z-invariance [zero orf]",
+      "achieved": 3.057436890718687e-16,
+      "asserted": 1e-12,
+      "note": ""
+    },
+    {
+      "identity": "partial_marg vs reparam [npsr=2]",
+      "achieved": 3.057355079909214e-16,
+      "asserted": 1e-09,
+      "note": ""
+    },
+    {
+      "identity": "partial_marg vs reparam [npsr=3]",
+      "achieved": 2.037062956327239e-16,
+      "asserted": 1e-09,
+      "note": ""
+    },
+    {
+      "identity": "partial_marg vs reparam [npsr=4]",
+      "achieved": 1.6098580156034946e-16,
+      "asserted": 1e-09,
+      "note": ""
+    },
+    {
+      "identity": "jax.grad vs central diff [lnposterior_reparam]",
+      "achieved": 3.096887679632232e-08,
+      "asserted": 1e-06,
+      "note": ""
+    },
+    {
+      "identity": "jax.grad vs central diff [partial_marg_lnposterior]",
+      "achieved": 3.264143024139064e-08,
+      "asserted": 1e-06,
+      "note": ""
+    },
+    {
+      "identity": "ln_likelihood_curn vs dense [mdc1_5]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "390 TOAs"
+    },
+    {
+      "identity": "partial_marg vs reparam [mdc1_5]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "tm cols [8, 11, 17]"
+    },
+    {
+      "identity": "ln_likelihood_curn vs dense [ng15_3]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "1876 TOAs"
+    },
+    {
+      "identity": "partial_marg vs reparam [ng15_3]",
+      "achieved": 1.75295227264493e-16,
+      "asserted": 1e-09,
+      "note": "tm cols [55, 40, 42]"
+    },
+    {
+      "identity": "partial_marg vs reparam [curn]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "12 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [curn-margtm]",
+      "achieved": 1.656978010039726e-16,
+      "asserted": 1e-09,
+      "note": "12 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm]",
+      "achieved": 1.5287184453593437e-16,
+      "asserted": 1e-09,
+      "note": "18 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm-dm]",
+      "achieved": 1.528718470391525e-16,
+      "asserted": 1e-09,
+      "note": "24 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm-gtm]",
+      "achieved": 0.0,
+      "asserted": 1e-09,
+      "note": "26 cols"
+    },
+    {
+      "identity": "partial_marg vs reparam [ltm-dm-gtm]",
+      "achieved": 1.528711893646603e-16,
+      "asserted": 1e-09,
+      "note": "32 cols"
+    }
+  ]
+}

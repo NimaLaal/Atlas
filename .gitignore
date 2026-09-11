@@ -211,3 +211,6 @@ data/NG20/
 notebooks/*_sim_noiseless.tim
 notebooks/*_sim*.tim
 notebooks/single_psr/
+
+# Large pulsar pickles produced by the demo notebooks
+notebooks/*.pkl

@@ -93,7 +93,11 @@ class Pulsar:
                 psr = E_Pulsar(par, tim, timing_package='tempo2',
                                sort=False, drop_t2pulsar=False) # keeps psr.t2pulsar
             else:
-                psr = E_Pulsar(par, tim, sort=False, drop_pintpsr=False) # keeps psr.model
+                # Be explicit: enterprise picks tempo2 when libstempo is
+                # importable, so omitting this silently ignores
+                # timing_package='pint' and then fails on psr.model.
+                psr = E_Pulsar(par, tim, timing_package='pint',
+                               sort=False, drop_pintpsr=False) # keeps psr.model
 
             self.name = psr.name
 

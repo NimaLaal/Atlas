@@ -1,0 +1,67 @@
+{
+  "recorded": "2026-09-01T21:27:31",
+  "backend": "gpu",
+  "jax": "0.10.1",
+  "numpyro": "0.21.0",
+  "config": {
+    "model_string": "ltm|unc+cor->unc",
+    "n_gwb": 8,
+    "n_irn": 15,
+    "linear_timing": true,
+    "marg_timing": false,
+    "diag_white_cov": false,
+    "include_ecorr": false,
+    "orf": "hd_orf",
+    "irn_prior": [
+      -18.0,
+      0.0,
+      -11.0,
+      7.0
+    ],
+    "gwb_prior": [
+      -18.0,
+      0.0,
+      -11.0,
+      7.0
+    ],
+    "warmup": 700,
+    "samples": 700,
+    "max_tree_depth": 8,
+    "seed": 170817,
+    "vary_white": true
+  },
+  "injected": {
+    "gwb_log10_A": -13.301,
+    "gwb_gamma": 4.333333333333333
+  },
+  "provenance": {
+    "source": "notebooks/psrs_mdc1_t2_36psr.pkl",
+    "description": "IPTA MDC1 Open-1, all 36 pulsars, loaded via tempo2. Must be loaded with tempo2, not PINT: the par files carry EPHVER 5 and no UNITS line, so PINT reads TCB as TDB and the residuals become a uniform hash over one pulse period. This is the fixture the golden run uses.",
+    "injected_gwb_log10_A": -13.301,
+    "injected_gwb_gamma": 4.333333333333333,
+    "atlas_sha": "d374bf2"
+  },
+  "npsr": 36,
+  "ntoa": 4680,
+  "nmodes": 47,
+  "wall_minutes": 10.31,
+  "posterior": {
+    "gwb_log10_A": {
+      "mean": -13.299733601950777,
+      "std": 0.022892556308420704,
+      "ess": 700.0
+    },
+    "gwb_gamma": {
+      "mean": 4.302697073423625,
+      "std": 0.12190114295226237,
+      "ess": 700.0
+    }
+  },
+  "health": {
+    "z_a_std": 1.0212016132451258,
+    "frac_at_tree_depth_cap": 1.0,
+    "mean_num_steps": 255.0,
+    "final_step_size": 0.021703494713561346,
+    "n_divergent": 0
+  }
+}
