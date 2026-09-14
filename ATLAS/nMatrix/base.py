@@ -5,22 +5,19 @@ from ATLAS.signals.signals_utils import _timing_model_svd, stabilize_TNT, stabil
 import numpy as np
 import itertools
 from tqdm import tqdm
-from tqdm.auto import trange
 
-import jax.numpy as jnp
 import jax
-from jax.tree_util import register_pytree_node_class
+import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 from functools import partial
 
-import numpyro
-import numpyro.distributions as dist
-
+# Difference in seconds between consecutive TOAs below which they are considered
+# to be within the same epoch (NOTE: they must be in the same backend for this to apply)
 EPOCH_THRESHOLD = 1.0 # seconds
 
 # Helper functions for finding TOA epochs --------------------------------------
-def _get_psr_WN_helpers(psr, dt=1.0):
-    """Get the helper arrays/matrices for computing the white noise covariance matrix
+def _get_psr_wn_attributes(psr):
+    """Get the helper matrices for computing the white noise covariance matrix
 
     This function computes several helper quantities for computing the N matrix
     and its inverse solutions for a given pulsar. These include:
@@ -34,19 +31,15 @@ def _get_psr_WN_helpers(psr, dt=1.0):
     - toas: (N_toa) array of time of arrivals for this pulsar
     - backend_flags: (N_toa) array of backend names for each toa
 
-    Finally, the user also supplies a time interval `dt` for grouping toas into epochs. 
-    Toas are grouped into epochs such that all toas in an epoch are within a time 
-    interval `dt` of the first toa in that epoch. `dt` is given in seconds, and the 
-    default value is 1.0 second.
-
+    TOAs are grouped into epochs such that all toas in an epoch are within a time 
+    interval `EPOCH_THRESHOLD` of the first toa in that epoch. `EPOCH_THRESHOLD` 
+    is given in seconds.
 
     Parameters
     ----------
     psr : object
         The pulsar object to compute the helper arrays/matrices for [check description]
-    dt : float
-        The time interval (in seconds) for grouping toas into epochs, by default 1.0
-
+    
     Returns
     -------
     out : tuple
@@ -58,8 +51,9 @@ def _get_psr_WN_helpers(psr, dt=1.0):
         - V: (N_epoch) an array of backend indices for each epoch (i.e. which backend each epoch belongs to)
     """
     # The array of backends and an array which indicates which backend each toa belongs to
-    backends, B = np.unique(psr.backend_flags, return_inverse=True)
+    backends, B = np.unique(psr.backend_flags, return_inverse=True) # [n_backends], [n_toas]
     backends = tuple(backends) # Convert to tuple
+
     # The indices of toas for each backend (i.e. which toas belong to each backend)
     backend_idx = [np.where(B == i)[0] for i in range(len(backends))]
 
@@ -68,12 +62,19 @@ def _get_psr_WN_helpers(psr, dt=1.0):
     for i in range(len(backends)):
         # Get this backend's toas
         toas = psr.toas[backend_idx[i]]
+        isort = np.argsort(toas)
+        sort_toas = toas[isort]
 
-        # Get the epochs for this backend (indices of toas in this backend)
-        backend_epochs = _get_epochs(toas, dt)
+        # Find indices where adjacent toas are separated by >= dt (different epochs)
+        breaks = np.where(np.diff(sort_toas) >= EPOCH_THRESHOLD)[0] + 1 # (plus 1 since diff)
+        epochs = np.split(isort, breaks) # List of arrays of indices for each epoch (in backend indexing)
+
+        # Convert to sorted jax arrays and drop single-toa epochs (in backend indexing)
+        epoch_idx = [np.sort(jnp.array(epoch, dtype=int))
+                     for epoch in epochs if len(epoch) > 1]
 
         # Map backend indices to global indices through B[i]
-        epochs = [backend_idx[i][e] for e in backend_epochs]
+        epochs = [backend_idx[i][e] for e in epoch_idx] 
 
         U.extend(epochs) # Add these epochs to U
         V.extend([i]*len(epochs)) # Add the backend index for these epochs to V
@@ -81,7 +82,7 @@ def _get_psr_WN_helpers(psr, dt=1.0):
     # U is a list of arrays of toa indices for each epoch
     # we need to convert this to a padded array for fast einsum computations
     if len(U) == 0:
-        # No epoch holds more than one TOA (_get_epochs drops singletons), so
+        # No epoch holds more than one TOA (singletons are dropped above), so
         # there is no ECORR block structure at all -- e.g. a single-frequency
         # campaign with one TOA per observing session. Empty (0, 1) helpers let
         # the per-epoch einsums in the solvers reduce over an empty axis, which
@@ -89,7 +90,7 @@ def _get_psr_WN_helpers(psr, dt=1.0):
         U_pad = jnp.zeros((0, 1), dtype=int)
         U_mask = jnp.zeros((0, 1), dtype=bool)
     else:
-        U_pad, U_mask = jagged2padded(U)
+        U_pad, U_mask = jagged2padded(U, pad_value=-1) # [n_epochs, max_epoch_size], [n_epochs, max_epoch_size]
         U_pad, U_mask = jnp.array(U_pad, dtype=int), jnp.array(U_mask, dtype=bool)
 
     # V is a list of backend indices for each epoch (i.e. which backend each epoch belongs to)
@@ -100,39 +101,6 @@ def _get_psr_WN_helpers(psr, dt=1.0):
     out = (backends, B, U_pad, U_mask, V)
     return out
 
-
-def _get_epochs(toas, dt):
-    """Create a list of toa epochs, where each epoch is a list of toa indices
-
-    This method groups toas indices into epochs such that all toas in an epoch 
-    are within a time interval `dt` of adjacent TOAs. i.e. if the difference
-    between adjacent toas is greater than or equal to `dt`, then they belong to 
-    different epochs. This method does NOT take into account timing back ends.
-
-    Parameters
-    ----------
-    toas : np.ndarray
-        Array of time of arrivals (toas)
-    dt : float
-        Time interval for grouping toas into epochs
-
-    Returns
-    -------
-    epoch_idx : list
-        A list of numpy arrays, each containing the indices of toas in that epoch
-    """
-    isort = np.argsort(toas)
-    sort_toas = toas[isort]
-
-    # Find indices where adjacent toas are separated by >= dt
-    breaks = np.where(np.diff(sort_toas) >= dt)[0] + 1 # (plus 1 since diff)
-    epochs = np.split(isort, breaks)
-
-    # Convert to sorted jax arrays and drop single-toa epochs.
-    epoch_idx = [jnp.sort(jnp.array(epoch, dtype=int))
-                 for epoch in epochs if len(epoch) > 1]
-
-    return epoch_idx
 
 class DiagSinglePulsarWhiteCov:
     """A simple TOA covariance matrix with only TOA errors. (no extra noise factors)
@@ -145,20 +113,6 @@ class DiagSinglePulsarWhiteCov:
     The covariance matrix can be written as:
         N_ij = delta_ij * sigma_i^2
         where sigma_i is the TOA error for the i-th TOA.
-
-    This class uses JAX pytrees which enable JIT compilation of functions with
-    objects of this class as an input.
-
-    Attributes
-    ----------
-    psr_name : str
-        The name of the pulsar this covariance matrix corresponds to.
-    ntoas : int
-        The number of TOAs for this pulsar.
-    toaerrs : array
-        The TOA errors for this pulsar. [ntoas]
-    nvec : array
-        An array of the diagonal elements of the covariance matrix (the white noise variances). [ntoas]
     """
 
     def __init__(self, psr, marg = False):
@@ -204,38 +158,30 @@ class DiagSinglePulsarWhiteCov:
         Returns
         -------
         tuple
-            Tuple ``(nvec, jvec)`` where
-
-            - ``nvec`` contains the diagonal white-noise variances
-              for each TOA.
-            - ``jvec`` is None.
+            A tuple containing:
+            - nvec: The diagonal elements of the covariance matrix (the white noise variances). [ntoas]
+            - jvec: None.
         """
         nvec = self.toaerrs**2
         jvec = None
         return nvec, jvec
 
     def _solve_func_maker(self, return_logdet):
-        """Solve the linear system left^T N^{-1} right.
+        """Create a solver function for the covariance matrix.
 
-        This method implements the solution to the linear system left^T N^{-1} right
-        for the simplified covariance matrix, which is just a diagonal matrix with the
-        TOA errors squared on the diagonal. This method can be JIT compiled in other functions!
-
-        NOTE: the left matrix will be transposed for you and should be [N_toa, N]
+        This method returns a JIT-compiled function that solves the linear system
+        left^T N^{-1} right, where N is the covariance matrix. The returned function
+        can optionally also return the log-determinant of N.
 
         Parameters
         ----------
-        white_noise_helpers: tuple
-            This contaains (nvec, jvec). jvec is set to None
-        left : array-like
-            The left-hand side of the linear system. [N_toa, N]
-        right : array-like
-            The right-hand side of the linear system. [N_toa, M]
-        
+        return_logdet : bool
+            If True, the returned solver function will also return the log-determinant of the covariance matrix. If False, only the solution to the linear system is returned.
+
         Returns
         -------
-        array-like
-            The solution to the linear system. [N, M]
+        function
+            A JIT-compiled function that solves the linear system left^T N^{-1} right. 
         """
         if self.marg:
             new_func = partial(self._solve_marg, return_logdet = return_logdet)
@@ -290,7 +236,6 @@ class DiagSinglePulsarWhiteCov:
         ----------
         white_noise_helpers: tuple
             (nvec, jvec) where jvec = None
-
         left : array-like
             The left-hand side of the equation. [Ntoa, n]
         right : array-like
@@ -325,10 +270,9 @@ class DiagSinglePulsarWhiteCov:
 
         Parameters
         ----------
-        helpers : tuple
-            Tuple ``(nvec, jvec)`` containing the diagonal and ECORR
-            covariance components.
-
+        white_noise_helpers: tuple
+            (nvec, jvec) where jvec = None
+        
         Returns
         -------
         float
@@ -336,6 +280,7 @@ class DiagSinglePulsarWhiteCov:
         """
         nvec, jvec = white_noise_helpers
         return jnp.sum(jnp.log(nvec))
+    
 
 class SinglePulsarWhiteCov:
     """A complete TOA covariance matrix with EFAC, EQUAD, and ECORR.
@@ -349,34 +294,6 @@ class SinglePulsarWhiteCov:
 
     This class uses the Sherman-Morrison formula to calculate the linear system
     left^T N^{-1} right efficiently without explicitly inverting the covariance matrix.
-
-    This class uses JAX pytrees which enable JIT compilation of functions with
-    objects of this class as an input.
-
-    Attributes
-    ----------
-    psr_name : str
-        The name of the pulsar this covariance matrix corresponds to.
-    ntoas : int
-        The number of TOAs for this pulsar.
-    nepochs : int
-        The number of epochs for this pulsar.
-    toaerrs : array
-        The TOA errors for this pulsar. [ntoas]
-    backends : list
-        A list of unique backend names for this pulsar.
-    B : array
-        An array of backend indices for each TOA. [ntoas]
-    U_pad : array
-        A padded array of TOA indices for each epoch. [nepochs, max_epoch_size]
-    U_mask : array
-        A boolean mask indicating which elements of U_pad are valid. [nepochs, max_epoch_size]
-    V : array
-        An array of epoch indices for each TOA. [ntoas]
-    lower_prior_bounds: array
-        lower prior bounds
-    upper_prior_bounds: array
-        upper prior bounds
     """
 
     def __init__(self, psr,
@@ -393,13 +310,10 @@ class SinglePulsarWhiteCov:
         ----------
         psr : object
             the pulsar object
-
         marg: bool
             Do you want to marginalize over linear timing model errors?
-
         *prior_bounds : tuple, optional
             the lower and upper prior bounds for white noise params
-
         include_ecorr : bool, optional
             Whether to give each backend an ECORR parameter. Set this to False
             for datasets whose epochs contain a single TOA each -- an epoch of
@@ -411,7 +325,7 @@ class SinglePulsarWhiteCov:
             makes the Sherman-Morrison correction and its log-determinant
             contribution vanish exactly). Defaults to True.
         """
-        backends, B, U_pad, U_mask, V = _get_psr_WN_helpers(psr, dt=EPOCH_THRESHOLD)
+        backends, B, U_pad, U_mask, V = _get_psr_wn_attributes(psr)
 
         if include_ecorr and len(U_pad) == 0:
             raise ValueError(
@@ -492,49 +406,6 @@ class SinglePulsarWhiteCov:
         v = jnp.array([params[n] for n in names])
         return v
     
-    def make_numpyro_prior(self, uniform_efac = False):
-        """Sample white-noise parameters using NumPyro priors.
-
-        Generates one EFAC, log10_t2equad, and log10_ecorr parameter for
-        each backend and returns them as a flat vector with layout
-
-            [ef_0, ..., ef_nb | eq_0, ..., eq_nb | ec_0, ..., ec_nb]
-
-        Parameters
-        ----------
-        uniform_efac : bool, optional
-            If True, sample EFAC values from a uniform distribution
-            between ``lower_efac`` and ``upper_efac``. Otherwise,
-            sample from a truncated normal distribution centered on
-            ``center_efac`` with standard deviation ``sigma_efac``.
-
-        Returns
-        -------
-        jnp.ndarray
-            White-noise parameter vector of shape
-            ``[3 * n_backends]``.
-        """
-        psr  = self.psr_name
-        ef, eq, ec = [], [], []
-
-        if uniform_efac:
-            efac_base_dist = dist.Uniform(self.lower_efac, self.upper_efac)
-        else:
-            efac_base_dist = dist.TruncatedNormal(loc=self.center_efac, 
-                                scale=self.sigma_efac, low=self.lower_efac)
-            
-        for b in self.backends:   # same iteration order as params_dict_to_vector
-            ef.append(numpyro.sample(f'{psr}_{b}_efac', efac_base_dist))
-            eq.append(numpyro.sample(f'{psr}_{b}_log10_t2equad',
-                                    dist.Uniform(self.lower_log10equad, self.upper_log10equad)))
-            if self.include_ecorr:
-                ec.append(numpyro.sample(f'{psr}_{b}_log10_ecorr',
-                                        dist.Uniform(self.lower_log10ecorr, self.upper_log10ecorr)))
-        # Concatenate in the same [ef | eq | ec] order that params_dict_to_vector uses
-        blocks = [jnp.stack(ef), jnp.stack(eq)]
-        if self.include_ecorr:
-            blocks.append(jnp.stack(ec))
-        return jnp.concatenate(blocks)
 
     def get_prior_bounds(self):
         """Return lower and upper bounds for all white-noise parameters.
@@ -702,27 +573,24 @@ class SinglePulsarWhiteCov:
         return nvec, jvec
 
     def _solve_func_maker(self, return_logdet):
-        """Solve the linear system left^T N^{-1} right.
+        """Create a solver function for the covariance matrix.
 
-        This method implements the solution to the linear system left^T N^{-1} right
-        for the simplified covariance matrix, which is just a diagonal matrix with the
-        TOA errors squared on the diagonal. This method can be JIT compiled in other functions!
-
-        NOTE: the left matrix will be transposed for you and should be [N_toa, N]
+        This method returns a JIT-compiled function that solves the linear system
+        left^T N^{-1} right, where N is the covariance matrix. If ``self.marg`` is
+        set, N is replaced by the timing-model marginalized covariance D. The
+        returned function can optionally also return the log-determinant.
 
         Parameters
         ----------
-        white_noise_helpers: tuple
-            This contaains (nvec, jvec). jvec is set to None
-        left : array-like
-            The left-hand side of the linear system. [N_toa, N]
-        right : array-like
-            The right-hand side of the linear system. [N_toa, M]
-        
+        return_logdet : bool
+            If True, the returned solver also returns the log-determinant of the
+            covariance matrix. If False, only the solution is returned.
+
         Returns
         -------
-        array-like
-            The solution to the linear system. [N, M]
+        function
+            A JIT-compiled function with signature
+            ``f(white_noise_helpers, left, right)``.
         """
         if self.marg:
             new_func = partial(self._solve_marg, return_logdet = return_logdet)
@@ -734,29 +602,32 @@ class SinglePulsarWhiteCov:
     def _solve_unmarg(self, white_noise_helpers, left, right, return_logdet):
         """Solve the linear system ``left^T N^{-1} right``.
 
-        This method evaluates
+        N is the diagonal part plus a per-epoch rank-one ECORR term,
 
-            left^T N^{-1} right
+            N = diag(nvec) + U diag(jvec) U^T
 
-        using the Sherman-Morrison formula and also returns the
-        log-determinant of the covariance matrix.
+        where U is the epoch indicator. The inverse is applied with the
+        Sherman-Morrison formula, so N is never formed or inverted explicitly.
+
+        NOTE: the left matrix will be transposed for you and should be [N_toa, N]
 
         Parameters
         ----------
         white_noise_helpers : tuple
-            Tuple ``(nvec, jvec)`` containing the diagonal and
-            ECORR covariance components.
+            Tuple ``(nvec, jvec)`` containing the diagonal and ECORR
+            covariance components.
         left : array-like
             Left-hand matrix of shape ``[N_toa, N]``.
         right : array-like
             Right-hand matrix of shape ``[N_toa, M]``.
+        return_logdet : bool
+            Whether to also return log|N|.
 
         Returns
         -------
-        tuple
-            A tuple ``(solve_result, logdet_N)`` containing the
-            covariance-weighted matrix product and the
-            log-determinant of the covariance matrix.
+        array-like or tuple
+            ``left^T N^{-1} right`` of shape ``[N, M]``; if ``return_logdet``
+            is True, the tuple ``(solve_result, logdet_N)`` instead.
         """
         nvec, jvec = white_noise_helpers
         # Get the diagonal bit.
@@ -791,24 +662,33 @@ class SinglePulsarWhiteCov:
         """Solve a linear equation (left).T @ D^{-1} @ right.
 
         This method solves the linear equation (left).T @ D^{-1} @ right, where
-        D is the timing-model marginalized covariance matrix.
+        D is the timing-model marginalized covariance matrix,
+
+            D = N + M (prior) M^T,
+
+        applied in the limit of an infinite timing-model prior. D^{-1} reduces to
+        N^{-1} - N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1}, which is what is
+        evaluated below.
 
         NOTE: the left matrix will be transposed for you and should be [N_toa, N]
 
         Parameters
         ----------
-        helpers : tuple
+        white_noise_helpers : tuple
             Tuple ``(nvec, jvec)`` containing the diagonal and ECORR covariance components.
-        Fmat : array [total_ntoas, N_basis]
         left : array-like
             The left-hand side of the equation. [Ntoa, n]
         right : array-like
             The right-hand side of the equation. [Ntoa, m]
+        return_logdet : bool
+            Whether to also return log|D|, which includes the log-determinant of
+            M^T N^{-1} M and the ``Mprior`` normalisation.
 
         Returns
         -------
-        array-like
-            The result of the linear equation. [n, m] or [m]
+        array-like or tuple
+            The result of the linear equation, shape ``[n, m]``; if
+            ``return_logdet`` is True, the tuple ``(result, logdet_D)`` instead.
         """
         # Solve L^T N^{-1} R - L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
         # Term1 = L^T N^{-1} R
@@ -961,26 +841,8 @@ class WhiteCov:
         T^T N^{-1} r = sum_p  T_p^T N_p^{-1} r_p
     where the _p subscript selects the TOA rows belonging to pulsar p.
 
-    Within each per-pulsar block, the Sherman-Morrison formula from
-    Fix_TM_TOA_cov_full is re-used, so ECORR is handled exactly.
-
-    This class is a JAX pytree; all methods decorated with @jit can be
-    JIT-compiled even when an instance of this class is an argument.
-
-    Attributes
-    ----------
-    npulsars : int
-        Number of pulsars.
-    ntoas_per_psr : tuple of int
-        Number of TOAs for each pulsar, in order.
-    total_ntoas : int
-        Total number of TOAs across all pulsars.
-    toa_starts : tuple of int
-        Start index in the global TOA array for each pulsar.
-    toa_ends : tuple of int
-        End index (exclusive) in the global TOA array for each pulsar.
-    cov_matrices : list of white noise cov objects
-        Per-pulsar covariance matrix objects (each itself a pytree).
+    Within each per-pulsar block the Sherman-Morrison formula from
+    :class:`SinglePulsarWhiteCov` is re-used, so ECORR is handled exactly.
     """
 
     def __init__(self, 
@@ -994,22 +856,39 @@ class WhiteCov:
                 ):
         """Construct a multi-pulsar white noise covariance handler.
 
+        Builds one per-pulsar covariance object for every pulsar in ``data``. The
+        per-pulsar class is chosen by ``data.diag_white_cov``:
+        :class:`DiagSinglePulsarWhiteCov` when set (TOA errors only, no free
+        parameters), :class:`SinglePulsarWhiteCov` otherwise.
+
+        NOTE: this constructor mutates its argument -- it calls
+        ``data.add_white_noise_cov(self)`` on the way out, so ``data.Nmat``
+        points at the handler afterwards.
+
         Parameters
         ----------
-        psrs : object
-            the pulsar object
-
         data : object
-            ATLAS data object
-
-        diag_white_cov : bool
-            do you want simple no backend diagonal white noise?
-
-        include_ecorr : bool
+            ATLAS data object. Supplies ``psrs``, ``npsrs``, ``diag_white_cov``
+            and ``marg``.
+        stabilize_TNT : bool, optional
+            Condition-stabilize TNT (and TDNTD) in the solvers before returning.
+            Defaults to False. NOTE: currently honoured only when
+            ``data.diag_white_cov`` is False.
+        efac_prior_bounds : tuple, optional
+            ``(low, high)`` bounds on EFAC. Defaults to ``(0.01, 10)``.
+        efac_prior_normal : tuple, optional
+            ``(mean, std)`` for the truncated-normal EFAC prior, used when EFAC
+            is not sampled uniformly. Defaults to ``(1., 0.25)``.
+        log10equad_prior_bounds : tuple, optional
+            ``(low, high)`` bounds on log10_t2equad. Defaults to ``(-9, -5)``.
+        log10ecorr_prior_bounds : tuple, optional
+            ``(low, high)`` bounds on log10_ecorr. Defaults to ``(-9, -5)``.
+        include_ecorr : bool, optional
             Give every backend an ECORR parameter? Set False when the epochs
             hold one TOA each, which makes ECORR degenerate with EQUAD. See
-            ``SinglePulsarWhiteCov``. Ignored when ``data.diag_white_cov`` is
-            set, since that model has no free parameters at all.
+            :class:`SinglePulsarWhiteCov`. Ignored when ``data.diag_white_cov``
+            is set, since that model has no free parameters at all.
+            Defaults to True.
         """
         # Extracting the data analysis settings
         self.data = data
@@ -1020,10 +899,10 @@ class WhiteCov:
         self.include_ecorr = include_ecorr
 
         self.cov_matrices = []
-        pbar = trange(self.npulsars)
+        pbar = tqdm(range(self.npulsars))
         for pidx in pbar:
             psr = self.data.psrs[pidx]
-            pbar.set_description(f"Construncting the white noise cov matrix for {psr.name}")
+            pbar.set_description(f"Constructing the white noise cov matrix for {psr.name}")
             if not self.diag_white_cov:
                 self.cov_matrices.append(SinglePulsarWhiteCov(
                                                             psr, 
@@ -1074,22 +953,6 @@ class WhiteCov:
         return jnp.concatenate([cov.params_dict_to_vector(params)
                                 for cov in self.cov_matrices])
 
-    def sample_numpyro_multi_psr_wn_vec(self, uniform_efac = False):
-        """Sample white noise for all pulsars and return a concatenated wn_vec.
-
-        The layout mirrors MultiPsr_WN_Cov.params_dict_to_vector:
-            [wn_vec_psr0 | wn_vec_psr1 | ...]
-        where each per-pulsar block is [ef | eq | ec] for that pulsar's backends.
-
-        Parameters
-        ----------
-        multi_cov : MultiPsr_WN_Cov
-
-        Returns
-        -------
-        wn_vec : jnp.ndarray [sum_p(3 * nbackends_p)]
-        """
-        return jnp.concatenate([cov.make_numpyro_prior(uniform_efac = uniform_efac) for cov in self.cov_matrices])
 
     def prior_draw(self, uniform_efac = False):
         """Sample white noise for all pulsars and return a concatenated wn_vec.

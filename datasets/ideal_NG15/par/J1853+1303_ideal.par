@@ -1,15 +1,15 @@
-# Created: 2026-07-20T09:27:08.466453
+# Created: 2026-08-31T14:40:21.480149
 # PINT_version: 1.1.5
 # User: kyleg
 # Host: ASLNX-BHQ7Z84.vuds.vanderbilt.edu
 # OS: Linux-6.11.0-24-generic-x86_64-with-glibc2.39
 # Python: 3.12.13 | packaged by conda-forge | (main, Mar  5 2026, 16:50:00) [GCC 14.3.0]
 # Format: pint
-# read_time: 2026-07-20T09:18:57.059534
+# read_time: 2026-08-31T14:26:24.405525
 # allow_tcb: False
 # convert_tcb: False
 # allow_T2: False
-# original_name: ../datasets/ideal_NG15/par/J1853+1303_ideal.par
+# original_name: ../../datasets/ideal_NG15/par/J1853+1303_ideal.par
 PSR                            J1853+1303
 EPHEM                               DE440
 CLOCK                        TT(BIPM2019)
