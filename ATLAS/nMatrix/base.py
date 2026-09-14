@@ -4,14 +4,12 @@ from ATLAS.signals.signals_utils import _timing_model_svd, stabilize_TNT, stabil
 
 import numpy as np
 import itertools
+from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 from functools import partial
-
-import numpyro
-import numpyro.distributions as dist
 
 # Difference in seconds between consecutive TOAs below which they are considered
 # to be within the same epoch (NOTE: they must be in the same backend for this to apply)
@@ -83,8 +81,17 @@ def _get_psr_wn_attributes(psr):
 
     # U is a list of arrays of toa indices for each epoch
     # we need to convert this to a padded array for fast einsum computations
-    U_pad, U_mask = jagged2padded(U, pad_value=-1) # [n_epochs, max_epoch_size], [n_epochs, max_epoch_size]
-    U_pad, U_mask = jnp.array(U_pad, dtype=int), jnp.array(U_mask, dtype=bool)
+    if len(U) == 0:
+        # No epoch holds more than one TOA (singletons are dropped above), so
+        # there is no ECORR block structure at all -- e.g. a single-frequency
+        # campaign with one TOA per observing session. Empty (0, 1) helpers let
+        # the per-epoch einsums in the solvers reduce over an empty axis, which
+        # contributes exactly zero rather than raising in jagged2padded.
+        U_pad = jnp.zeros((0, 1), dtype=int)
+        U_mask = jnp.zeros((0, 1), dtype=bool)
+    else:
+        U_pad, U_mask = jagged2padded(U, pad_value=-1) # [n_epochs, max_epoch_size], [n_epochs, max_epoch_size]
+        U_pad, U_mask = jnp.array(U_pad, dtype=int), jnp.array(U_mask, dtype=bool)
 
     # V is a list of backend indices for each epoch (i.e. which backend each epoch belongs to)
     V = jnp.array(V, dtype=int)
@@ -892,10 +899,10 @@ class WhiteCov:
         self.include_ecorr = include_ecorr
 
         self.cov_matrices = []
-        pbar = trange(self.npulsars)
+        pbar = tqdm(range(self.npulsars))
         for pidx in pbar:
             psr = self.data.psrs[pidx]
-            pbar.set_description(f"Construncting the white noise cov matrix for {psr.name}")
+            pbar.set_description(f"Constructing the white noise cov matrix for {psr.name}")
             if not self.diag_white_cov:
                 self.cov_matrices.append(SinglePulsarWhiteCov(
                                                             psr, 
