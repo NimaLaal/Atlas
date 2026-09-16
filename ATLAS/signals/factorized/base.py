@@ -1373,7 +1373,9 @@ class SuperSignal:
             phiinvs_diags = phiinvs.diagonal(axis1=-2, axis2=-1)  # [nmodes, npsrs]
 
         if self.linear_timing and not self.marg_tm:
-            phiinvs_diags_ltm = jnp.full(shape=(self.nmodes, self.npsrs),
+            # self.nmodes includes deterministic contributions,
+            # so shape GP priors from `RR` which only includes reparameterized modes
+            phiinvs_diags_ltm = jnp.full(shape=(RR.shape[-1], self.npsrs),
                                         fill_value=self.lowest_value_eq_to_zero)
             phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
             # set prior variance of padded parameters to one for stable transformation
