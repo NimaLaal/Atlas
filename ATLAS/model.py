@@ -91,13 +91,32 @@ def model_maker(raw_residuals,
     ######################################## Red Noise ########################################
     xs = numpyro.sample('red_noise', dist.Uniform(super_sig.model.lower_prior_lim_all, 
                                                   super_sig.model.upper_prior_lim_all))
+
+    ################################ Deterministic Signals ####################################
+    if super_sig.has_det:
+        det = super_sig.det_signal
+        det_params = numpyro.sample('det_params', dist.Uniform(det.det_param_mins, det.det_param_maxs))
+        if not det.with_psr_params:
+            D_params = (det_params, None, None)
+        else:
+            data = super_sig.data
+            psr_phases = numpyro.sample('psr_phases', dist.Uniform(0., 2. * jnp.pi).expand((data.npsrs,)))
+            psr_dists_standard = numpyro.sample('psr_dists_standard', dist.Normal().expand((data.npsrs,)))
+            psr_dists = numpyro.deterministic('psr_dists', data.psr_dists_mean + psr_dists_standard * data.psr_dists_std)
+            D_params = (det_params, psr_phases, psr_dists)
+    else:
+        D_params = None
+
     # evaluate the posterior
     if marg_over_non_gwb:
         z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, 2*super_sig.data.num_gwb_bins)))
-        lprob, coeff = super_sig.partial_marg_lnposterior(helpers = helpers_now, red_params = xs, z = z_a)
+        lprob, coeff = super_sig.partial_marg_lnposterior(helpers = helpers_now, red_params = xs, z = z_a,
+                                                          D_params = D_params)
     else:
-        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes)))
-        lprob, coeff = super_sig.lnposterior_reparam(helpers = helpers_now, red_params = xs, z = z_a)
+        n_reparam = super_sig.nmodes - (super_sig.det_signal.num_coeff_det if super_sig.has_det else 0)
+        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, n_reparam)))
+        lprob, coeff = super_sig.lnposterior_reparam(helpers = helpers_now, red_params = xs, z = z_a,
+                                                     D_params = D_params)
 
     numpyro.factor('lnpost', lprob + 0.5 * jnp.sum(z_a**2))
     if save_red_coeff:
