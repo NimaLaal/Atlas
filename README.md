@@ -127,6 +127,8 @@ comparison against conventional codes:
 
 ```python
 data = PTA_Data(psrs, num_gwb_bins=14, num_irn_bins=30, marg_timing=True)
+m    = ModelBuilder(data=data)                 # new data needs a new builder
+wn   = m.make_white_noise(stabilize_TNT=True)  # and a fresh WhiteCov on it
 rn   = m.make_red_noise("unc+cor->unc", ...)   # no `ltm|` prefix
 mcmc.run(..., marg_over_non_gwb=False)         # z_a is [npsr, 2*num_irn_bins]
 ```
@@ -135,6 +137,12 @@ mcmc.run(..., marg_over_non_gwb=False)         # z_a is [npsr, 2*num_irn_bins]
 columns and the timing solution is projected out inside the noise matrix. Best
 conditioned of the four treatments, and the only one with no timing coefficients
 to recover.
+
+Rebuilding the builder is not optional. `ModelBuilder` binds the dataset at
+construction and `make_red_noise` reads `self.data`, so rebinding the name
+`data` leaves an existing builder pointing at the previous `PTA_Data` — it would
+build the *un*-marginalised model without complaint. The same applies to
+`WhiteCov`, which registers itself on the data object it was given.
 
 ## Likelihood
 
@@ -224,6 +232,8 @@ parameters and a flat ridge in the posterior:
 
 ```python
 data = PTA_Data([psr], num_irn_bins=30, marg_timing=True)
+m    = ModelBuilder(data=data)                 # see above: new data, new builder
+wn   = m.make_white_noise(stabilize_TNT=True)
 rn   = m.make_red_noise("unc", irn_psd_function=powerlaw,
                         irn_lower_bound_psd=jnp.array([-18., 0.]),
                         irn_upper_bound_psd=jnp.array([-11., 7.]))
