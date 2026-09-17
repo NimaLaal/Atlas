@@ -499,4 +499,4 @@ def gt_orf(angle, tau):
 @jax.jit
 def zero_orf(angle):
     """No correlation."""
-    return jnp.zeros(angle)
+    return jnp.zeros_like(angle)
