@@ -104,20 +104,15 @@ class ModelBuilder:
             data=self.data,
         )
 
-    def make_white_noise(self, stabilize_TNT=True):
-        """Build and return the white-noise covariance model.
+    def make_white_noise(self, stabilize_TNT = True, include_ecorr = None):
+        """Build the white noise covariance.
 
-        Parameters
-        ----------
-        stabilize_TNT : bool, default True
-            Add a small diagonal to TNT before inversion to guard against
-            near-singular matrices.
-
-        Returns
-        -------
-        WhiteCov
+        ``include_ecorr=None`` takes the answer from ``data.include_ecorr``,
+        which PTA_Data detects from the TOA epochs; True/False overrides it.
         """
-        return WhiteCov(data=self.data, stabilize_TNT=stabilize_TNT)
+        wn_model = WhiteCov(data=self.data, stabilize_TNT=stabilize_TNT,
+                            include_ecorr=include_ecorr)
+        return wn_model
 
     def make_red_noise(self,
                        red_noise_combination_string,

@@ -100,13 +100,10 @@ def run():
         timfiles=None, parfiles=None, noise_dict=None, dm_ref_freq=1400,
     )
     m = ModelBuilder(data=data)
-    # WhiteCov directly rather than m.make_white_noise(), which cannot pass
-    # include_ecorr -- and ECORR must be off here: every MDC1 epoch holds a
-    # single TOA, which makes ECORR exactly degenerate with EQUAD, and
-    # SinglePulsarWhiteCov refuses it rather than sampling an unidentified
-    # direction.
-    wn = WhiteCov(data=data, stabilize_TNT=True,
-                  include_ecorr=CONFIG["include_ecorr"])
+    # wn = WhiteCov(data=data, stabilize_TNT=True,
+    #               include_ecorr=CONFIG["include_ecorr"])
+    ## should run cleanly now
+    wn = m.make_white_noise(stabilize_TNT=True)
     ilo, ilo_g, ihi, ihi_g = CONFIG["irn_prior"]
     glo, glo_g, ghi, ghi_g = CONFIG["gwb_prior"]
     rn = m.make_red_noise(

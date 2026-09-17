@@ -1,5 +1,6 @@
 
 from ATLAS.utils import get_pulsar_timespan
+from ATLAS.utils import psr_has_multi_toa_epoch
 from ATLAS.utils import jit, jit_method
 from ATLAS.signals.signals_utils import _timing_model_svd
 
@@ -34,6 +35,9 @@ class PTA_Data:
     psr_tspans : array
         An array containing the individual timespans for each pulsar, calculated
         as the difference between the maximum and minimum TOAs for each pulsar. [npsrs]
+    include_ecorr : bool
+        Whether ECORR is identifiable for this dataset, detected from the TOA
+        epochs. See :meth:`_detect_ecorr`.
     """
 
     def __init__(self, 
@@ -110,6 +114,8 @@ class PTA_Data:
         self.linear_timing = linear_timing
         self.diag_white_cov = diag_white_cov
         self.marg = marg_timing
+        # Consulted by WhiteCov when its own include_ecorr is left at None.
+        self.include_ecorr = self._detect_ecorr()
 
         # Radio frequencies
         radio_freqs = jnp.concat([psr.freqs for psr in psrs])
@@ -135,6 +141,16 @@ class PTA_Data:
         name still work.
         """
         return self.num_dm_bins
+
+    def _detect_ecorr(self):
+        """Is ECORR identifiable anywhere in this PTA?
+
+        False only when no pulsar has an epoch holding more than one TOA, which
+        makes ECORR exactly degenerate with EQUAD. NOTE: a mixed dataset keeps
+        this True, and its epoch-less pulsars still raise in SinglePulsarWhiteCov
+        -- ECORR is one flag for the whole PTA, not per pulsar.
+        """
+        return any(psr_has_multi_toa_epoch(psr) for psr in self.psrs)
 
     def add_white_noise_cov(self, white_noise_cov):
         self.Nmat = white_noise_cov
