@@ -24,7 +24,28 @@ MPC_M = PC_M * 1e6  # Megaparsec in meters
 
 T_SUN_SEC = 4.9254909476412675e-06 # Solar mass time in seconds
 
+# Difference in seconds between consecutive TOAs below which they are considered
+# to be within the same epoch (NOTE: they must be in the same backend for this to apply)
+EPOCH_THRESHOLD = 1.0 # seconds
+
 # Pulsar utilities--------------------------------------------------------------
+
+def psr_has_multi_toa_epoch(psr):
+    """Does any epoch of this pulsar hold more than one TOA?
+
+    Equivalent to ``len(_get_psr_wn_attributes(psr)[2]) > 0`` (nMatrix.base)
+    without building the padded epoch helpers: that function groups TOAs by
+    backend, splits them at gaps of `EPOCH_THRESHOLD` or more, and drops every
+    epoch of length one, so a surviving epoch exists exactly when two adjacent
+    TOAs of the same backend are closer together than `EPOCH_THRESHOLD`.
+    ECORR is only identifiable when at least one such epoch exists.
+    """
+    toas = np.asarray(psr.toas, dtype=float)
+    flags = np.asarray(psr.backend_flags)
+    order = np.lexsort((toas, flags)) # backend major, time minor
+    t, b = toas[order], flags[order]
+    return bool(np.any((b[1:] == b[:-1]) & (np.diff(t) < EPOCH_THRESHOLD)))
+
 
 def get_pulsar_timespan(psr):
     """Get the total timespan of a pulsar or pulsar array.

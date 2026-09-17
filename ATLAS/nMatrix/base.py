@@ -1,4 +1,5 @@
 from ATLAS.utils import jagged2padded, jit_method
+from ATLAS.utils import EPOCH_THRESHOLD
 from ATLAS.utils import jit
 from ATLAS.signals.signals_utils import _timing_model_svd, stabilize_TNT, stabilize_TDNTD
 
@@ -10,10 +11,6 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 from functools import partial
-
-# Difference in seconds between consecutive TOAs below which they are considered
-# to be within the same epoch (NOTE: they must be in the same backend for this to apply)
-EPOCH_THRESHOLD = 1.0 # seconds
 
 # Helper functions for finding TOA epochs --------------------------------------
 def _get_psr_wn_attributes(psr):
@@ -31,9 +28,10 @@ def _get_psr_wn_attributes(psr):
     - toas: (N_toa) array of time of arrivals for this pulsar
     - backend_flags: (N_toa) array of backend names for each toa
 
-    TOAs are grouped into epochs such that all toas in an epoch are within a time 
-    interval `EPOCH_THRESHOLD` of the first toa in that epoch. `EPOCH_THRESHOLD` 
-    is given in seconds.
+    Within a backend, TOAs are grouped into epochs by chaining: a new epoch starts
+    wherever two adjacent (time-sorted) toas are separated by `EPOCH_THRESHOLD` or
+    more, so an epoch may span more than `EPOCH_THRESHOLD` in total.
+    `EPOCH_THRESHOLD` is given in seconds.
 
     Parameters
     ----------
@@ -852,7 +850,7 @@ class WhiteCov:
                 efac_prior_normal = (1., 0.25), # (mean, std)
                 log10equad_prior_bounds = (-9, -5), # (low, high)
                 log10ecorr_prior_bounds = (-9, -5), # (low, high)
-                include_ecorr = True
+                include_ecorr = None
                 ):
         """Construct a multi-pulsar white noise covariance handler.
 
@@ -883,13 +881,20 @@ class WhiteCov:
             ``(low, high)`` bounds on log10_t2equad. Defaults to ``(-9, -5)``.
         log10ecorr_prior_bounds : tuple, optional
             ``(low, high)`` bounds on log10_ecorr. Defaults to ``(-9, -5)``.
-        include_ecorr : bool, optional
+        include_ecorr : bool or None, optional
             Give every backend an ECORR parameter? Set False when the epochs
             hold one TOA each, which makes ECORR degenerate with EQUAD. See
             :class:`SinglePulsarWhiteCov`. Ignored when ``data.diag_white_cov``
             is set, since that model has no free parameters at all.
-            Defaults to True.
+            Defaults to None, which takes the answer from ``data.include_ecorr``
+            (detected from the TOA epochs by :class:`ATLAS.data.PTA_Data`) and
+            falls back to True if the data object does not carry the attribute.
         """
+        if include_ecorr is None:
+            include_ecorr = getattr(data, 'include_ecorr', None)
+            if include_ecorr is None:
+                include_ecorr = True
+
         # Extracting the data analysis settings
         self.data = data
         self.diag_white_cov = self.data.diag_white_cov

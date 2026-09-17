@@ -42,9 +42,14 @@ class ModelBuilder:
                                                 load_how_many_in_parallel = load_how_many_in_parallel,
                                                 data = self.data)
 
-    def make_white_noise(self, stabilize_TNT = True):
+    def make_white_noise(self, stabilize_TNT = True, include_ecorr = None):
+        """Build the white noise covariance.
 
-        wn_model = WhiteCov(data = self.data, stabilize_TNT = stabilize_TNT)
+        ``include_ecorr=None`` takes the answer from ``data.include_ecorr``,
+        which PTA_Data detects from the TOA epochs; True/False overrides it.
+        """
+        wn_model = WhiteCov(data = self.data, stabilize_TNT = stabilize_TNT,
+                            include_ecorr = include_ecorr)
         return wn_model
 
     def make_red_noise(self,
