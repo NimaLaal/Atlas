@@ -2,6 +2,7 @@
 from ATLAS.utils import jit, jit_method
 
 import jax.numpy as jnp
+import numpy as np
 
 from glob import glob
 
@@ -12,6 +13,7 @@ from jug.engine.session import TimingSession
 from enterprise.pulsar import Pulsar as E_Pulsar
 import pint.logging
 import logging
+from dataclasses import dataclass
 
 MAX_JOBS = 8
 LINEAR_PARAMS = ['offset','f','dm','fd','jump'] # Matt also said NE_SW, but I dunno what that is
@@ -146,6 +148,10 @@ class Pulsar:
             self.freqs = jnp.array(result['freq_bary_mhz'])
             self.backend_flags = list([t.flags['f'] for t in s.toas_data]) # Can't store as jnp array
 
+            # Pulsar Distances
+            pdist = np.load('../datasets/NG15/pulsar_distances_15yr.npz')[self.name][:2]
+            self.pdist = jnp.array([(float(x), float(y)) for x, y in [pdist]])[0]
+
             # Position stuffs
             self.raj = float(s.params['_raj_rad'])
             self.decj = float(s.params['_decj_rad'])
@@ -171,17 +177,54 @@ class Pulsar:
                 linear.append(state)
 
             self.Mmat_is_linear = jnp.array(linear)
+            self.Mmat_linear = self.Mmat[:, self.Mmat_is_linear]
+            self.Mmat_linear_labels = [l for l, is_lin in zip(self.Mmat_labels, self.Mmat_is_linear) if is_lin]
 
-    @property
-    def Mmat_linear(self):
-        return self.Mmat[:, self.Mmat_is_linear]
+    # @property
+    # def Mmat_linear(self):
+    #     return self.Mmat[:, self.Mmat_is_linear]
     
-    @property
-    def Mmat_linear_labels(self):
-        return [l for l, is_lin in zip(self.Mmat_labels, self.Mmat_is_linear) if is_lin]
+    # @property
+    # def Mmat_linear_labels(self):
+    #     return [l for l, is_lin in zip(self.Mmat_labels, self.Mmat_is_linear) if is_lin]
 
 
 
+@dataclass
+class PulsarDataLoader:
+    par_file: str
+    tim_file: str
+    timing_package: str
+
+    # Basic info
+    name: str
+
+    # TOA data
+    toas: jnp.ndarray
+    residuals: jnp.ndarray
+    toaerrs: jnp.ndarray
+    freqs: jnp.ndarray
+    backend_flags: list
+
+    # Pulsar distance
+    pdist: jnp.ndarray
+
+    # Position
+    raj: float
+    decj: float
+    pos: jnp.ndarray
+
+    # Timing-model parameters
+    fit_param_names: list
+    fit_param_values: jnp.ndarray
+    fit_param_uncertainties: jnp.ndarray
+
+    # Linearized design matrix
+    Mmat: jnp.ndarray
+    Mmat_labels: list
+    Mmat_is_linear: jnp.ndarray
+    Mmat_linear: jnp.ndarray
+    Mmat_linear_labels: list
 
 
 

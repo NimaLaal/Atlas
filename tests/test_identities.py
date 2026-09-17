@@ -289,8 +289,9 @@ def test_reparam_without_timing_block():
 
 def test_empty_p_block_is_rejected():
     """A model string with no non-GWB stochastic block should say so, not
-    fail deep inside a slice."""
-    with pytest.raises(ValueError, match="nothing to marginalise"):
+    fail deep inside a slice.
+    """
+    with pytest.raises(ValueError, match=r"nothing to marginali[sz]e"):
         m = H.build(model_string="cor", linear_timing=False, orf_name="zero")
         m.rn.partial_marg_lnposterior_helper
 
@@ -362,9 +363,6 @@ def test_partial_marg_requires_cor_block():
             jnp.zeros((m.npsr, 2 * m.n_gwb)))
 
 
-@pytest.mark.xfail(reason="build_basis emits cor=slice(18,26) into a 20-column basis "
-                          "for a separate (non-overlapping) cor block",
-                   raises=ValueError, strict=True)
 def test_separate_cor_block():
     m = H.build(model_string="ltm|unc;cor")
     z = jnp.zeros((m.npsr, m.rn.nmodes))
