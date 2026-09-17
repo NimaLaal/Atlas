@@ -103,6 +103,12 @@ whitened coordinates while the recorded `coeff` are physical. With
 `"ltm|unc+cor->unc"` and `num_irn_bins=30` above, that is the array-wide timing
 width plus 60 red columns per pulsar.
 
+With a `det` block the width is `nmodes - det_signal.num_coeff_det` instead:
+deterministic columns carry no prior and are never reparameterised, since their
+coefficients come from the deterministic parameters rather than from `z`.
+`model_maker` computes this for you, and it is why `jnp.zeros((npsr, rn.nmodes))`
+— which appears throughout the notebooks — is right only for a model without one.
+
 `save_red_coeff=True` is what makes the coefficients retrievable — it registers
 `numpyro.deterministic('coeff', coeff)`. Without it they are still sampled, and
 still affect the posterior, but are discarded. The timing block of `coeff` is
@@ -346,27 +352,27 @@ elementwise, and is intended as a gate before refactoring.
 |---|---|---|
 | `data.py` | 143 | `PTA_Data`: arrays plus run configuration |
 | `model_builder.py` | 122 | `ModelBuilder`: the construction API |
-| `model.py` | 104 | `model_maker`: the NumPyro model |
+| `model.py` | 123 | `model_maker`: the NumPyro model |
 | `nMatrix/base.py` | 1192 | white-noise covariance and its solves |
 | `signals/factorized/base.py` | 1518 | `Red`, `GaussianTiming`, `SuperSignal`, the likelihoods |
 | `parameterized.py` | 1623 | `φ` assembly and inversion |
 | `signals/signals_utils.py` | 565 | model-string parser, column bookkeeping, timing SVD |
 | `signals/correlated/base.py` | 608 | `Correlated`: background signal and ORF |
 | `signals/timing/` | 2266 | non-linear timing model (JUG) |
-| `signals/deterministic/` | 713 | continuous-wave and other deterministic signals |
+| `signals/deterministic/` | 402 | `Deterministic`: continuous waves and other deterministic signals |
 | `samplers/canetoadracing.py` | 678 | vendored `MultiHMCGibbs` kernels |
 | `psd_functions.py` | 501 | PSD and ORF library |
 | `sim.py` | 357 | simulation |
 | `experimental/` | 4832 | not reachable from any entry point; see its docstring |
 
-The rows above account for 15,222 lines; the package is 16,853 across 34 modules.
+The rows above account for 14,930 lines; the package is 16,561 across 34 modules.
 
 ## Known issues
 
-- No end-to-end continuous-wave path currently runs. `JointDeterministic`
-  cannot be constructed, the CW delay function and its caller disagree over
-  whether `tref` has already been subtracted, and `model_maker` does not sample
-  deterministic parameters.
+- `model_maker` sizes the reparameterised block as
+  `nmodes - det_signal.num_coeff_det`, but `lnposterior_reparam` still shapes the
+  linear-timing prior from `self.nmodes`, so a `det` block combined with `ltm`
+  mismatches. A fix is in flight on the `AG` branch.
 - An `ltm|` prefix is only honoured when the shared group names a representative
   with `->`. Without one, `build_basis` leaves `M` out of the basis while the
   column map still claims it is there, so `"ltm|unc"` and `"ltm|unc;cor"` both
@@ -384,9 +390,10 @@ The rows above account for 15,222 lines; the package is 16,853 across 34 modules
   a message.
 - The chromatic index is implemented but connected to nothing:
   `SuperSignal.update_red_basis` has no callers.
-- `stabilize_TNT` is a no-op for any pulsar with padded timing columns, since
-  those columns are exactly zero and the shift is proportional to
-  `min(diag(TNT))`.
+- `stabilize_TNT` (`signals/signals_utils.py:78`) is a no-op for any pulsar with
+  padded timing columns: the shift is `eps * min(diag(TNT))` and those columns
+  put an exact zero on the diagonal. A positive-only variant is commented out
+  directly below it.
 
 ## References
 
