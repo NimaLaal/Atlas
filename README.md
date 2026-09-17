@@ -369,10 +369,22 @@ The rows above account for 14,930 lines; the package is 16,561 across 34 modules
 
 ## Known issues
 
-- `model_maker` sizes the reparameterised block as
-  `nmodes - det_signal.num_coeff_det`, but `lnposterior_reparam` still shapes the
-  linear-timing prior from `self.nmodes`, so a `det` block combined with `ltm`
-  mismatches. A fix is in flight on the `AG` branch.
+- A `det` block works with `marg_timing=True` but crashes with sampled linear
+  timing, before evaluating anything: `model_maker` sizes the reparameterised
+  block as `nmodes - det_signal.num_coeff_det`, while `lnposterior_reparam`
+  still shapes the linear-timing prior from `self.nmodes`. Measured on a
+  3-pulsar synthetic, `"ltm|unc+cor->unc;det"` raises
+  `Incompatible types for broadcasting: float64[12,3] vs float64[28,3]`. A fix
+  is in flight on the `AG` branch.
+- Nothing in the test suite exercises a `det` block — no test mentions
+  `D_params` or `has_det` — which is why the above reached `main`.
+- `ln_likelihood_curn` has no `has_det` guard. With a `det` block it either
+  fails on shape or, given a matching-width `phiinv`, marginalises the
+  deterministic columns under a red-noise prior and returns an answer.
+- `SuperSignal.nfreqs` (`signals/factorized/base.py:822`) subtracts only the
+  timing width, so deterministic columns are counted as red-noise bins.
+- `cw_delay_evolve_float64` documents its return as `[ns]`
+  (`signals/deterministic/det_signals.py:86`); the delays are in **seconds**.
 - An `ltm|` prefix is only honoured when the shared group names a representative
   with `->`. Without one, `build_basis` leaves `M` out of the basis while the
   column map still claims it is there, so `"ltm|unc"` and `"ltm|unc;cor"` both
