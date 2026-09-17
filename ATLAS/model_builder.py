@@ -85,16 +85,24 @@ class ModelBuilder:
                 ]
                 for sublist in sample:
                     for j, s in enumerate(sublist):
-                        self.SAMPLE[i][j] = s.replace('A1DOT', 'XDOT')
-            else:
-                self.SAMPLE = [self.data.psrs[pidx].fit_param_names for pidx in range(self.data.npsrs)]
-                
-        load_how_many_in_parallel = min(self.data.npsrs, 10)
-        return build_multi_psr_timing_model(self.data.parfiles, 
-                                                self.data.timfiles, 
-                                                self.SAMPLE, 
-                                                load_how_many_in_parallel = load_how_many_in_parallel,
-                                                data = self.data)
+                        sublist[j] = s.replace('A1DOT', 'XDOT')
+            except:
+                sample = [
+                    list(self.data.psrs[pidx].fit_param_names)
+                    for pidx in range(self.data.npsrs)
+                ]
+
+        njobs = (load_how_many_in_parallel
+                 if load_how_many_in_parallel is not None
+                 else min(self.data.npsrs, 10))
+
+        return build_multi_psr_timing_model(
+            self.data.parfiles,
+            self.data.timfiles,
+            sample,
+            load_how_many_in_parallel=njobs,
+            data=self.data,
+        )
 
     def make_white_noise(self, stabilize_TNT = True, include_ecorr = None):
         """Build the white noise covariance.
@@ -102,8 +110,8 @@ class ModelBuilder:
         ``include_ecorr=None`` takes the answer from ``data.include_ecorr``,
         which PTA_Data detects from the TOA epochs; True/False overrides it.
         """
-        wn_model = WhiteCov(data = self.data, stabilize_TNT = stabilize_TNT,
-                            include_ecorr = include_ecorr)
+        wn_model = WhiteCov(data=self.data, stabilize_TNT=stabilize_TNT,
+                            include_ecorr=include_ecorr)
         return wn_model
 
     def make_red_noise(self,
