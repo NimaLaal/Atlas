@@ -1,4 +1,3 @@
-
 from ATLAS.utils import jit_method, jit
 from ATLAS.signals import signals_utils as sutils
 from ATLAS.signals.factorized.utils import make_irn_model
@@ -12,60 +11,22 @@ from tqdm import trange
 from functools import partial
 import numpy as np
 import random
-from sklearn.decomposition import TruncatedSVD
 from sklearn.decomposition import PCA
-from tqdm_joblib import ParallelPbar
-from joblib import delayed
 from functools import cached_property
 
 class Red:
-    """A signal class for a factorized likelihood (not prior).
+    """Per-pulsar red-noise signal on a Fourier (sine/cosine) basis.
 
-    The frequencies are the first `nfreqs` harmonics of 1/Tspan. Tspan could either
-    be the PTA timespan or the individual pulsar timespans. Supplying `user_freqs`
-    overwrites this.
+    Builds the Fourier design matrix for every pulsar, holds the PSD model and
+    its prior bounds, and supplies the white-noise helper products
+    (TNT, TNr, rNr, logdet_N) the likelihoods consume.  The
+    ``*_freespec`` methods implement the blocked-Gibbs conditional draws of
+    Laal et al. and are valid only for a FREE-SPECTRUM ``psd_function``.
 
-    Attributes
-    ----------
-    name : str
-        The name of the signal.
-    init_params : dict
-        The parameters used for initialization, which can be useful for re-initialization.
-    parameter_names : list of str
-        A list of parameter names corresponding to the parameters of the signal.
-    n_parameters : int
-        The number of parameters in the signal.
-    parameter_range : array
-        An array of the lower and upper bounds for each parameter [n_parameters, 2].
-    allow_posterior_draw : bool
-        Whether to allow posterior draws for this signal.
-    sampling_method : str
-        The sampling method to use for the signal.
-    initialized : bool
-        Whether the signal has been fully initialized with data.
-    psr_toas : list of arrays
-        A reference to the list of TOA arrays for each pulsar [npsr, npsr_toas].
-    nfreqs : int
-        The number of frequency bins in the free spectrum.
-    nmodes : int
-        The number of modes in the Fourier design matrix (2*nfreqs for sine and cosine).
-    npsrs : int
-        The number of pulsars in the dataset.
-    use_pulsar_tspan : bool
-        Whether to use individual pulsar timespans for frequency calculation, or the PTA timespan.
-    tspans : array or float
-        The timespans used for frequency calculation. Either scalar or [npsrs]
-    freqs : array
-        The frequencies used in the Fourier design matrix. Either [nfreqs] or [npsrs, nfreqs]
-    log_prior_volume : float
-        The log of the prior volume for the parameters, used for uniform priors.
-    fixed_wn : bool
-        Whether the white noise is fixed, which can allow for optimization in computations.
-    _psd_range : array
-        The range of the power spectral density in linear space, used for computations.
-    _diag_idx : array
-        An array of diagonal indices for the Sigma matrix, used for efficient updates.
+    Parameter layout: a flat ``[npsr * nfreqs]`` vector of ``halflog10_rho``,
+    pulsar index varying slowest, matching ``sutils.sigmaVec2blockVec``.
     """
+
     def __init__(self,
                  name,
                  data,
@@ -76,22 +37,11 @@ class Red:
                  halflog10_rho_range=(-9,-2), 
                  use_pulsar_tspan=False,
                  posterior_draw_ndraws = 1,
-                 user_freqs = jnp.array([False]),
+                 user_freqs = None,
                 ):
-        """The constructor for the IRN_Freespectrum signal class.
-
-        This signal models the intrinsic red noise as a pulsar-independent signal 
-        in all pulsars. The power spectrum is modeled as a free spectrum with nfreqs 
-        frequencies. The parameters are given as halflog10_rho, which is defined as
-        - <a^T a> = rho^2 -> halflog10_rho = 0.5 * log10(<a^T a>)
-        This means that the units are log(seconds). 
-
-        The frequencies are the first `nfreqs` harmonics of 1/Tspan. Tspan is either
-        the PTA timespan or the individual pulsar timespans, depending on the
-        `use_pulsar_tspan` flag.
-
-        If data is not provided, the signal use a simple initialization (see 
-        Atlas.signals.base.Signal_Base).
+        """
+        The ATLAS red noise signal for uncorrelated processes.
+        This signal models the uncorelated red noise.
 
         Parameters
         ----------
@@ -99,6 +49,13 @@ class Red:
             The name of the signal.
         data : Atlas.data.Data.PTA_Data
             Atlas data object.
+        psd_function: callable
+            a functools.partial function capable of modeling red noise PSD
+        lower_bound_psd: jax.array
+            the lower prior bound ordered exacly as how the `psd_function` accepts parameters
+        upper_bound_psd: jax.array
+            the upper prior bound ordered exacly as how the `psd_function` accepts parameters
+
         nfreqs : int, optional
             The number of frequency bins in the free spectrum, by default 10.
         halflog10_rho_range : tuple, optional
@@ -125,10 +82,18 @@ class Red:
         self.npsrs = self.data.npsrs 
 
         self.use_pulsar_tspan = use_pulsar_tspan # Use pulsar tspan, or PTA tspan?
-        if user_freqs.any():
-            self.freqs = user_freqs
+        # `user_freqs` used to default to jnp.array([False]) and be tested with
+        # .any(); that silently ignored a user array of all-zero frequencies and
+        # raised AttributeError on a plain Python list.  None is the sentinel now,
+        # and the old sentinel is still accepted so existing callers keep working.
+        if user_freqs is not None and not (
+                getattr(user_freqs, 'dtype', None) == jnp.bool_ and not jnp.asarray(user_freqs).any()):
+            self.freqs = jnp.asarray(user_freqs)
             self.nfreqs = len(self.freqs)
             self.nmodes = 2 * self.nfreqs
+            # Set even on this branch: get_basis()/diagnostics read self.tspans,
+            # which was previously left undefined whenever user_freqs was given.
+            self.tspans = data.psr_tspans if use_pulsar_tspan else data.pta_tspan
         else:    
             if use_pulsar_tspan:
                 self.tspans = data.psr_tspans # Array of individual pulsar timespans [npsrs]
@@ -143,8 +108,13 @@ class Red:
                 # Frequencies for this signal (Same frequencies for all pulsars)
                 self.freqs = sutils.get_harmonic_frequencies(self.nfreqs, self.tspans) # [nfreqs]  
 
-        # length of parameters
-        self.n_parameters = len(self.freqs) # Number of parameters
+        # Length of the parameter vector.  This was len(self.freqs), which is
+        # nfreqs when the frequencies are shared and npsrs when they are
+        # per-pulsar -- neither matches the [npsr*nfreqs] layout that
+        # get_phi_diag / ln_prior_freespec / posterior_draw_freespec all assume.
+        # With npsrs > 1 the old value made ln_prior_freespec's comparison
+        # broadcast-incompatible and prior_draw_freespec return the wrong length.
+        self.n_parameters = self.npsrs * self.nfreqs
         par_range = jnp.ones((self.n_parameters, 2)) * jnp.array(halflog10_rho_range)[None,:]
         self.parameter_range = par_range # Range for each parameter, shape (n_parameters, 2)
 
@@ -157,15 +127,17 @@ class Red:
         self.fixed_res = data.fixed_res
         self.linear_timing = data.linear_timing
 
-        # function to get helper objects for likelihood
-        self.get_helpers = self._get_helpers()
-
         # Hidden attributes if needed-------------------------------------------
         # PSD range in linear space for computations.
         self._psd_range = 10**(2*jnp.array(halflog10_rho_range, dtype=float)) 
         self._diag_idx = jnp.arange(self.nmodes)
-        
+
+        # Built BEFORE _get_helpers() so the helper wrapper can hand it over as a
+        # traced argument.  (Despite the name, this is an ARRAY, not a callable.)
         self.get_red_basis = jnp.concat(self.get_basis()) # [n_toas, nmodes]
+
+        # function to get helper objects for likelihood
+        self.get_helpers = self._get_helpers()
 
     # Helper methods------------------------------------------------------------
     @jit_method
@@ -204,32 +176,35 @@ class Red:
             Function which return TNT, TNr, rNr, logdet_N, etc. helper arrays.
         """
 
-        if self.fixed_wn and not self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               white_noise_params = self.data.fixed_white_noise_params,
-                               )
-            return jit(new_func)
+        # Four near-identical branches collapsed into one bound-kwargs dict --
+        # same semantics, and the fixed_wn/fixed_res combinations can no longer
+        # drift apart.  The basis is passed as a TRACED ARGUMENT rather than
+        # captured from self: capturing it makes it a compile-time constant that
+        # XLA writes into the executable (see SuperSignal._get_helpers for the
+        # 9.5 GB incident on NANOGrav 15yr).
+        bound = dict(N_list = self.data.Nmat)
+        if self.fixed_wn:
+            bound['white_noise_params'] = self.data.fixed_white_noise_params
+        if self.fixed_res:
+            bound['reff'] = jnp.concat(self.data.raw_residuals)[:, None]
 
-        elif not self.fixed_wn and not self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               )
-            return jit(new_func)
+        core = jit(partial(self.update_white_matrix_products_unjitted, **bound))
 
-        elif not self.fixed_wn and self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               reff = jnp.concat(self.data.raw_residuals)[:, None],
-                               )
-            return jit(new_func)
+        def get_helpers(red_noise_basis = None, **kwargs):
+            """TNT / TNr / rNr / logdet_N for the current white-noise params.
 
-        elif self.fixed_wn and self.fixed_res:
-            new_func = partial(self.update_white_matrix_products_unjitted,
-                               N_list = self.data.Nmat,
-                               white_noise_params = self.data.fixed_white_noise_params,
-                               reff = jnp.concat(self.data.raw_residuals)[:, None],)
-            return jit(new_func)
+            ``red_noise_basis`` defaults to this signal's own T-matrix; pass one
+            explicitly to override it (e.g. the chromatic-index path, which
+            rescales the DM columns).  Any argument not bound at construction
+            (``white_noise_params`` when the white noise is free, ``reff`` when
+            the residuals are not fixed) must be supplied as a keyword.
+            """
+            if red_noise_basis is None:
+                red_noise_basis = self.get_red_basis
+            return core(red_noise_basis = red_noise_basis, **kwargs)
+
+        get_helpers.core = core
+        return get_helpers
 
     @jit_method
     def get_phi_diag(self, params):
@@ -354,7 +329,8 @@ class Red:
         return coef # [npsr, nmodes]
     
     # Required methods----------------------------------------------------------
-    def update_white_matrix_products_unjitted(self, N_list, white_noise_params, reff):
+    def update_white_matrix_products_unjitted(self, red_noise_basis, N_list,
+                                              white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
         This method computes the helper objects TNT, TNr, rNr, and logdet_N for each pulsar, which are
@@ -367,18 +343,23 @@ class Red:
 
         Parameters
         ----------
-        N_list : list of Atlas.nMatrix.base.Base_TOA_cov
-            The white noise covariance matrices for each pulsar.
-        reff : list of arrays
-            The effective residuals for each pulsar. [npsr, npsr_toas]
+        red_noise_basis : array, [n_toas, nmodes]
+            The T-matrix, passed as a traced argument rather than captured.
+        N_list : Atlas.nMatrix.base.Base_TOA_cov
+            The white-noise covariance model for all pulsars.
+        white_noise_params : array
+            Current white-noise parameters (bound at construction when fixed).
+        reff : array, [n_toas, 1]
+            The effective residuals (bound at construction when fixed).
 
         Returns
         -------
         tuple
-            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
+            (TNT, TNr, rNr, logdet_N): [npsr, nmode, nmode], [npsr, nmode],
+            scalar, scalar.  ``rNr`` and ``logdet_N`` are totals over the
+            array, not per pulsar.
         """
-        return N_list.get_red_helpers(red_noise_basis = self.get_red_basis, 
+        return N_list.get_red_helpers(red_noise_basis = red_noise_basis, 
                                       residuals = reff, 
                                       white_noise_params = white_noise_params) # [FNF, FNr, rNr, logdetN]
 
@@ -387,9 +368,9 @@ class Red:
     def ln_prior_freespec(self, params):
         """Compute the log-prior for the IRN signal parameters.
 
-        This method computes the log of the uniform prior on the IRN parameters.
-        All parameters are uniform priors with the range specified by 
-        self.parameter_range.
+        Uniform over ``self.parameter_range``; returns ``-log_prior_volume``
+        inside the bounds and -inf outside.  ``params`` is the full
+        ``[npsr*nfreqs]`` vector, matching ``n_parameters``.
 
         Parameters
         ----------
@@ -485,34 +466,28 @@ class Red:
 
     @jit_method
     def posterior_draw_from_coeff(self, coef, key):
-        """Draw a set of parameters from the posterior distribution for the IRN signal.
+        """As ``posterior_draw_freespec``, but from coefficients already drawn.
 
-        This method generates a random draw from the posterior distribution on the 
-        IRN parameters. This method is often called "gibbs sampling" in the literature,
-        but since we are using blocked-gibbs sampling, we opt to label it as "drawing
-        from the posterior" instead. Since the fourier coefficients distribution for
-        a set of PSDs is analytically known and the distribution of PSDs is known
-        for a set of fourier coefficients, we can directly draw from the posterior
-        using this method.
+        Same conditional (Laal et al. eq. B3); this variant skips
+        ``_get_coefficient_realization`` and takes the Fourier coefficients
+        directly, for callers that already have a realization in hand.
+
+        NOTE: valid only for a FREE-SPECTRUM psd_function.
 
         Parameters
         ----------
-        helpers : tuple
-            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
-        params : array
-             The current parameters, which are halflog10_rhos for each frequency
-             for each pulsar. [npsr*nfreqs]
+        coef : array
+            A realization of the Fourier coefficients. [npsr, nmodes, ndraws]
         key : jax.random.PRNGKey
             The random key for generating the draw.
 
         Returns
         -------
         array            
-            The drawn parameters from the posterior distribution. [npsr*nfreqs]
+            The drawn parameters from the posterior. [ndraws, npsr*nfreqs]
         """
-        key1, key2 = jrandom.split(key)
-        # Get a realization of the coefficients
+        # split-and-discard, exactly as before, so the RNG stream is unchanged
+        _, key2 = jrandom.split(key)
         
         # Sum sine and cosine elements
         beta = 0.5*(coef[:,::2]**2 + coef[:,1::2]**2) # [npsr, nfreqs, ndraws]
@@ -527,55 +502,48 @@ class Red:
                             maxval=high) # [npsr, nfreqs, ndraws]
         
         # Compute equation B3 from Laal et al. 
-        new_params = -beta / jnp.log(U) # [npsr, nfreqs]
+        new_params = -beta / jnp.log(U) # [npsr, nfreqs, ndraws]
 
         # Convert back to halflog10_rho parameters
-        halflog10_rho = 0.5*jnp.log10(new_params).reshape(-1, self.ndraws) # [npsr*nfreqs, nfreqs]
+        halflog10_rho = 0.5*jnp.log10(new_params).reshape(-1, self.ndraws) # [npsr*nfreqs, ndraws]
         return halflog10_rho.T # [ndraws, nfreqs*npsrs]
 
 class GaussianTiming:
-    """A signal class for a factorized likelihood (not prior) for the timing model.
+    """A data-driven Gaussian basis for the nonlinear timing model.
+
+    Instead of the analytic design matrix, this signal builds a reduced basis
+    from the timing model's own PRIOR PREDICTIVE: it draws ``num_samples``
+    parameter vectors from the timing priors, evaluates the model delay for
+    each, and takes the leading ``nmodes`` principal components of the
+    resulting residual ensemble.  The basis then enters the T-matrix like any
+    other Fourier block, with a free-spectrum (or fixed, unit) PSD on it.
 
     Attributes
     ----------
     name : str
         The name of the signal.
-    init_params : dict
-        The parameters used for initialization, which can be useful for re-initialization.
-    parameter_names : list of str
-        A list of parameter names corresponding to the parameters of the signal.
-    n_parameters : int
-        The number of parameters in the signal.
-    parameter_range : array
-        An array of the lower and upper bounds for each parameter [n_parameters, 2].
-    allow_posterior_draw : bool
-        Whether to allow posterior draws for this signal.
-    sampling_method : str
-        The sampling method to use for the signal.
-    initialized : bool
-        Whether the signal has been fully initialized with data.
-    psr_toas : list of arrays
-        A reference to the list of TOA arrays for each pulsar [npsr, npsr_toas].
-    nfreqs : int
-        The number of frequency bins in the free spectrum.
     nmodes : int
-        The number of modes in the Fourier design matrix (2*nfreqs for sine and cosine).
-    npsrs : int
-        The number of pulsars in the dataset.
-    use_pulsar_tspan : bool
-        Whether to use individual pulsar timespans for frequency calculation, or the PTA timespan.
-    tspans : array or float
-        The timespans used for frequency calculation. Either scalar or [npsrs]
+        Number of basis columns retained (must be even).  This is also the
+        number of PSD parameters per pulsar: the covariance classes are built
+        with ``gtm_mode_resolved=True``, so every column gets its own variance
+        rather than sharing one with its neighbour.
+    nfreqs : int
+        nmodes // 2.  Passed on as ``gtm_bins`` because the shared signal
+        interface counts basis columns in sin/cos pairs; these columns are
+        PCs, not quadrature pairs.
     freqs : array
-        The frequencies used in the Fourier design matrix. Either [nfreqs] or [npsrs, nfreqs]
-    log_prior_volume : float
-        The log of the prior volume for the parameters, used for uniform priors.
-    fixed_wn : bool
-        Whether the white noise is fixed, which can allow for optimization in computations.
-    _psd_range : array
-        The range of the power spectral density in linear space, used for computations.
-    _diag_idx : array
-        An array of diagonal indices for the Sigma matrix, used for efficient updates.
+        Placeholder ones([nmodes]), one per basis column -- the PCs have no
+        associated frequency.  A PSD function that actually consumes
+        frequencies must NOT be used here.
+    U : list of arrays
+        Per-pulsar basis, [npsr][n_toa_p, nmodes].
+    explained_variance_ratio : list of float
+        Fraction of the prior-predictive variance captured per pulsar.
+    z_scale : float
+        Prior width (in units of the JUG formal sigma) used to draw the
+        training ensemble.
+    tm_model : MultiPsrTimingModel or None
+        Source of the prior draws; None when an explicit ``basis`` was given.
     """
     def __init__(self,
                  name,
@@ -596,24 +564,75 @@ class GaussianTiming:
         name : str
             The name of the signal.
         data : Atlas.data.Data.PTA_Data
-            Atlas data object.
+            Atlas data object (used for ``npsrs`` and ``psr_names``).
+        nmodes : int
+            Number of basis columns to keep; must be even.  Also the number of
+            PSD parameters per pulsar (one per column).
+        gtm_psd : array, optional
+            Precomputed phi for the basis, ``(nmodes, npsrs)``.  Forwarded to
+            the covariance class, which then samples no GTM parameters.
+        lower_bound_psd, upper_bound_psd : array, optional
+            Free-spectrum prior bounds, broadcast to ``nmodes`` entries.  Give
+            both or neither; neither holds the PSD fixed at unit variance.
+        timing_model : MultiPsrTimingModel, optional
+            Source of the prior-predictive draws.  Required unless ``basis`` is
+            given, and mutually exclusive with it.
+        basis : list of array, optional
+            Precomputed per-pulsar basis, ``[npsr][n_toa_p, nmodes]``; skips
+            the sampling and PCA entirely.
+        z_scale : float, default 100
+            Width of the affine timing priors used to draw the training set,
+            in units of the JUG formal sigma.  Shrunk by 10x per retry when a
+            pulsar yields too few finite draws.
+        num_trials_for_pca : int, default 10
+            Retries allowed per pulsar before giving up.
+        pca_seed_per_pulsar : array of PRNGKey, optional
+            One key per pulsar; drawn from the global RNG (and recorded in
+            ``self.pca_seed``) when not supplied.
+
+        Raises
+        ------
+        ValueError
+            On an odd ``nmodes``, a half-specified bound pair, neither or both
+            of ``basis``/``timing_model``, or a pulsar whose prior draws never
+            yield enough finite samples.
         """
         if nmodes % 2 != 0:
             raise ValueError(f"Expected an even integer for `nmodes`, got {nmodes}.")
+        if (lower_bound_psd is None) != (upper_bound_psd is None):
+            raise ValueError(
+                "lower_bound_psd and upper_bound_psd must be given together: "
+                "pass both to sample a free spectrum over the PCA basis, or "
+                "neither to hold it fixed at unit variance.")
+        if basis is None and timing_model is None:
+            raise ValueError(
+                "GaussianTiming needs either an explicit `basis` or a "
+                "`timing_model` to draw the prior-predictive training set from.")
+        if basis is not None and timing_model is not None:
+            raise ValueError(
+                "Pass `basis` OR `timing_model`, not both -- an explicit basis "
+                "makes the timing model unused, which silently hides a stale basis.")
         self.nmodes = nmodes
         self.nfreqs = int(nmodes/2)
         self.gtm_psd = gtm_psd
         
         # PSD reparameterization
+        # One PSD parameter per BASIS COLUMN (nmodes), not per sin/cos pair:
+        # these columns are principal components, so two consecutive columns are
+        # unrelated and must not be forced to share a variance.  The covariance
+        # classes are constructed with gtm_mode_resolved=True to match.
         if lower_bound_psd is None and upper_bound_psd is None:
-            psd_function = make_free_spectrum(self.nfreqs)
-            param_names = [f"halflog10_rho_{i}" for i in range(self.nfreqs)]
-            fixed_kwargs = {param_names[i]: v for i, v in zip(jnp.arange(self.nfreqs), jnp.zeros(self.nfreqs))}
+            # No bounds given -> hold every column at halflog10_rho = 0, i.e.
+            # unit prior variance on the PCA coefficients.
+            psd_function = make_free_spectrum(self.nmodes)
+            param_names = [f"halflog10_rho_{i}" for i in range(self.nmodes)]
+            fixed_kwargs = {name: 0.0 for name in param_names}
             self.psd_function, self.psd_reparam_helper = make_irn_model(partial(psd_function, **fixed_kwargs), 
                                             lower_bound_array = jnp.array([]), 
                                             upper_bound_array = jnp.array([]))
         else:
-        # PSD reparameterization
+            lower_bound_psd = jnp.broadcast_to(jnp.asarray(lower_bound_psd), (self.nmodes,))
+            upper_bound_psd = jnp.broadcast_to(jnp.asarray(upper_bound_psd), (self.nmodes,))
             self.psd_function, self.psd_reparam_helper = make_irn_model(free_spectrum, 
                                             lower_bound_array = lower_bound_psd, 
                                             upper_bound_array = upper_bound_psd)
@@ -624,157 +643,182 @@ class GaussianTiming:
         self.num_trials_for_pca = num_trials_for_pca
 
         if pca_seed_per_pulsar is None:
-            self.pca_seeds = jrandom.split(jrandom.key(random.randint(0, 81982)), data.npsrs)
+            # Was seeded from the global `random` module, so a run could not be
+            # reproduced even with everything else fixed.  Record the seed we
+            # actually used so it can be passed back in.
+            self.pca_seed = random.randint(0, 81982)
+            self.pca_seeds = jrandom.split(jrandom.key(self.pca_seed), data.npsrs)
         else:
+            self.pca_seed = None
             self.pca_seeds = pca_seed_per_pulsar
 
+        self.tm_model = timing_model
         if basis is None:
-            self.tm_model = timing_model
-            self.U, self.explained_variance_ratio, self.timing_residual_training_set = self._get_basis()
-
+            (self.U, self.explained_variance_ratio,
+             self.timing_residual_training_set) = self._get_basis()
         else:
             self.U = basis
+            # Defined unconditionally: downstream code (and any diagnostic) that
+            # touches these on the explicit-basis path used to hit AttributeError.
+            self.explained_variance_ratio = None
+            self.timing_residual_training_set = None
 
-        self.nfreqs = int(nmodes/2)
-        self.freqs = jnp.ones(self.nfreqs)
+        # Placeholder, ONE PER BASIS COLUMN: the PCA columns are not harmonics,
+        # so there is no meaningful frequency to report, but the covariance
+        # classes evaluate the GTM PSD once per column when mode-resolved.
+        # Kept because SuperSignal.model_maker forwards `.freqs` as `f_gtm`; any
+        # PSD that actually uses frequencies would be evaluated at 1 Hz for
+        # every column.
+        self.freqs = jnp.ones(self.nmodes)
 
     
     def get_basis(self):
+        """Per-pulsar basis matrices, ``[npsr][n_toa_p, nmodes]``."""
         return self.U
 
-    def _fit_pulsar(self, tm_residuals_prior):
+    def _fit_pulsar(self, tm_residuals_prior, random_state=0):
+        """Leading `nmodes` PCs of a prior-predictive residual ensemble.
 
-        mask = (
-            np.isfinite(tm_residuals_prior).all(axis=-1)
-            # & ((tm_residuals_prior > -10) & (tm_residuals_prior < 10)).all(axis=-1)
-        )
+        Returns ``(U, explained_variance_ratio)`` or None when too few finite
+        draws survive to fit `nmodes` components.
+        """
+        tm_residuals_prior = np.asarray(tm_residuals_prior)
+        mask = np.isfinite(tm_residuals_prior).all(axis=-1)
         tm_residuals_prior = tm_residuals_prior[mask]
 
         if tm_residuals_prior.shape[0] < self.nmodes:
             return None
-        else:
-            svd = PCA(
-                n_components=self.nmodes,
-                whiten=True,
-                random_state=random.randint(0, 18971),
-            )
-            svd.fit(tm_residuals_prior)
-            U = svd.components_.T * np.sqrt(svd.explained_variance_)[None, :]
-            
-            return (
-                U,
-                svd.explained_variance_ratio_.sum(),
-            )
 
-    def _get_basis(self):
+        # random_state was drawn from the global RNG, which made the basis
+        # irreproducible; it is now derived from the caller's pulsar seed.
+        svd = PCA(n_components=self.nmodes, random_state=random_state)
+        svd.fit(tm_residuals_prior)
+        # whiten=True only affects .transform(), not .components_, so it was a
+        # no-op here; the explicit sqrt(explained_variance_) scaling below is
+        # what actually sets the column norms.
+        U = svd.components_.T * np.sqrt(svd.explained_variance_)[None, :]
 
+        return U, svd.explained_variance_ratio_.sum()
+
+    def _get_basis(self, num_samples=int(1e4)):
+        """Per-pulsar PCA basis from prior-predictive timing residuals.
+
+        Returns (bases, explained_variance_ratios, training_sets), each a list
+        with one entry per pulsar.
+        """
         timing_bases = []
         explained_variance_ratio = []
+        training_sets = []
+        self.z_scale_used = []
 
         pbar = trange(self.data.npsrs)
         for pidx in pbar:
-            pbar.set_description(f"Generating prior samples and performing PCA for {self.data.psr_names[pidx]}")
-            
-            for num_iters in range(self.num_trials_for_pca):
-                timing_residual_training_set = self.tm_model.sample_training_residuals(key = self.pca_seeds[pidx], 
-                                                                                        num_samples = int(1e4),
-                                                                                        z_scale = self.z_scale,
-                                                                                        pulsar_index = pidx)
-                ans = self._fit_pulsar(timing_residual_training_set)
-                if ans is None:
-                    print('Not enough samples in the prior. Shrinking the prior...')
-                    self.z_scale = self.z_scale/10
-                    if num_iters == self.num_trials_for_pca - 1:
-                        raise ValueError(f"Cannot find prior samples for {self.data.psr_names[pidx]}")
+            pbar.set_description(
+                f"Generating prior samples and performing PCA for {self.data.psr_names[pidx]}")
 
-                    continue
-                    
-                else:
+            # Per-pulsar working copy.  `self.z_scale` was shrunk in place, so
+            # one difficult pulsar permanently narrowed the prior for every
+            # pulsar after it -- and the recorded z_scale no longer described
+            # the bases already built.
+            z_scale = self.z_scale
+            for num_iters in range(self.num_trials_for_pca):
+                # Fold the attempt index into the key: re-drawing with the same
+                # key only changed the affine params (z_scale multiplies them);
+                # the bounded params (SINI/ECC/M2/PX) ignore z_scale entirely
+                # and so were bit-identical on every retry.
+                key = (self.pca_seeds[pidx] if num_iters == 0
+                       else jrandom.fold_in(self.pca_seeds[pidx], num_iters))
+                training_set = self.tm_model.sample_training_residuals(
+                    key = key,
+                    num_samples = num_samples,
+                    z_scale = z_scale,
+                    pulsar_index = pidx)
+                ans = self._fit_pulsar(training_set, random_state=pidx)
+                if ans is not None:
                     timing_bases.append(ans[0])
                     explained_variance_ratio.append(ans[1])
+                    training_sets.append(training_set)
+                    self.z_scale_used.append(z_scale)
                     break
+                print(f'Not enough finite prior samples for '
+                      f'{self.data.psr_names[pidx]}; shrinking the prior '
+                      f'({z_scale} -> {z_scale/10}).')
+                z_scale = z_scale/10
+            else:
+                raise ValueError(
+                    f"Cannot find prior samples for {self.data.psr_names[pidx]} "
+                    f"after {self.num_trials_for_pca} attempts (final z_scale "
+                    f"{z_scale}).")
 
-        return timing_bases, explained_variance_ratio, timing_residual_training_set
+        return timing_bases, explained_variance_ratio, training_sets
 
 class SuperSignal:
-    """A signal class for a pulsar-independent free spectrum red noise (IRN) signal.
+    """Assembles several signals into one likelihood over a shared T-matrix.
 
-    This signal models the intrinsic red noise as a pulsar-independent signal
-    in each pulsar. The power spectrum is modeled as a free spectrum with nfreqs 
-    frequency bins. The parameters are given as halflog10_rho, which is defined as
-    - <a^T a> = rho^2 -> halflog10_rho = 0.5 * log10(<a^T a>)
-    This means that the units are log(seconds).
+    Takes a list of component signals (``'unc'`` intrinsic red noise, ``'cor'``
+    correlated GWB, ``'dm'`` DM noise, ``'gtm'`` Gaussian timing model,
+    ``'det'`` deterministic) plus a combination string describing which of them
+    share basis columns, concatenates their bases (optionally prefixed by the
+    linear timing-model design matrix), builds the matching
+    ``parameterized`` covariance model, and exposes the log-posteriors that
+    consume them.
 
-    The frequencies are the first `nfreqs` harmonics of 1/Tspan. Tspan could either
-    be the PTA timespan or the individual pulsar timespans.
+    The combination string is parsed by ``sutils.parse_basis_string``; e.g.
+    ``"[T]:unc+cor->unc | dm"`` prefixes the timing columns, lets ``unc`` and
+    ``cor`` share one block represented by ``unc``'s basis, and gives ``dm``
+    its own.
 
     Attributes
     ----------
-    name : str
-        The name of the signal.
-    init_params : dict
-        The parameters used for initialization, which can be useful for re-initialization.
-    parameter_names : list of str
-        A list of parameter names corresponding to the parameters of the signal.
-    n_parameters : int
-        The number of parameters in the signal.
-    parameter_range : array
-        An array of the lower and upper bounds for each parameter [n_parameters, 2].
-    allow_posterior_draw : bool
-        Whether to allow posterior draws for this signal.
-    sampling_method : str
-        The sampling method to use for the signal.
-    initialized : bool
-        Whether the signal has been fully initialized with data.
-    psr_toas : list of arrays
-        A reference to the list of TOA arrays for each pulsar [npsr, npsr_toas].
-    nfreqs : int
-        The number of frequency bins in the free spectrum.
+    signal_map : dict[str, signal]
+        Component signals by name; ``has_unc`` / ``has_cor`` / ``has_dm`` /
+        ``has_gtm`` / ``has_det`` mirror its keys.
+    get_Fmat_concat : array, [n_toas, nmodes]
+        The assembled T-matrix, ``[timing | shared block | separate blocks]``.
+    signal_comb_idxs : dict[str, slice]
+        Column slice of each signal (plus ``'timing'``) within that matrix.
     nmodes : int
-        The number of modes in the Fourier design matrix (2*nfreqs for sine and cosine).
-    npsrs : int
-        The number of pulsars in the dataset.
-    use_pulsar_tspan : bool
-        Whether to use individual pulsar timespans for frequency calculation, or the PTA timespan.
-    tspans : array or float
-        The timespans used for frequency calculation. Either scalar or [npsrs]
-    freqs : array
-        The frequencies used in the Fourier design matrix. Either [nfreqs] or [npsrs, nfreqs]
-    log_prior_volume : float
-        The log of the prior volume for the parameters, used for uniform priors.
-    fixed_wn : bool
-        Whether the white noise is fixed, which can allow for optimization in computations.
-    _psd_range : array
-        The range of the power spectral density in linear space, used for computations.
-    _diag_idx : array
-        An array of diagonal indices for the Sigma matrix, used for efficient updates.
+        Total column count of the T-matrix.
+    nfreqs : int
+        ``(nmodes - linear_timing_model_size) // 2``; only meaningful when the
+        basis is [timing | one Fourier block].
+    linear_timing_model_size : int
+        Width of the padded timing block (0 when the timing model is
+        marginalized or absent).
+    _pad_mask : array, [npsr, linear_timing_model_size]
+        1 where a timing column is padding, 0 where it is real.
+    model : parameterized.PerPulsarRedNoise | CorrelatedPulsarRedNoise
+        The phi model, built by ``model_maker``.
+    _phi_is_mode_resolved : bool
+        True when ``model`` returns phi at basis-column rather than
+        frequency-bin resolution.
+    get_helpers : callable
+        TNT / TNr / rNr / logdet_N for the assembled basis.
     """
     def __init__(self,
                 signal_list,
                 signal_combination_string,
                 data,
                 ):
-        """The constructor for the IRN_Freespectrum signal class.
-
-        This signal models the intrinsic red noise as a pulsar-independent signal 
-        in all pulsars. The power spectrum is modeled as a free spectrum with nfreqs 
-        frequencies. The parameters are given as halflog10_rho, which is defined as
-        - <a^T a> = rho^2 -> halflog10_rho = 0.5 * log10(<a^T a>)
-        This means that the units are log(seconds). 
-
-        The frequencies are the first `nfreqs` harmonics of 1/Tspan. Tspan is either
-        the PTA timespan or the individual pulsar timespans, depending on the
-        `use_pulsar_tspan` flag.
-
-        If data is not provided, the signal use a simple initialization (see 
-        Atlas.signals.base.Signal_Base).
-
+        """
         Parameters
         ----------
-        signal_list : list,
-            List of signal components.
-        data : Atlas.data
-            Atlas data object.
+        signal_list : list
+            Component signal objects.  Their ``.name`` attributes must be
+            unique and are what the combination string refers to.
+        signal_combination_string : str
+            Which components share basis columns, e.g.
+            ``"[T]:unc+cor->unc | dm"``.  A leading ``[T]`` prefixes the linear
+            timing-model design matrix.
+        data : Atlas.data.Data.PTA_Data
+            Supplies the residuals, the design matrices and the analysis flags
+            (``fixed_wn``, ``fixed_res``, ``linear_timing``, ``marg``).
+
+        Raises
+        ------
+        ValueError
+            On duplicate signal names, or a combination string naming a signal
+            that is not in ``signal_list``.
         """
         self.signal_combination_string = signal_combination_string
         self.data = data
@@ -790,36 +834,34 @@ class SuperSignal:
             self.linear_timing_model_size = 0
         else:
             self.linear_timing_model_size = max([x.shape[-1] for x in self.Mmat]) if self.linear_timing else 0
-        self.linear_timing = data.linear_timing
         self.lowest_value_eq_to_zero = 1e-40
 
         self.signal_map = {s.name: s for s in signal_list}
-        self.has_unc = False; self.has_cor = False 
-        self.has_dm = False; self.has_gtm = False
-        self.has_det = False
-        if 'cor' in self.signal_map.keys():
-            self.has_cor = True
-        if 'unc' in self.signal_map.keys():
-            self.has_unc = True
-        if 'dm' in self.signal_map.keys():
-            self.has_dm = True
-        if 'gtm' in self.signal_map.keys():
-            self.has_gtm = True
-        if 'det' in self.signal_map.keys():
-            self.has_det = True
-            self.det_signal = self.signal_map['det']
+        if len(self.signal_map) != len(signal_list):
+            raise ValueError(
+                "signal_list contains duplicate names; the later signal would "
+                f"silently replace the earlier one: {[s.name for s in signal_list]}")
+        for flag in ('unc', 'cor', 'dm', 'gtm', 'det'):
+            setattr(self, f'has_{flag}', flag in self.signal_map)
+        self.det_signal = self.signal_map['det'] if self.has_det else None
 
         self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
+        if self.signal_comb_idxs['dm'] is not None:
+            self.update_red_basis(chrom_index = jnp.ones(self.data.npsrs) * 2)
 
+        # Total column count of the assembled T-matrix: timing + every Fourier
+        # block + any deterministic block.  NOT 2*nfreqs of a single signal.
         self.nmodes = self.get_Fmat_concat.shape[-1]
         self.npsrs = self.data.npsrs
 
         # get helper arrays for likelihood
         self.get_helpers = self._get_helpers()
 
-        # number of frequency bins for NumPyro interface
-        self.nfreqs = int((self.nmodes - self.linear_timing_model_size)/2) # Sine and cosine modes per frequency
+        # Number of frequency bins for the NumPyro interface.  Only meaningful
+        # when the basis is [timing | one Fourier block]; with separate blocks
+        # (or a det block) this counts columns that are not sine/cosine pairs.
+        self.nfreqs = int((self.nmodes - self.linear_timing_model_size)/2)
 
         # Hidden attributes if needed-------------------------------------------
         self._diag_idx = jnp.arange(self.nmodes)
@@ -967,6 +1009,14 @@ class SuperSignal:
         shared_block_placed = False
         shared_start        = None
 
+        # With '[T]' but no shared signal the timing columns were never appended
+        # to Fmat, while tm_offset still shifted every separate signal's slice --
+        # so signal_indices['timing'] pointed at the first separate block and all
+        # other slices were off by linear_timing_model_size.  Emit the M block
+        # on its own in that case.
+        if include_timing and rep is None:
+            Fmats.append(jnp.concat(self.padd_tm_design_matrix()))
+
         for name in order:
             if name in shared_names:
                 if not shared_block_placed:
@@ -1016,27 +1066,31 @@ class SuperSignal:
         core = jit(partial(self.update_white_matrix_products_unjitted, **bound))
 
         def get_helpers(red_noise_basis = None, **kwargs):
+            """TNT / TNr / rNr / logdet_N for the current white-noise params.
+
+            ``red_noise_basis`` defaults to the assembled T-matrix; pass one
+            explicitly to override it (the chromatic-index path rescales the DM
+            columns this way).  Arguments not bound at construction
+            (``white_noise_params`` when the white noise is free, ``reff`` when
+            the residuals are not fixed) must be supplied as keywords.
+            """
             if red_noise_basis is None:
                 red_noise_basis = self.get_Fmat_concat
             return core(red_noise_basis = red_noise_basis, **kwargs)
 
-        # The jitted core, so callers (and the profiler) can lower/compile it with the
-        # T-matrix as a genuine argument. NOTE: wrapping ``get_helpers`` in a further
-        # jit re-captures the default T-matrix as a compile-time constant, which is
-        # exactly what this change exists to avoid -- pass ``red_noise_basis``
-        # explicitly from the outermost jitted function instead.
         get_helpers.core = core
 
         return get_helpers
 
     def model_maker(self):
-        """Add a specific parameterization of the power spectral density based
-        on Atlas' `parameterized.py`.
+        """Build ``self.model``, the phi model for the assembled basis.
 
-        Parameters
-        ----------
-        model: Atlas.parameterized object.
-            An instantiation of a parameterized object.
+        Collects each present component's PSD function, helper dictionary, bin
+        count and frequencies, then instantiates
+        ``parameterized.CorrelatedPulsarRedNoise`` when a ``'cor'`` signal is
+        present and ``parameterized.PerPulsarRedNoise`` otherwise.  Also sets
+        ``self._phi_is_mode_resolved``, which tells the likelihoods whether phi
+        rows are basis columns or frequency bins.
         """
         model_kwargs = {'pulsar_names':self.data.psr_names}
 
@@ -1054,7 +1108,10 @@ class SuperSignal:
                 gtm_helper_dictionary = self.signal_map['gtm'].psd_reparam_helper,
                 gtm_bins              = self.signal_map['gtm'].nfreqs,
                 f_gtm                 = self.signal_map['gtm'].freqs,
-                gtm_psd               = self.signal_map['gtm'].gtm_psd 
+                gtm_psd               = self.signal_map['gtm'].gtm_psd,
+                # The GTM basis columns are principal components, not sin/cos
+                # pairs: give each its own PSD value/parameter.
+                gtm_mode_resolved     = True,
             )
 
         if self.has_dm:
@@ -1089,6 +1146,13 @@ class SuperSignal:
             )
             self.model = partial(parameterized.CorrelatedPulsarRedNoise, **model_kwargs)()
 
+        # phi comes back at basis-column (mode) resolution whenever the GTM
+        # block is mode-resolved; otherwise it is at frequency-bin resolution
+        # and the consumer has to repeat each bin across its two modes.
+        self._phi_is_mode_resolved = bool(
+            getattr(self.model, 'gtm_mode_resolved', False)
+            and getattr(self.model, 'has_gtm', False))
+
     def update_white_matrix_products_unjitted(self, red_noise_basis, N_list, white_noise_params, reff):
         """Get the helper objects for likelihood evaluation.
 
@@ -1102,16 +1166,21 @@ class SuperSignal:
 
         Parameters
         ----------
-        N_list : list of Atlas.nMatrix.base.Base_TOA_cov
-            The white noise covariance matrices for each pulsar.
-        reff : list of arrays
-            The effective residuals for each pulsar. [npsr, npsr_toas]
+        red_noise_basis : array, [n_toas, nmodes]
+            The T-matrix, passed as a traced argument rather than captured.
+        N_list : Atlas.nMatrix.base.Base_TOA_cov
+            The white-noise covariance model for all pulsars.
+        white_noise_params : array
+            Current white-noise parameters (bound at construction when fixed).
+        reff : array, [n_toas, 1]
+            The effective residuals (bound at construction when fixed).
 
         Returns
         -------
         tuple
-            The helper objects (TNT, TNr, rNr, and logdet_N) for each pulsar. 
-            [npsr, nmode, nmode], [npsr, nmode]
+            (TNT, TNr, rNr, logdet_N): [npsr, nmode, nmode], [npsr, nmode],
+            scalar, scalar.  ``rNr`` and ``logdet_N`` are totals over the
+            array, not per pulsar.
         """
         return N_list.get_red_helpers(red_noise_basis = red_noise_basis, 
                                       residuals = reff, 
@@ -1195,7 +1264,11 @@ class SuperSignal:
         float
             The log-likelihood contribution from the IRN signal. [1]
         """
-        TNT, TNr, rNr, logdet_N = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode], [0], [0]
+        # NOTE: this path assumes T is PURELY Fourier -- phiinv below covers
+        # 2*nfreq modes, so with linear-timing columns in T the diagonal add in
+        # get_sigma_from_phiinv is shape-incompatible.  Use
+        # lnposterior_reparam / partial_marg_lnposterior for a padded T.
+        TNT, TNr, rNr, logdet_N = helpers # [npsr, nmode, nmode], [npsr, nmode], [0], [0]
 
         phi, psd_common = self.model.get_phi_mat_CURN(params) #[nfreq,npsrs]
         phiinv = jnp.repeat(1/phi.T, 2, axis = 1)
@@ -1215,11 +1288,27 @@ class SuperSignal:
 
     @cached_property
     def partial_marg_lnposterior_helper(self):
+        """Column index sets used by both reparameterised log-posteriors.
+
+        Returns
+        -------
+        cor_idx : slice or None      the GWB block (None when absent)
+        P_idx : index set            every non-GWB stochastic block --
+                                     timing, IRN, DM, GTM -- merged in column
+                                     order
+        det_idx : slice or None      the deterministic block
+
+        Raises
+        ------
+        ValueError
+            If the model string carries no non-GWB stochastic block, leaving
+            nothing to marginalize or reparameterise over.
+        """
         # 'cor' and 'det' are already single slices, so they stay contiguous
         # by construction — no conversion needed.
         #
         # 'cor' is optional. `partial_marg_lnposterior` genuinely requires it --
-        # it keeps the GWB block and marginalises the rest analytically -- and
+        # it keeps the GWB block and marginalizes the rest analytically -- and
         # guards for it at its own entry point. `lnposterior_reparam` does not:
         # it merges 'cor' straight back into one block. Indexing it here
         # unconditionally is what made every GWB-free model unusable from
@@ -1241,7 +1330,7 @@ class SuperSignal:
         if not P_parts:
             raise ValueError(
                 f"model string {self.signal_combination_string!r} has no "
-                "non-GWB stochastic block, so there is nothing to marginalise "
+                "non-GWB stochastic block, so there is nothing to marginalize "
                 "or reparameterise over"
             )
         P_idx = sutils.merge_slices(*P_parts)
@@ -1304,7 +1393,7 @@ class SuperSignal:
         if self.signal_comb_idxs.get('cor') is None:
             raise ValueError(
                 "partial_marg_lnposterior keeps the 'cor' (GWB) block and "
-                "marginalises the rest analytically, so it requires one; model "
+                "marginalizes the rest analytically, so it requires one; model "
                 f"string {self.signal_combination_string!r} has none. Use "
                 "lnposterior_reparam instead."
             )
@@ -1362,7 +1451,11 @@ class SuperSignal:
 
         red_noise_cov = self.model.get_phi_mat_full(red_params)
         if self.npsrs == 1:
-            if self.has_gtm:
+            if self._phi_is_mode_resolved:
+                # Already one value per basis column -- no repeat, and the
+                # logdet is not doubled.  (Keyed off the model's resolution
+                # rather than merely `has_gtm`: a bin-resolved GTM block still
+                # needs the repeat below.)
                 phiinvs_diags = 1 / red_noise_cov  # [nmodes, npsrs]
                 logdet_phimat = jnp.sum(jnp.log(red_noise_cov))
             else:
@@ -1373,7 +1466,9 @@ class SuperSignal:
             phiinvs_diags = phiinvs.diagonal(axis1=-2, axis2=-1)  # [nmodes, npsrs]
 
         if self.linear_timing and not self.marg_tm:
-            phiinvs_diags_ltm = jnp.full(shape=(self.nmodes, self.npsrs),
+            # self.nmodes includes deterministic contributions,
+            # so shape GP priors from `RR` which only includes reparameterized modes
+            phiinvs_diags_ltm = jnp.full(shape=(RR.shape[-1], self.npsrs),
                                         fill_value=self.lowest_value_eq_to_zero)
             phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
             # set prior variance of padded parameters to one for stable transformation
@@ -1444,7 +1539,29 @@ class SuperSignal:
         return log_density, coeff[..., 0]
 
     def __partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
+        """Log-posterior with the GWB coefficients kept and the rest marginalized.
 
+        The non-GWB coefficients (timing, IRN, DM, GTM) are integrated out
+        analytically; the GWB coefficients are reparameterised as
+        ``g = g_hat + L^-T z`` so a gradient sampler can move in ``z``.
+
+        Parameters
+        ----------
+        helpers : tuple
+            (TNT, TNr, rNr, logdet_N) over the full unified basis.
+        red_params : array
+            Spectral parameters of the red-noise / GWB covariance.
+        z : array, [npsr, n_gwb_modes]
+            Whitened GWB coefficients.
+        D_params : tuple or None
+            (det_params, psr_phases, psr_dists); required iff ``self.has_det``.
+
+        Returns
+        -------
+        log_density : float
+        g : array, [npsr, n_gwb_modes]
+            The GWB coefficients implied by ``z``.
+        """
         # unpack helper objects
         TNT, TNr, rNr, logdet_N = helpers
         cor_idx, P_idx, det_idx = self.partial_marg_lnposterior_helper

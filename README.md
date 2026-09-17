@@ -81,13 +81,78 @@ lo, hi = wn.get_prior_bounds()
 mcmc = MCMC(NUTS(model_maker, max_tree_depth=8), num_warmup=700, num_samples=700)
 mcmc.run(jrandom.key(170817), raw_residuals=raw, super_sig=rn,
          vary_white=True, wn_lower_bound=lo, wn_upper_bound=hi,
-         tm_model=None, helpers=None, marg_over_non_gwb=False)
+         tm_model=None, helpers=None,
+         marg_over_non_gwb=False, save_red_coeff=True)
+
+coeff = mcmc.get_samples()["coeff"]      # [ndraw, npsr, ncol]
 ```
 
 White noise must be constructed before red noise. `WhiteCov.__init__` registers
 itself on the data object and `SuperSignal` reads it during construction; the
 reverse order raises an `AttributeError` from inside a `functools.partial`.
 Nothing enforces the ordering.
+
+### Choosing what stays explicit
+
+`marg_over_non_gwb` selects the likelihood, and with it the shape of the latent
+vector `z_a` that NumPyro samples. The three configurations below differ only in
+the arguments to `mcmc.run` and `PTA_Data`; everything above is shared.
+
+**Every coefficient sampled non-centred** — the call above. `marg_over_non_gwb=False`
+draws `z_a` of shape `[npsr, nmodes]`, one standard normal per basis column
+including the timing block, and `lnposterior_reparam` maps it through the
+standardising transform `c = ĉ + L⁻ᵀz`, where `L` is the Cholesky factor of the
+posterior precision `Σ⁻¹ = TᵀN⁻¹T + diag(φ⁻¹)`. The sampler therefore explores
+whitened coordinates while the recorded `coeff` are physical. With
+`"ltm|unc+cor->unc"` and `num_irn_bins=30` above, that is the array-wide timing
+width plus 60 red columns per pulsar.
+
+With a `det` block the width is `nmodes - det_signal.num_coeff_det` instead:
+deterministic columns carry no prior and are never reparameterised, since their
+coefficients come from the deterministic parameters rather than from `z`.
+`model_maker` computes this for you, and it is why `jnp.zeros((npsr, rn.nmodes))`
+— which appears throughout the notebooks — is right only for a model without one.
+
+`save_red_coeff=True` is what makes the coefficients retrievable — it registers
+`numpyro.deterministic('coeff', coeff)`. Without it they are still sampled, and
+still affect the posterior, but are discarded. The timing block of `coeff` is
+what a back-transform through the design-matrix SVD turns into posteriors on
+physical timing parameters.
+
+**Only the background modes explicit** — the reduction that makes large arrays
+tractable:
+
+```python
+mcmc.run(..., marg_over_non_gwb=True, save_red_coeff=True)
+# z_a is now [npsr, 2 * num_gwb_bins]; coeff is [ndraw, npsr, 2*num_gwb_bins, 1]
+```
+
+`partial_marg_lnposterior` integrates the per-pulsar block analytically and keeps
+only the `2 n_gwb` background coefficients. On 67 pulsars that is roughly 37,600
+latent dimensions down to about 1,900. Note the trailing singleton axis on
+`coeff`, which the non-marginalised path does not have.
+
+**Timing model marginalised into `N`** — the staged-pipeline equivalent, for
+comparison against conventional codes:
+
+```python
+data = PTA_Data(psrs, num_gwb_bins=14, num_irn_bins=30, marg_timing=True)
+m    = ModelBuilder(data=data)                 # new data needs a new builder
+wn   = m.make_white_noise(stabilize_TNT=True)  # and a fresh WhiteCov on it
+rn   = m.make_red_noise("unc+cor->unc", ...)   # no `ltm|` prefix
+mcmc.run(..., marg_over_non_gwb=False)         # z_a is [npsr, 2*num_irn_bins]
+```
+
+`marg_timing=True` sets `linear_timing_model_size = 0`, so `T` carries no timing
+columns and the timing solution is projected out inside the noise matrix. Best
+conditioned of the four treatments, and the only one with no timing coefficients
+to recover.
+
+Rebuilding the builder is not optional. `ModelBuilder` binds the dataset at
+construction and `make_red_noise` reads `self.data`, so rebinding the name
+`data` leaves an existing builder pointing at the previous `PTA_Data` — it would
+build the *un*-marginalised model without complaint. The same applies to
+`WhiteCov`, which registers itself on the data object it was given.
 
 ## Likelihood
 
@@ -169,6 +234,27 @@ Signals are declared with a compact string passed to `make_red_noise`:
 Recognised names are `unc` (intrinsic red noise), `cor` (correlated background),
 `dm` (dispersion measure), `gtm` (Adaptus timing basis) and `det`
 (deterministic).
+
+No name is mandatory, `cor` included. A single-pulsar noise run wants a model
+with no correlated process at all — a common process cannot be separated from
+intrinsic red noise in one pulsar, so including one costs two unconstrained
+parameters and a flat ridge in the posterior:
+
+```python
+data = PTA_Data([psr], num_irn_bins=30, marg_timing=True)
+m    = ModelBuilder(data=data)                 # see above: new data, new builder
+wn   = m.make_white_noise(stabilize_TNT=True)
+rn   = m.make_red_noise("unc", irn_psd_function=powerlaw,
+                        irn_lower_bound_psd=jnp.array([-18., 0.]),
+                        irn_upper_bound_psd=jnp.array([-11., 7.]))
+mcmc.run(..., marg_over_non_gwb=False)
+```
+
+`SuperSignal` selects `PerPulsarRedNoise` instead of `CorrelatedPulsarRedNoise`
+when there is no `cor` block, and no ORF is needed. `partial_marg_lnposterior`
+is unavailable here by construction — it keeps the background block and
+marginalises the rest, so with no background there is nothing to keep; it raises
+a `ValueError` saying so. Use `marg_over_non_gwb=False`.
 
 Signals in a shared group *overlap* rather than sit adjacent. The background is
 modelled only in the lowest frequency bins, so `cor` occupies the first
@@ -268,39 +354,62 @@ elementwise, and is intended as a gate before refactoring.
 
 | path | lines | contents |
 |---|---|---|
-| `data.py` | 144 | `PTA_Data`: arrays plus run configuration |
+| `data.py` | 143 | `PTA_Data`: arrays plus run configuration |
 | `model_builder.py` | 122 | `ModelBuilder`: the construction API |
-| `model.py` | 104 | `model_maker`: the NumPyro model |
-| `nMatrix/base.py` | 1330 | white-noise covariance and its solves |
-| `signals/factorized/base.py` | 1495 | `Red`, `GaussianTiming`, `SuperSignal`, the likelihoods |
-| `parameterized.py` | 1624 | `φ` assembly and inversion |
+| `model.py` | 123 | `model_maker`: the NumPyro model |
+| `nMatrix/base.py` | 1192 | white-noise covariance and its solves |
+| `signals/factorized/base.py` | 1518 | `Red`, `GaussianTiming`, `SuperSignal`, the likelihoods |
+| `parameterized.py` | 1623 | `φ` assembly and inversion |
 | `signals/signals_utils.py` | 565 | model-string parser, column bookkeeping, timing SVD |
-| `signals/correlated/base.py` | 609 | `Correlated`: background signal and ORF |
-| `signals/timing/` | 2268 | non-linear timing model (JUG) |
-| `signals/deterministic/` | 714 | continuous-wave and other deterministic signals |
+| `signals/correlated/base.py` | 608 | `Correlated`: background signal and ORF |
+| `signals/timing/` | 2266 | non-linear timing model (JUG) |
+| `signals/deterministic/` | 402 | `Deterministic`: continuous waves and other deterministic signals |
 | `samplers/canetoadracing.py` | 678 | vendored `MultiHMCGibbs` kernels |
-| `psd_functions.py` | 502 | PSD and ORF library |
+| `psd_functions.py` | 501 | PSD and ORF library |
 | `sim.py` | 357 | simulation |
-| `experimental/` | 4741 | not reachable from any entry point; see its docstring |
+| `experimental/` | 4832 | not reachable from any entry point; see its docstring |
 
-Total 15,253 lines across 33 modules.
+The rows above account for 14,930 lines; the package is 16,561 across 34 modules.
 
 ## Known issues
 
-- No end-to-end continuous-wave path currently runs. `JointDeterministic`
-  cannot be constructed, the CW delay function and its caller disagree over
-  whether `tref` has already been subtracted, and `model_maker` does not sample
-  deterministic parameters.
-- A separate, non-overlapping `cor` block (`"ltm|unc;cor"`) produces column
-  slices past the end of the basis.
-- `ln_likelihood_curn` cannot be used together with a directly supplied
-  `gtm_psd`; the two `parameterized` classes also differ over whether
-  `get_phi_mat_CURN` returns an array or a tuple.
+- A `det` block works with `marg_timing=True` but crashes with sampled linear
+  timing, before evaluating anything: `model_maker` sizes the reparameterised
+  block as `nmodes - det_signal.num_coeff_det`, while `lnposterior_reparam`
+  still shapes the linear-timing prior from `self.nmodes`. Measured on a
+  3-pulsar synthetic, `"ltm|unc+cor->unc;det"` raises
+  `Incompatible types for broadcasting: float64[12,3] vs float64[28,3]`. A fix
+  is in flight on the `AG` branch.
+- Nothing in the test suite exercises a `det` block — no test mentions
+  `D_params` or `has_det` — which is why the above reached `main`.
+- `ln_likelihood_curn` has no `has_det` guard. With a `det` block it either
+  fails on shape or, given a matching-width `phiinv`, marginalises the
+  deterministic columns under a red-noise prior and returns an answer.
+- `SuperSignal.nfreqs` (`signals/factorized/base.py:822`) subtracts only the
+  timing width, so deterministic columns are counted as red-noise bins.
+- `cw_delay_evolve_float64` documents its return as `[ns]`
+  (`signals/deterministic/det_signals.py:86`); the delays are in **seconds**.
+- An `ltm|` prefix is only honoured when the shared group names a representative
+  with `->`. Without one, `build_basis` leaves `M` out of the basis while the
+  column map still claims it is there, so `"ltm|unc"` and `"ltm|unc;cor"` both
+  produce slices past the end of the basis. Sampled linear timing therefore
+  needs a `->` in the string; `marg_timing=True` is unaffected.
+- `ln_likelihood_curn` is unusable whenever `SuperSignal` selects
+  `PerPulsarRedNoise` — that is, on any model with no `cor` block — because the
+  two `parameterized` classes disagree over whether `get_phi_mat_CURN` returns
+  an array or an `(array, psd_common)` tuple. The same mismatch blocks a
+  directly supplied `gtm_psd`. The other two likelihoods are unaffected.
+- `lnposterior_reparam` and `partial_marg_lnposterior` return `coeff` with
+  different ranks — `[npsr, ncol]` and `[npsr, ncol, 1]` respectively.
+- `linear_timing=True` combined with a model string lacking an `ltm|` prefix is
+  an inconsistent configuration that fails as a raw broadcast error rather than
+  a message.
 - The chromatic index is implemented but connected to nothing:
   `SuperSignal.update_red_basis` has no callers.
-- `stabilize_TNT` is a no-op for any pulsar with padded timing columns, since
-  those columns are exactly zero and the shift is proportional to
-  `min(diag(TNT))`.
+- `stabilize_TNT` (`signals/signals_utils.py:78`) is a no-op for any pulsar with
+  padded timing columns: the shift is `eps * min(diag(TNT))` and those columns
+  put an exact zero on the diagonal. A positive-only variant is commented out
+  directly below it.
 
 ## References
 
