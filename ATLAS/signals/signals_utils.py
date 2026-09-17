@@ -94,14 +94,14 @@ def stabilize_TNT(A, A_shape, eps=1e-6):
     # shift = jnp.maximum(0.0, -eigvals[..., :1] + eps * eigvals[..., -1:])
     # return A + shift[..., None] * jnp.eye(A_shape)
 
-    lowest = A.diagonal(axis1 = -2, axis2 = -1).min(axis = -1)[..., None]
-    idxs = jnp.arange(A_shape)
-    return A.at[:, idxs, idxs].add(eps * lowest)
-    
-    # diag = A.diagonal(axis1=-2, axis2=-1)
-    # lowest = jnp.where(diag > 0, diag, jnp.inf).min(axis=-1, keepdims=True)
+    # lowest = A.diagonal(axis1 = -2, axis2 = -1).min(axis = -1)[..., None]
     # idxs = jnp.arange(A_shape)
     # return A.at[:, idxs, idxs].add(eps * lowest)
+    
+    diag = A.diagonal(axis1=-2, axis2=-1)
+    lowest = jnp.where(diag > 0, diag, jnp.inf).min(axis=-1, keepdims=True)
+    idxs = jnp.arange(A_shape)
+    return A.at[:, idxs, idxs].add(eps * lowest)
 
 def stabilize_TDNTD(A, A_shape, eps=1e-9):
     """

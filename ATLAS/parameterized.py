@@ -1,41 +1,97 @@
 import numpy as np
-from functools import cached_property, partial
 import warnings, inspect, jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.random as jr
 from ATLAS.utils import jit_method
 
-fref = 1 / (1 * 365.25 * 24 * 60 * 60)
+fref = 1 / (1 * 365.25 * 24 * 60 * 60)   # 1/yr, reference frequency
+
+
+_AMPLITUDE_NAME_MARKERS = ("log10_a", "log10_rho", "log10_amp")
+
+
+def _renorm_shift(param_names, logrenorm_offset):
+    """Per-parameter additive shift of the prior bounds for a unit change.
+
+    ``renorm_const`` rescales the residuals, so only LOG-AMPLITUDE parameters
+    move under it.  A spectral index (``gamma``), a bend frequency, a turnover
+    exponent or an ORF parameter is dimensionless and must not be shifted --
+    but the old code added ``logrenorm_offset`` to every bound of every PSD,
+    silently sliding those priors whenever ``renorm_const != 1``.
+
+    Amplitude-ness is decided by name: anything containing ``log10_A``,
+    ``log10_rho`` (hence ``halflog10_rho``) or ``log10_amp``, case-insensitively.
+    A free spectrum is all-amplitude, so its behaviour is unchanged.
+    """
+    is_amp = np.array(
+        [any(m in str(n).lower() for m in _AMPLITUDE_NAME_MARKERS)
+         for n in np.atleast_1d(param_names)],
+        dtype=bool,
+    )
+    return jnp.where(jnp.asarray(is_amp), logrenorm_offset, 0.0)
+
+
+def _signature_param_names(func):
+    """Ordered names of `func`'s real (non-variadic) parameters.
+
+    Uses ``Parameter.name`` rather than ``str(Parameter)``.  ``str(p)`` renders
+    a defaulted argument as ``"gamma=4.33"``, which silently broke two things:
+    the ordering assertions below compared ``"gamma"`` against ``"gamma=4.33"``,
+    and ``get_param_names()`` emitted the default as part of the name.  The old
+    ``"args" not in str(p)`` filter also dropped any parameter whose name merely
+    contained the substring (``nargs``, ``target_args``); the kind check is exact.
+    """
+    return np.array([
+        p.name for p in inspect.signature(func).parameters.values()
+        if p.kind not in (inspect.Parameter.VAR_POSITIONAL,
+                          inspect.Parameter.VAR_KEYWORD)
+    ])
 
 # ---------------------------------------------------------------------------
 # Name helpers (companions to _parse_psd_func / _parse_orf_func)
 # ---------------------------------------------------------------------------
 def _psd_signature_names(psd_func, n_bins, free_spec_sentinel="halflog10_rho"):
-    """
-    Return the ordered array of ALL parameter names in `psd_func`'s signature,
-    using the exact same parsing rules as `_parse_psd_func` (so indexing with
-    the corresponding `*_varied_indxs` array lines up).
+    """Ordered names of a PSD function's parameters, excluding ``f`` and ``df``.
 
-    For the free-spectral model (param count == n_bins), names are generated
-    as f"{free_spec_sentinel}_{i}" since the signature itself only has a
-    single sentinel argument.
+    Parsed exactly as ``_parse_psd_func`` parses them, so indexing this array
+    with the matching ``*_varied_indxs`` lines the names up with the sampled
+    parameters (and hence with the prior-bound arrays).
+
+    A free-spectral model carries a single sentinel argument in its signature
+    but ``n_bins`` actual parameters, so names are generated as
+    ``f"{free_spec_sentinel}_{i}"`` for i in range(n_bins).  ``n_bins`` must be
+    whatever was passed to ``_parse_psd_func`` for the same function -- for a
+    mode-resolved GTM block that is ``n_gtm_eval``, not ``gtm_bins``.
+
+    Parameters
+    ----------
+    psd_func : callable            signature ``(f, df, *params)``
+    n_bins : int                   parameter count for the free-spectral case
+    free_spec_sentinel : str       signature name marking a free spectrum
+
+    Returns
+    -------
+    np.ndarray of str
     """
-    sigs = np.array(
-        [str(p) for p in inspect.signature(psd_func).parameters
-         if "args" not in str(p)][2:]  # skip leading `f`, `df`
-    )
+    sigs = _signature_param_names(psd_func)[2:]  # skip leading `f`, `df`
     if free_spec_sentinel in sigs:
         return np.array([f"{free_spec_sentinel}_{i}" for i in range(n_bins)])
     return sigs
 
 
 def _orf_signature_names(orf_func):
-    """Return the ordered array of ORF parameter names (after `angle`)."""
-    return np.array(
-        [str(p) for p in inspect.signature(orf_func).parameters
-         if "args" not in str(p)][1:]  # skip leading `angle`
-    )
+    """Ordered names of an ORF function's parameters, excluding ``angle``.
+
+    Parameters
+    ----------
+    orf_func : callable            signature ``(angle, *params)``
+
+    Returns
+    -------
+    np.ndarray of str              empty when the ORF takes no free parameters
+    """
+    return _signature_param_names(orf_func)[1:]  # skip leading `angle`
 
 # ---------------------------------------------------------------------------
 # Helper to parse a PSD function's helper-dictionary the same way it is done
@@ -71,16 +127,34 @@ def _parse_psd_func(psd_func, helper_dict, n_bins, free_spec_sentinel="halflog10
     Returns
     -------
     param_value_container : jnp.ndarray
-        Zero-filled container; fixed slots are pre-filled.
+        Zero-filled container of length ``len(signature params)`` (or
+        ``n_bins`` for a free spectrum); fixed slots are pre-filled with their
+        values, so evaluating the PSD only needs the varied slots written.
     varied_param_indxs : jnp.ndarray[int]
-        Indices of the parameters that are *not* fixed (i.e. sampled).
+        Indices of the parameters that are *not* fixed (i.e. sampled).  Its
+        length is the per-pulsar parameter count, and the helper dictionary's
+        prior-bound arrays must have exactly that length.
+
+    Notes
+    -----
+    On the free-spectral branch EVERY bin is varied: ``fixed_psd_param_indices``
+    is ignored there (a warning is emitted if it was supplied).
     """
-    sigs = np.array(
-        [str(p) for p in inspect.signature(psd_func).parameters
-         if "args" not in str(p)][2:]  # skip leading `f` and `df`
-    )
+    sigs = _signature_param_names(psd_func)[2:]  # skip leading `f` and `df`
 
     if free_spec_sentinel in sigs:
+        # NOTE: every bin is varied on this branch -- "fixed_psd_param_indices"
+        # is NOT honoured for a free spectrum.  A caller that expects to hold
+        # bins fixed gets the opposite, and its prior-bound arrays will then be
+        # shorter than the parameter block this reports.  Say so loudly rather
+        # than letting the length mismatch surface much later.
+        if "fixed_psd_param_indices" in helper_dict:
+            warnings.warn(
+                f"{getattr(psd_func, '__name__', psd_func)!r} is treated as a "
+                "free spectrum, so 'fixed_psd_param_indices' is IGNORED and all "
+                f"{n_bins} bins are sampled.",
+                stacklevel=2,
+            )
         container = jnp.zeros(n_bins)
         varied = jnp.arange(n_bins, dtype=int)
         return container, varied
@@ -90,8 +164,11 @@ def _parse_psd_func(psd_func, helper_dict, n_bins, free_spec_sentinel="halflog10
         fixed_idx = helper_dict["fixed_psd_param_indices"]
         fixed_val = helper_dict["fixed_psd_param_values"]
         container = container.at[fixed_idx].set(fixed_val)
+        # `i not in fixed_idx` on a jnp array goes through __contains__ on a
+        # traced/complex array type; force a plain Python set of ints.
+        fixed_set = {int(i) for i in np.asarray(fixed_idx).reshape(-1)}
         varied = jnp.array(
-            [i for i in range(len(sigs)) if i not in fixed_idx], dtype=int
+            [i for i in range(len(sigs)) if i not in fixed_set], dtype=int
         )
     else:
         varied = jnp.arange(len(sigs), dtype=int)
@@ -99,10 +176,11 @@ def _parse_psd_func(psd_func, helper_dict, n_bins, free_spec_sentinel="halflog10
     # Ordering safety-check
     if "ordered_psd_model_params" in helper_dict:
         supplied = helper_dict["ordered_psd_model_params"]
-        assert np.all(supplied[varied] == sigs[varied]), (
-            f"PSD param ordering mismatch for {psd_func.__name__}. "
-            f"Signature expects {sigs[varied]}, got {supplied[varied]}."
-        )
+        if not (np.all(supplied[varied] == sigs[varied])):
+            raise ValueError((
+                f"PSD param ordering mismatch for {psd_func.__name__}. "
+                f"Signature expects {sigs[varied]}, got {supplied[varied]}."
+            ))
 
     return container, varied
 
@@ -114,24 +192,48 @@ def _parse_orf_func(orf_func, helper_dict):
 
     The function signature is assumed to start with (angle, *params).
 
+    Fixed-ness is decided by the PRESENCE of ``"ordered_orf_model_params"`` in
+    the helper dictionary, not by the signature; a parametrised ORF without
+    that key is therefore treated as fixed and evaluated at its defaults, which
+    this warns about.
+
+    Parameters
+    ----------
+    orf_func : callable            signature ``(angle, *params)``
+    helper_dict : dict             the GWB helper dictionary
+
     Returns
     -------
     orf_fixed : bool
-    orf_signs : np.ndarray of str   (parameter names after `angle`)
+        True when the ORF is to be called as ``orf_func(xi)`` with no sampled
+        parameters.
+    orf_signs : np.ndarray of str
+        Parameter names after ``angle`` (whether or not they are sampled).
     """
-    orf_signs = np.array(
-        [str(p) for p in inspect.signature(orf_func).parameters
-         if "args" not in str(p)][1:]  # skip leading `angle`
-    )
+    orf_signs = _signature_param_names(orf_func)[1:]  # skip leading `angle`
 
     if "ordered_orf_model_params" in helper_dict:
         supplied = helper_dict["ordered_orf_model_params"]
-        assert np.all(supplied == orf_signs), (
-            f"ORF param ordering mismatch.  Signature expects {orf_signs}, "
-            f"got {supplied}."
-        )
+        if not (np.all(supplied == orf_signs)):
+            raise ValueError((
+                f"ORF param ordering mismatch.  Signature expects {orf_signs}, "
+                f"got {supplied}."
+            ))
         return False, orf_signs
 
+    # Fixed-ness is decided by the PRESENCE OF A DICT KEY, not by the signature.
+    # An ORF that really does take free parameters but whose helper dictionary
+    # omits 'ordered_orf_model_params' is silently treated as fixed and then
+    # called as orf_func(xi) -- which either raises far downstream or, worse,
+    # quietly runs on the parameters' defaults.
+    if len(orf_signs) > 0:
+        warnings.warn(
+            f"ORF {getattr(orf_func, '__name__', orf_func)!r} has free "
+            f"parameters {list(orf_signs)} but the helper dictionary has no "
+            "'ordered_orf_model_params' key, so it is being treated as FIXED "
+            "and will be evaluated at its default parameter values.",
+            stacklevel=2,
+        )
     return True, orf_signs
 
 
@@ -148,96 +250,214 @@ def _bin_idx_to_mode_idx(idx_arr):
 
 
 # ---------------------------------------------------------------------------
+# Shared GTM (Gaussian timing model) geometry
+# ---------------------------------------------------------------------------
+
+class _GTMModeMixin:
+    """GTM sizing and evaluation shared by both covariance classes.
+
+    The GTM basis columns are principal components of the timing-model prior
+    predictive, NOT sin/cos quadrature pairs of a frequency.  Pairing
+    consecutive columns into a "bin" and handing both the same PSD value --
+    which is what the bin-resolution path does, via ``jnp.repeat(x, 2)`` --
+    forces two unrelated PCs to share a variance.
+
+    With ``gtm_mode_resolved=True`` (the default) the GTM PSD is instead
+    carried at BASIS-COLUMN resolution: one value, and one sampled parameter
+    per pulsar, for every column.  ``phi`` is then returned at mode resolution
+    (``nmodes = 2 * n_total_bins`` along axis 0) throughout the class, with the
+    non-GTM blocks' bin values duplicated across their two quadrature modes.
+    Supplying a precomputed ``gtm_psd`` array is the fixed-value special case
+    of exactly that layout.
+
+    Set ``gtm_mode_resolved=False`` to recover the old bin-resolution
+    behaviour (one PSD value per pair of columns).
+    """
+
+    def _init_gtm_geometry(self, gtm_bins_arg, f_gtm,
+                           gtm_psd_func, gtm_helper_dictionary):
+        """Size the GTM block and validate everything that describes it.
+
+        Must be called after ``self.GTM_slice``, ``self.has_gtm_direct``,
+        ``self.gtm_mode_resolved``, ``self.gtm_psd_input`` and
+        ``self.Npulsars`` are set, and before the GTM PSD is parsed (which
+        needs ``n_gtm_eval``).
+
+        Sets
+        ----
+        gtm_bins : int          GTM width in frequency bins, taken from
+                                ``signal_indices['gtm']`` (the ``gtm_bins``
+                                argument is only cross-checked against it).
+        n_gtm_modes : int       ``2 * gtm_bins`` -- the number of basis columns.
+        GTM_slice_modes : slice the GTM block in column space.
+        n_gtm_eval : int        points at which the PSD function is evaluated:
+                                ``n_gtm_modes`` when mode-resolved, else
+                                ``gtm_bins``.  This is the per-pulsar parameter
+                                count for a free spectrum.
+        f_gtm, df_gtm : arrays  ``(Npulsars, n_gtm_eval)``; only set when the
+                                PSD comes from a function.
+
+        Parameters
+        ----------
+        gtm_bins_arg : int or None   caller's bin count, cross-checked
+        f_gtm : array or None        frequencies, at bin or column length
+        gtm_psd_func : callable or None
+        gtm_helper_dictionary : dict or None
+
+        Raises
+        ------
+        ValueError
+            On any disagreement between ``gtm_bins``, ``signal_indices``,
+            ``f_gtm`` and a directly-supplied ``gtm_psd``.
+        """
+        n_bins = self.GTM_slice.stop - self.GTM_slice.start
+        self.gtm_bins = n_bins
+        self.n_gtm_modes = 2 * n_bins
+        self.GTM_slice_modes = slice(2 * self.GTM_slice.start,
+                                     2 * self.GTM_slice.stop)
+        if gtm_bins_arg is not None and int(gtm_bins_arg) != n_bins:
+            raise ValueError(
+                f"gtm_bins={gtm_bins_arg} disagrees with signal_indices['gtm'], "
+                f"which spans {n_bins} frequency bins / {self.n_gtm_modes} "
+                "basis columns.")
+
+        # Points at which the PSD function is evaluated: one per basis column
+        # when mode-resolved, one per sin/cos pair otherwise.
+        self.n_gtm_eval = self.n_gtm_modes if self.gtm_mode_resolved else n_bins
+
+        if self.has_gtm_direct:
+            arr = jnp.asarray(self.gtm_psd_input)
+            if arr.shape != (self.n_gtm_modes, self.Npulsars):
+                raise ValueError(
+                    f"gtm_psd must have shape ({self.n_gtm_modes}, "
+                    f"{self.Npulsars}) -- one value per basis column per pulsar "
+                    f"-- to match the {n_bins}-bin GTM slice in signal_indices; "
+                    f"got {arr.shape}.")
+            self.gtm_psd_input = arr
+            return
+
+        if gtm_psd_func is None or f_gtm is None or gtm_helper_dictionary is None:
+            raise ValueError(
+                "gtm_psd_func, f_gtm and gtm_helper_dictionary must all be "
+                "supplied when a GTM block is present and no explicit gtm_psd "
+                "array is given.")
+
+        f = jnp.asarray(f_gtm)
+        if f.ndim == 1:
+            if f.shape[0] == n_bins and self.n_gtm_eval == self.n_gtm_modes:
+                # Bin-resolution placeholder frequencies for a mode-resolved
+                # block: the PCs have no real frequency, so duplicate rather
+                # than reject.
+                f = jnp.repeat(f, 2)
+            if f.shape[0] != self.n_gtm_eval:
+                raise ValueError(
+                    f"f_gtm has {f.shape[0]} entries but the GTM block needs "
+                    f"{self.n_gtm_eval} "
+                    f"({'one per basis column' if self.gtm_mode_resolved else 'one per frequency bin'}).")
+            f = jnp.broadcast_to(f, (self.Npulsars, self.n_gtm_eval))
+        elif f.shape != (self.Npulsars, self.n_gtm_eval):
+            raise ValueError(
+                f"f_gtm must have shape ({self.n_gtm_eval},) or "
+                f"({self.Npulsars}, {self.n_gtm_eval}); got {f.shape}.")
+        self.f_gtm = f
+        self.df_gtm = jnp.diff(
+            jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_gtm), axis=1))
+
+    @jit_method
+    def _gtm_mode_values(self, gtm_flat):
+        """GTM phi at basis-column resolution.
+
+        Parameters
+        ----------
+        gtm_flat : jnp.ndarray, shape (num_GTM_params,)
+            The GTM slice of ``xs``; ignored when the block carries no sampled
+            parameters.
+
+        Returns
+        -------
+        jnp.ndarray, shape (n_gtm_modes, Npulsars)
+            The directly-supplied ``gtm_psd`` if there is one; ones when the
+            block has no varied parameters; otherwise the evaluated PSD, with
+            each value duplicated across its two quadrature modes if the block
+            is bin-resolved rather than mode-resolved.
+        """
+        if self.has_gtm_direct:
+            return self.gtm_psd_input
+        if self._do_not_vary_gtm:
+            return jnp.ones((self.n_gtm_modes, self.Npulsars))
+        vals = self._eval_gtm_psd_all(gtm_flat)      # (n_gtm_eval, Npulsars)
+        if self.n_gtm_eval != self.n_gtm_modes:      # bin-resolved fallback
+            vals = jnp.repeat(vals, 2, axis=0)
+        return vals
+
+
+# ---------------------------------------------------------------------------
 # Unified red-noise covariance-matrix class
 # ---------------------------------------------------------------------------
 
-class PerPulsarRedNoise:
-    """
-    A unified class for constructing the red-noise covariance (phi) matrix
-    for pulsar timing array (PTA) analyses.
+class PerPulsarRedNoise(_GTMModeMixin):
+    """Red-noise covariance (phi) for a PTA with NO cross-pulsar correlations.
 
-    This class generalises the original ``PowerLawRedNoise``,
-    ``FreeSpecRedNoise``, ``DMRedNoise``, and ``ParameterizedGwb`` classes
-    into a single entry-point.  The non-GWB (intrinsic red noise, DM, …)
-    spectral components are described by callable PSD functions in exactly
-    the same way as the GWB PSD, together with companion helper dictionaries
-    that carry prior bounds and optional fixed-parameter information.
+    Combines up to three per-pulsar spectral components -- intrinsic red noise
+    (``irn``), DM noise (``dm``) and the Gaussian timing model (``gtm``) -- each
+    described by a callable PSD function plus a helper dictionary carrying its
+    prior bounds and optional fixed parameters.  At least one must be supplied.
+    For a model that also carries a common, ORF-correlated process, use
+    ``CorrelatedPulsarRedNoise``.
+
+    Because the pulsars are independent, phi is diagonal in the pulsar index
+    and is carried as that diagonal rather than as a square matrix:
+    ``get_phi_mat`` and ``get_phi_mat_full`` are aliases of ``get_phi_diag``
+    and all return shape ``(n_rows, Npulsars)``.  ``get_phi_mat_inv`` is the
+    one method that expands to ``(n_rows, Npulsars, Npulsars)``, for interface
+    parity with the correlated class.
 
     Parameter vector layout
     -----------------------
-    The flat ``xs`` vector passed to ``get_phi_mat`` / ``get_phi_diag`` is
-    ordered as::
+    The flat ``xs`` vector consumed by ``get_phi_diag`` is ordered as::
 
         xs = [ irn_psd_params (num_IR_params),
-               dm_psd_params  (num_DM_params),   ← only if irn_psd_func is not None
-               gwb_psd_params (n_gwb_varied),
-               orf_params     (n_orf_varied) ]    ← only if ORF has free params
+               dm_psd_params  (num_DM_params),
+               gtm_psd_params (num_GTM_params) ]
 
-    where:
+    Each block is present only when its component is; each is flat with the
+    pulsar index varying *slowest* (all parameters for pulsar 0, then pulsar 1,
+    ...).  There are no GWB or ORF parameters in this class.  ``get_param_names``
+    returns the matching names, and ``lower/upper_prior_lim_all`` the matching
+    bounds -- their length is checked against this layout at construction.
 
-    * ``irn_psd_params`` is a flat array of shape
-      ``(n_irn_varied_per_pulsar * Npulsars,)`` with pulsar index varying
-      *slowest* (i.e. all params for pulsar 0 first, then pulsar 1, etc.).
-    * ``dm_psd_params``  follows the same layout for the DM component.
-    * ``gwb_psd_params`` are the varied GWB PSD parameters.
-    * ``orf_params``     are the varied ORF parameters (absent when the ORF is
-      fixed, i.e. no free parameters).
+    PSD function convention
+    -----------------------
+    Every PSD function must have the signature::
 
-    IRN / DM PSD function convention
-    ---------------------------------
-    Both ``irn_psd_func`` and ``dm_psd_func`` must have the signature::
+        psd_func(f, df, *params) -> jnp.ndarray of shape (n_points,)
 
-        psd_func(f, df, *params) -> jnp.ndarray of shape (n_bins,)
+    where ``params`` is the parameter tuple *for a single pulsar*; the function
+    is called once per pulsar inside a ``vmap``.
 
-    where ``params`` is the parameter *tuple for a single pulsar*.  The
-    function is called once per pulsar inside a ``vmap``.
-
-    If ``irn_psd_func`` is ``None`` (the default) the class reduces to a
-    GWB-only model (equivalent to the original ``ParameterizedGwb``).
-
-    GWB / ORF function convention
-    ------------------------------
-    ``gwb_psd_func(f, df, *params) -> jnp.ndarray of shape (crn_bins,)``
-    ``orf_func(angle, *params)     -> jnp.ndarray of shape (n_pairs,)``
-
-    Direct (mode-resolution) GTM PSD
-    ---------------------------------
-    Instead of supplying ``gtm_psd_func`` (a callable PSD model that is
-    evaluated once per frequency *bin* and then implicitly duplicated across
-    the sin/cos quadrature modes of that bin), you may instead supply
-    ``gtm_psd`` directly: a precomputed array of shape
-    ``(2 * gtm_nfreqs, Npulsars)`` giving the phi value for *every Fourier
-    mode* (sin and cos separately, so consecutive modes need not be equal).
-
-    When ``gtm_psd`` is supplied:
-      * ``gtm_psd_func`` / ``gtm_helper_dictionary`` are ignored for the GTM
-        component (no GTM parameters are sampled — ``num_GTM_params == 0``).
-      * ``get_phi_diag`` / ``get_phi_mat`` / ``get_phi_mat_full`` /
-        ``get_phi_mat_CURN`` all return arrays with their leading axis at
-        **mode** resolution, i.e. shape ``(nmodes, Npulsars)`` /
-        ``(nmodes, Npulsars, Npulsars)`` where
-        ``nmodes = 2 * n_total_bins``, rather than
-        ``(n_total_bins, Npulsars[, Npulsars])``.
-      * ``get_phi_mat_inv`` expects (and returns) arrays at that same mode
-        resolution.
+    Row resolution
+    --------------
+    Rows are frequency BINS, shape ``(n_total_bins, Npulsars)``, except when the
+    GTM block is mode-resolved -- ``gtm_mode_resolved=True`` (the default) or a
+    direct ``gtm_psd`` array -- in which case every returned array is at BASIS
+    COLUMN resolution, ``(2 * n_total_bins, Npulsars)``: the IRN/DM/GWB bin
+    values duplicated across their two quadrature modes, and one independent
+    value per GTM column.  See ``_GTMModeMixin`` for why the GTM block is
+    treated this way.  ``get_phi_mat_inv`` follows whichever resolution its
+    input is in.
 
     Helper dictionary keys
     ----------------------
-    ``gwb_helper_dictionary`` (same as before):
-        * ``"gwb_psd_param_upper_lim"``
-        * ``"gwb_psd_param_lower_lim"``
-        * ``"ordered_gwb_psd_model_params"``  (optional, for ordering check)
-        * ``"fixed_gwb_psd_param_indices"``   (optional)
-        * ``"fixed_gwb_psd_param_values"``    (optional)
-        * ``"ordered_orf_model_params"``       (optional, marks free ORF)
+    ``irn_helper_dictionary`` / ``dm_helper_dictionary`` /
+    ``gtm_helper_dictionary``:
+        * ``"psd_param_upper_lim"``      (required) bounds for the VARIED params
+        * ``"psd_param_lower_lim"``      (required)
+        * ``"ordered_psd_model_params"`` (optional) ordering cross-check
+        * ``"fixed_psd_param_indices"``  (optional) ignored for a free spectrum
+        * ``"fixed_psd_param_values"``   (optional)
 
-    ``irn_helper_dictionary`` / ``dm_helper_dictionary`` (same structure,
-    but keys prefixed with ``"psd_"`` instead of ``"gwb_psd_"`` / ``"gwb_"``):
-        * ``"psd_param_upper_lim"``
-        * ``"psd_param_lower_lim"``
-        * ``"ordered_psd_model_params"``  (optional)
-        * ``"fixed_psd_param_indices"``   (optional)
-        * ``"fixed_psd_param_values"``    (optional)
+    Bounds are shifted by ``0.5*log10(renorm_const)`` for LOG-AMPLITUDE
+    parameters only (see ``_renorm_shift``).
 
     Authors
     -------
@@ -264,17 +484,64 @@ class PerPulsarRedNoise:
         gtm_bins=None,
         f_gtm=None,
         gtm_psd=None,            # direct, mode-resolution GTM phi: (2*gtm_nfreqs, Npulsars)
+        gtm_mode_resolved=True,  # one PSD value per basis COLUMN (see _GTMModeMixin)
         # ---- shared ----
         renorm_const=1.0,
         Npulsars=1,
         pulsar_names=None
     ):
+        """
+        Parameters
+        ----------
+        signal_indices : dict[str, slice]
+            Column slices of the T-matrix per signal, as returned by
+            ``SuperSignal.build_basis``.  The keys ``'unc'`` / ``'dm'`` /
+            ``'gtm'`` are read for whichever components are present, and they
+            fix each block's width -- the ``*_bins`` arguments are only
+            cross-checked against them.
+        linear_timing_model_size : int
+            Number of leading timing-model columns in the T-matrix; subtracted
+            before converting column indices to frequency bins.
+        irn_psd_func, dm_psd_func, gtm_psd_func : callable, optional
+            ``psd_func(f, df, *params)`` for one pulsar.  Passing None omits
+            that component; at least one component is required.
+        irn_helper_dictionary, dm_helper_dictionary, gtm_helper_dictionary : dict, optional
+            Prior bounds and optional fixed-parameter info (see class docstring).
+            Required whenever the matching PSD function is given.
+        irn_bins, dm_bins, gtm_bins : int, optional
+            Number of frequency bins for each component.
+        f_irn, f_dm, f_gtm : array, optional
+            Frequencies, ``(n_bins,)`` or ``(Npulsars, n_bins)``.  For a
+            mode-resolved GTM block ``f_gtm`` may also be given at column
+            resolution; a bin-length array is duplicated.
+        gtm_psd : array, optional
+            Precomputed GTM phi, ``(2*gtm_bins, Npulsars)`` -- one value per
+            basis column per pulsar.  When given, no GTM parameters are sampled
+            and ``gtm_psd_func``/``gtm_helper_dictionary`` are unused.
+        gtm_mode_resolved : bool, default True
+            One PSD value (and one sampled parameter) per GTM basis column
+            rather than one per sin/cos pair.  See ``_GTMModeMixin``.
+        renorm_const : float, default 1.0
+            Unit rescaling of the residuals; shifts log-amplitude prior bounds
+            by ``0.5*log10(renorm_const)``.
+        Npulsars : int
+        pulsar_names : list of str, optional
+            Required only by ``get_param_names``.
+
+        Raises
+        ------
+        ValueError
+            If no component is supplied, if any block's declared size
+            disagrees with ``signal_indices``, or if the prior bounds do not
+            cover exactly the sampled parameters.
+        """
         self.Npulsars = Npulsars
         if pulsar_names is not None:
-            assert len(pulsar_names) == Npulsars, (
-                f"len(pulsar_names)={len(pulsar_names)} does not match "
-                f"Npulsars={Npulsars}."
-            )
+            if not (len(pulsar_names) == Npulsars):
+                raise ValueError((
+                    f"len(pulsar_names)={len(pulsar_names)} does not match "
+                    f"Npulsars={Npulsars}."
+                ))
         self.pulsar_names = pulsar_names
 
         # ------------------------------------------------------------------ #
@@ -283,6 +550,7 @@ class PerPulsarRedNoise:
         tm_offset = linear_timing_model_size
 
         def _fourier_slice(name):
+            """Column slice of `name` in the T-matrix -> its frequency-bin slice."""
             sl = signal_indices[name]
             return slice((sl.start - tm_offset) // 2,
                         (sl.stop  - tm_offset) // 2)
@@ -307,8 +575,18 @@ class PerPulsarRedNoise:
         self.has_gtm = has_gtm
         self.has_gtm_direct = gtm_psd is not None
         self.gtm_psd_input = gtm_psd
-        if self.has_dm is None and self.has_irn is None and self.has_gtm is None:
-            raise ValueError("Either `irn`, 'dm', or 'gtm' needs to be supplied." )
+        # A directly-supplied gtm_psd is mode-resolution by definition.  False
+        # when there is no GTM block at all, so every `if self.gtm_mode_resolved`
+        # below is also a "there is a GTM block" test.
+        self.gtm_mode_resolved = bool(
+            has_gtm and (gtm_mode_resolved or self.has_gtm_direct))
+        # `has_*` are booleans, never None, so the old `is None` test could never
+        # fire; with no component at all the failure was a bare
+        # `max([])  ->  ValueError` from the n_total_bins line below.
+        if not (self.has_irn or self.has_dm or self.has_gtm):
+            raise ValueError(
+                "PerPulsarRedNoise needs at least one of `irn_psd_func`, "
+                "`dm_psd_func`, `gtm_psd_func`/`gtm_psd`.")
 
         if has_irn:
             self.IRN_slice = _fourier_slice('unc')
@@ -330,12 +608,14 @@ class PerPulsarRedNoise:
         #  IRN bookkeeping                                                     #
         # ------------------------------------------------------------------ #
         if self.has_irn:
-            assert irn_bins is not None and f_irn is not None, (
-                "irn_bins and f_irn must be supplied when irn_psd_func is given."
-            )
-            assert irn_helper_dictionary is not None, (
-                "irn_helper_dictionary must be supplied when irn_psd_func is given."
-            )
+            if not (irn_bins is not None and f_irn is not None):
+                raise ValueError((
+                    "irn_bins and f_irn must be supplied when irn_psd_func is given."
+                ))
+            if not (irn_helper_dictionary is not None):
+                raise ValueError((
+                    "irn_helper_dictionary must be supplied when irn_psd_func is given."
+                ))
             self.irn_bins = irn_bins
             self.f_irn = f_irn if f_irn.ndim == 2 else jnp.broadcast_to(f_irn, (self.Npulsars, self.irn_bins)) 
             self.df_irn = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_irn), axis = 1))
@@ -344,12 +624,14 @@ class PerPulsarRedNoise:
         #  DM bookkeeping                                                      #
         # ------------------------------------------------------------------ #
         if self.has_dm:
-            assert dm_bins is not None and f_dm is not None, (
-                "dm_bins and f_dm must be supplied when dm_psd_func is given."
-            )
-            assert dm_helper_dictionary is not None, (
-                "dm_helper_dictionary must be supplied when dm_psd_func is given."
-            )
+            if not (dm_bins is not None and f_dm is not None):
+                raise ValueError((
+                    "dm_bins and f_dm must be supplied when dm_psd_func is given."
+                ))
+            if not (dm_helper_dictionary is not None):
+                raise ValueError((
+                    "dm_helper_dictionary must be supplied when dm_psd_func is given."
+                ))
             self.dm_bins = dm_bins
             self.f_dm = f_dm if f_dm.ndim == 2 else jnp.broadcast_to(f_dm, (self.Npulsars, self.dm_bins))
             self.df_dm = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_dm), axis = 1))
@@ -357,30 +639,9 @@ class PerPulsarRedNoise:
         # ------------------------------------------------------------------ #
         #  GTM bookkeeping                                                      #
         # ------------------------------------------------------------------ #
-        if self.has_gtm_direct:
-            assert self.gtm_psd_input.shape[1] == self.Npulsars, (
-                f"gtm_psd second dimension ({self.gtm_psd_input.shape[1]}) "
-                f"must match Npulsars ({self.Npulsars})."
-            )
-            expected_gtm_bins = self.GTM_slice.stop - self.GTM_slice.start
-            assert self.gtm_psd_input.shape[0] == 2 * expected_gtm_bins, (
-                f"gtm_psd must have shape (2*{expected_gtm_bins}, {self.Npulsars}) "
-                f"to match the {expected_gtm_bins}-bin GTM slice in signal_indices; "
-                f"got {self.gtm_psd_input.shape}."
-            )
-            self.gtm_bins = expected_gtm_bins
-            # Mode-resolution (raw column-space) slice/indices for the GTM block.
-            self.GTM_slice_modes = slice(2 * self.GTM_slice.start, 2 * self.GTM_slice.stop)
-        elif self.has_gtm:
-            assert gtm_bins is not None and f_gtm is not None, (
-                "gtm_bins and f_gtm must be supplied when gtm_psd_func is given."
-            )
-            assert gtm_helper_dictionary is not None, (
-                "gtm_helper_dictionary must be supplied when gtm_psd_func is given."
-            )
-            self.gtm_bins = gtm_bins
-            self.f_gtm = f_gtm if f_gtm.ndim == 2 else jnp.broadcast_to(f_gtm, (self.Npulsars, self.gtm_bins))
-            self.df_gtm = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_gtm), axis = 1))
+        if self.has_gtm:
+            self._init_gtm_geometry(gtm_bins, f_gtm,
+                                    gtm_psd_func, gtm_helper_dictionary)
 
         # ------------------------------------------------------------------ #
         #  Parse IRN PSD                                                       #
@@ -411,8 +672,10 @@ class PerPulsarRedNoise:
         #  Parse GTM PSD                                                        #
         # ------------------------------------------------------------------ #
         if self.has_gtm and not self.has_gtm_direct:
+            # n_gtm_eval, not gtm_bins: a mode-resolved free spectrum carries
+            # one parameter per basis column.
             self.gtm_param_container, self.gtm_varied_indxs = _parse_psd_func(
-                gtm_psd_func, gtm_helper_dictionary, gtm_bins
+                gtm_psd_func, gtm_helper_dictionary, self.n_gtm_eval
             )
             self.n_gtm_varied = int(len(self.gtm_varied_indxs))
             self.num_GTM_params = self.n_gtm_varied * self.Npulsars
@@ -438,36 +701,48 @@ class PerPulsarRedNoise:
         upper, lower = jnp.array([]), jnp.array([])
 
         if self.has_irn:
+            irn_shift = _renorm_shift(
+                _psd_signature_names(irn_psd_func, self.irn_bins)[
+                    np.asarray(self.irn_varied_indxs)],
+                self.logrenorm_offset)
             irn_upper = jnp.tile(
-                irn_helper_dictionary["psd_param_upper_lim"] + self.logrenorm_offset,
+                jnp.asarray(irn_helper_dictionary["psd_param_upper_lim"]) + irn_shift,
                 self.Npulsars
             )
             irn_lower = jnp.tile(
-                irn_helper_dictionary["psd_param_lower_lim"] + self.logrenorm_offset,
+                jnp.asarray(irn_helper_dictionary["psd_param_lower_lim"]) + irn_shift,
                 self.Npulsars
             )
             upper = jnp.concatenate([upper, irn_upper])
             lower = jnp.concatenate([lower, irn_lower])
 
         if self.has_dm:
+            dm_shift = _renorm_shift(
+                _psd_signature_names(dm_psd_func, self.dm_bins)[
+                    np.asarray(self.dm_varied_indxs)],
+                self.logrenorm_offset)
             dm_upper = jnp.tile(
-                dm_helper_dictionary["psd_param_upper_lim"] + self.logrenorm_offset,
+                jnp.asarray(dm_helper_dictionary["psd_param_upper_lim"]) + dm_shift,
                 self.Npulsars
             )
             dm_lower = jnp.tile(
-                dm_helper_dictionary["psd_param_lower_lim"] + self.logrenorm_offset,
+                jnp.asarray(dm_helper_dictionary["psd_param_lower_lim"]) + dm_shift,
                 self.Npulsars
             )
             upper = jnp.concatenate([upper, dm_upper])
             lower = jnp.concatenate([lower, dm_lower])
 
         if self.has_gtm and not self.has_gtm_direct:
+            gtm_shift = _renorm_shift(
+                _psd_signature_names(gtm_psd_func, self.n_gtm_eval)[
+                    np.asarray(self.gtm_varied_indxs)],
+                self.logrenorm_offset)
             gtm_upper = jnp.tile(
-                gtm_helper_dictionary["psd_param_upper_lim"] + self.logrenorm_offset,
+                jnp.asarray(gtm_helper_dictionary["psd_param_upper_lim"]) + gtm_shift,
                 self.Npulsars
             )
             gtm_lower = jnp.tile(
-                gtm_helper_dictionary["psd_param_lower_lim"] + self.logrenorm_offset,
+                jnp.asarray(gtm_helper_dictionary["psd_param_lower_lim"]) + gtm_shift,
                 self.Npulsars
             )
             upper = jnp.concatenate([upper, gtm_upper])
@@ -475,6 +750,21 @@ class PerPulsarRedNoise:
 
         self.upper_prior_lim_all = upper
         self.lower_prior_lim_all = lower
+
+        # The parameter block sizes come from the PSD SIGNATURES, the prior
+        # bounds come from the HELPER DICTIONARIES, and nothing tied the two
+        # together.  A mismatch (e.g. a free-spectrum PSD, whose every bin is
+        # varied, paired with an empty bounds array because the caller meant to
+        # hold it fixed) silently produced an `xs` layout the prior does not
+        # cover -- get_lnprior then compares arrays of different length.
+        n_expected = self.gtm_end_idx
+        if upper.shape[0] != n_expected:
+            raise ValueError(
+                f"Prior bounds have {upper.shape[0]} entries but the parameter "
+                f"layout needs {n_expected} (IRN {self.num_IR_params} + DM "
+                f"{self.num_DM_params} + GTM {self.num_GTM_params}).  Check that "
+                "each helper dictionary's psd_param_*_lim covers exactly the "
+                "varied parameters of its PSD function.")
 
         if renorm_const != 1:
             warnings.warn(
@@ -513,6 +803,11 @@ class PerPulsarRedNoise:
         """
         Evaluate the DM PSD for *all* pulsars.
 
+        Parameters
+        ----------
+        dm_params_flat : jnp.ndarray, shape (num_DM_params,)
+            Flat array; reshaped to (Npulsars, n_dm_varied) before vmapping.
+
         Returns
         -------
         jnp.ndarray, shape (dm_bins, Npulsars)
@@ -531,9 +826,17 @@ class PerPulsarRedNoise:
         Evaluate the GTM PSD for *all* pulsars (function-based model only;
         not used when `gtm_psd` was supplied directly).
 
+        Parameters
+        ----------
+        gtm_params_flat : jnp.ndarray, shape (num_GTM_params,)
+            Flat array; reshaped to (Npulsars, n_gtm_varied) before vmapping.
+
         Returns
         -------
-        jnp.ndarray, shape (gtm_bins, Npulsars)
+        jnp.ndarray, shape (n_gtm_eval, Npulsars)
+            One row per basis column when the block is mode-resolved, else one
+            row per frequency bin.  Prefer ``_gtm_mode_values``, which always
+            returns column resolution.
         """
         per_psr = gtm_params_flat.reshape(self.Npulsars, self.n_gtm_varied)
 
@@ -549,7 +852,10 @@ class PerPulsarRedNoise:
 
     @jit_method
     def _unpack(self, xs):
-        """Return (irn_flat, dm_flat) from ``xs``."""
+        """Split ``xs`` into its (irn_flat, dm_flat, gtm_flat) blocks.
+
+        Blocks belonging to absent components come back empty.
+        """
         irn = xs[:self.irn_end_idx]
         dm  = xs[self.irn_end_idx:self.dm_end_idx]
         gtm = xs[self.dm_end_idx:self.gtm_end_idx]
@@ -562,19 +868,22 @@ class PerPulsarRedNoise:
     @jit_method
     def get_phi_diag(self, xs):
         """
-        Build the phi diagonal.
+        Build the phi diagonal: the prior variance of every basis coefficient.
+
+        Parameters
+        ----------
+        xs : jnp.ndarray
+            Flat parameter vector; see the class docstring for its layout.
 
         Returns
         -------
         phi_diag : jnp.ndarray
-            Shape ``(n_total_bins, Npulsars)`` when no direct ``gtm_psd`` was
-            supplied at construction. When a direct ``gtm_psd`` *was*
-            supplied, the whole array is instead returned at **mode**
-            resolution, shape ``(nmodes, Npulsars)`` with
-            ``nmodes = 2 * n_total_bins`` — every non-GTM bin's value is
-            duplicated across its two quadrature modes (as before), while the
-            GTM block is filled directly from ``gtm_psd`` (which may differ
-            between the two modes of a given frequency).
+            ``(n_total_bins, Npulsars)`` when the GTM block is bin-resolved (or
+            absent).  When it is mode-resolved -- ``gtm_mode_resolved=True`` or
+            a direct ``gtm_psd`` -- the whole array comes back at BASIS COLUMN
+            resolution instead, ``(2 * n_total_bins, Npulsars)``: each non-GTM
+            bin duplicated across its two quadrature modes, and one independent
+            value per GTM column.
         """
         irn_flat, dm_flat, gtm_flat = self._unpack(xs)
 
@@ -590,61 +899,58 @@ class PerPulsarRedNoise:
                 self._eval_dm_psd_all(dm_flat)
             )
 
-        if self.has_gtm and not self.has_gtm_direct:
+        if self.has_gtm and not self.gtm_mode_resolved:
             if not self._do_not_vary_gtm:
                 gtm_psd = self._eval_gtm_psd_all(gtm_flat)
             else:
                 gtm_psd = 1.
-            phi_diag = phi_diag.at[self.GTM_slice].add(
-                gtm_psd
-            )
+            phi_diag = phi_diag.at[self.GTM_slice].add(gtm_psd)
 
-        if self.has_gtm_direct:
+        if self.gtm_mode_resolved:
+            # Expand every bin into its two quadrature modes, then overwrite the
+            # GTM columns with one value per column.
             phi_diag = jnp.repeat(phi_diag, 2, axis=0)
-            phi_diag = phi_diag.at[self.GTM_slice_modes].set(self.gtm_psd_input)
+            phi_diag = phi_diag.at[self.GTM_slice_modes].set(
+                self._gtm_mode_values(gtm_flat))
 
         return phi_diag
 
     @jit_method
     def get_phi_mat(self, xs):
         """
-        Build the full phi-matrix  (n_total_bins, Npulsars, Npulsars), or, if
-        a direct ``gtm_psd`` was supplied, (nmodes, Npulsars, Npulsars).
+        Alias of ``get_phi_diag``.
 
-        Off-diagonal (cross-pulsar) elements are filled only in the GWB bins,
-        weighted by the ORF.
-
-        Parameters
-        ----------
-        xs : jnp.ndarray
-            Flat parameter vector (see class docstring for layout).
-
-        Returns
-        -------
-        phi : jnp.ndarray  (n_total_bins, Npulsars, Npulsars)
+        This model has NO cross-pulsar correlations, so phi is diagonal in the
+        pulsar index and is carried as the (n_total_bins, Npulsars) diagonal
+        rather than an (n_total_bins, Npulsars, Npulsars) matrix.  The name is
+        kept so callers can use either model class interchangeably; the old
+        docstring claimed a square matrix that was never built.
         """
         return self.get_phi_diag(xs)
 
     @jit_method
     def get_phi_mat_full(self, xs):
-        """
-        Like ``get_phi_mat`` but also fills the *upper* triangle so the matrix
-        is explicitly symmetric.
-        """
+        """Alias of ``get_phi_diag`` -- see ``get_phi_mat``."""
         return self.get_phi_diag(xs)
 
     @jit_method
     def get_phi_mat_CURN(self, xs):
         """
-        Return the phi diagonal (CURN = Common Uncorrelated Red Noise):
-        cross-pulsar correlations are ignored even if an ORF was supplied.
+        Return ``(phi_diag, psd_common)`` for interface parity with
+        ``CorrelatedPulsarRedNoise.get_phi_mat_CURN``.
+
+        There is no common process in this model, so ``psd_common`` is None.
+        This used to return the bare array, which made the documented (and
+        actually used) ``phi, psd_common = model.get_phi_mat_CURN(params)``
+        unpack the leading axis of phi -- a ValueError, or two rows of phi
+        silently mistaken for phi and psd_common when n_total_bins == 2.
 
         Returns
         -------
         phi_diag : jnp.ndarray  (n_total_bins, Npulsars)
-        psd_common : jnp.ndarray  (crn_bins,)
+        psd_common : None
         """
-        return self.get_phi_diag(xs)
+        return self.get_phi_diag(xs), None
 
     # ---------------------------------------------------------------------- #
     #  Inversion                                                              #
@@ -653,26 +959,32 @@ class PerPulsarRedNoise:
     @jit_method
     def get_phi_mat_inv(self, phi):
         """
-        Invert the phi-matrix.
+        Invert the phi diagonal and embed it as a (diagonal) matrix per row.
+
+        The inversion is elementwise -- this model has no cross-pulsar
+        correlations -- and the result is widened to ``(..., Npulsars,
+        Npulsars)`` only so that callers can treat it like the correlated
+        class's output.
 
         Parameters
         ----------
         phi : jnp.ndarray
-            ``(n_total_bins, Npulsars)`` normally, or ``(nmodes, Npulsars)``
-            when a direct ``gtm_psd`` was supplied at construction (i.e. the
-            output of ``get_phi_diag`` in that mode).
+            The output of ``get_phi_diag``: ``(n_total_bins, Npulsars)`` when
+            bin-resolved, ``(2*n_total_bins, Npulsars)`` when the GTM block is
+            mode-resolved.
 
         Returns
         -------
         phiinv : jnp.ndarray
-            ``(2*n_total_bins, Npulsars, Npulsars)`` normally (bin values
-            repeated twice along axis-0, one for each quadrature component),
-            or ``(nmodes, Npulsars, Npulsars)`` in the direct-``gtm_psd``
-            case, where the array is already at mode resolution and is
-            inverted mode-by-mode without any repetition.
+            Bin-resolved input: ``(2*n_total_bins, Npulsars, Npulsars)`` -- each
+            bin repeated across its two quadrature modes.  Mode-resolved input:
+            ``(2*n_total_bins, Npulsars, Npulsars)`` with no repetition, since
+            the input already has one row per basis column.
         logdet_phi : float
+            log|phi| summed over all modes and pulsars (hence the factor 2 in
+            the bin-resolved branch).
         """
-        if self.has_gtm_direct:
+        if self.gtm_mode_resolved:
             phiinv = 1.0 / phi
             log_det_phi = jnp.sum(jnp.log(phi))
         else:
@@ -686,27 +998,25 @@ class PerPulsarRedNoise:
 
     @jit_method
     def get_lnprior(self, xs):
-        """Uniform log-prior: returns a small constant if in bounds, -inf otherwise."""
+        """UNNORMALISED uniform log-prior over ``xs``.
+
+        Returns an arbitrary constant (see ``_spit_neg_number``) when every
+        parameter is strictly inside its bounds and -inf otherwise; the
+        constant is not -log(prior volume), so this is usable for MCMC
+        acceptance ratios but not for evidence.
+        """
         in_bounds = jnp.logical_and(
             xs > self.lower_prior_lim_all, xs < self.upper_prior_lim_all
         ).all()
         return jax.lax.cond(in_bounds, self._spit_neg_number, self._spit_neg_infinity)
 
     def get_lnprior_numpy(self, xs):
+        """``get_lnprior`` as a host-side numpy scalar."""
         return self.get_lnprior(xs).__array__()
 
     @jit_method
     def make_initial_guess(self, key):
-        """Draw a uniform initial sample within the prior bounds."""
-        return jr.uniform(
-            key,
-            shape=(self.upper_prior_lim_all.shape[0],),
-            minval=self.lower_prior_lim_all,
-            maxval=self.upper_prior_lim_all,
-        )
-
-    def test(self, key):
-        """Draw a uniform initial sample within the prior bounds."""
+        """Draw one uniform sample from inside the prior bounds. [n_params]"""
         return jr.uniform(
             key,
             shape=(self.upper_prior_lim_all.shape[0],),
@@ -727,12 +1037,23 @@ class PerPulsarRedNoise:
                 dm_psd_params  (pulsar-major, param-minor),
                 gtm_psd_params (pulsar-major, param-minor)]
 
-        Note: if a direct ``gtm_psd`` was supplied at construction, the GTM
-        block contributes no names (it has no sampled parameters).
+        Names are ``f"{pulsar}_{component}_{param}"``.  A directly-supplied
+        ``gtm_psd`` contributes no names (it has no sampled parameters), and a
+        mode-resolved GTM free spectrum contributes one name per basis column.
+
+        Returns
+        -------
+        list of str, the same length as ``lower/upper_prior_lim_all``.
+
+        Raises
+        ------
+        ValueError
+            If ``pulsar_names`` was not supplied at construction.
         """
-        assert self.pulsar_names is not None, (
-            "pulsar_names must be supplied at construction to get param names."
-        )
+        if not (self.pulsar_names is not None):
+            raise ValueError((
+                "pulsar_names must be supplied at construction to get param names."
+            ))
 
         names = []
 
@@ -751,7 +1072,7 @@ class PerPulsarRedNoise:
                 names += [f"{psr}_dm_{p}" for p in dm_names]
 
         if self.has_gtm and not self.has_gtm_direct:
-            gtm_names = _psd_signature_names(self.gtm_psd_func, self.gtm_bins)[
+            gtm_names = _psd_signature_names(self.gtm_psd_func, self.n_gtm_eval)[
                 np.asarray(self.gtm_varied_indxs)
             ]
             for psr in self.pulsar_names:
@@ -760,6 +1081,7 @@ class PerPulsarRedNoise:
         return names
 
     def get_param_names_and_priors(self):
+        """``{param_name: (lower_bound, upper_bound)}`` in ``xs`` order."""
         return dict(
                 zip(
                 self.get_param_names(), 
@@ -768,43 +1090,77 @@ class PerPulsarRedNoise:
                     )))
                     
     def jax_to_numpy_CPU(self, jax_CPU_array):
+        """Zero-copy view of a CPU-resident JAX array as a numpy array."""
         return np.from_dlpack(jax_CPU_array)
 
     def _spit_neg_infinity(self):
+        """-inf branch of ``get_lnprior`` (lax.cond needs a callable)."""
         return -jnp.inf
 
     def _spit_neg_number(self):
+        """In-bounds branch of ``get_lnprior`` (lax.cond needs a callable).
+
+        An arbitrary constant, NOT -log(prior volume): the prior is
+        unnormalised, so this cancels in MCMC ratios but makes any evidence or
+        cross-model comparison built on ``get_lnprior`` meaningless.
+        """
         return -8.01
 
-class CorrelatedPulsarRedNoise:
-    """
-    A unified class for constructing the red-noise covariance (phi) matrix
-    for pulsar timing array (PTA) analyses.
+
+class CorrelatedPulsarRedNoise(_GTMModeMixin):
+    """Red-noise covariance (phi) for a PTA WITH a common, ORF-correlated process.
+
+    Same per-pulsar components as ``PerPulsarRedNoise`` (``irn``, ``dm``,
+    ``gtm``, all optional) plus a mandatory common process whose PSD is shared
+    by every pulsar and whose cross-pulsar correlations are set by an overlap
+    reduction function of the pulsar-pair angular separations.  phi is
+    therefore a genuine ``(n_rows, Npulsars, Npulsars)`` matrix: diagonal
+    everywhere except in the GWB bins, where the off-diagonals are
+    ``orf(xi) * psd_common``.
 
     Parameter vector layout
     -----------------------
-    The flat ``xs`` vector passed to ``get_phi_mat`` / ``get_phi_diag`` is
-    ordered as::
+    The flat ``xs`` vector is ordered as::
 
         xs = [ irn_psd_params (num_IR_params),
                dm_psd_params  (num_DM_params),
                gtm_psd_params (num_GTM_params),
                gwb_psd_params (n_gwb_varied),
-               orf_params     (n_orf_varied) ]    ← only if ORF has free params
+               orf_params     (n_orf_varied) ]    <- only if the ORF is free
 
-    Direct (mode-resolution) GTM PSD
-    ---------------------------------
-    As in ``PerPulsarRedNoise``, ``gtm_psd`` may be supplied directly instead
-    of ``gtm_psd_func``: a precomputed array of shape
-    ``(2 * gtm_nfreqs, Npulsars)`` giving the phi value for every Fourier
-    mode. When supplied, no GTM parameters are sampled
-    (``num_GTM_params == 0``), and ``get_phi_diag`` / ``get_phi_mat`` /
-    ``get_phi_mat_full`` / ``get_phi_mat_CURN`` / ``get_phi_mat_inv`` all
-    operate and return values at **mode** resolution
-    (``nmodes = 2 * n_total_bins`` along axis 0) rather than at frequency-bin
-    resolution. Non-GTM components (IRN, DM, GWB) are unaffected in value —
-    their bin-resolution values are simply duplicated across the two
-    quadrature modes of each bin, exactly as the old "repeat by 2" step did.
+    The three per-pulsar blocks are flat with the pulsar index varying
+    *slowest*; the GWB and ORF blocks are shared across pulsars.  Block
+    boundaries are ``irn_end_idx``, ``dm_end_idx``, ``gtm_end_idx``,
+    ``gwb_psd_end_idx``; the total is checked against the prior bounds at
+    construction.
+
+    Row resolution
+    --------------
+    Rows are frequency BINS, except when the GTM block is mode-resolved --
+    ``gtm_mode_resolved=True`` (the default) or a direct ``gtm_psd`` array --
+    in which case ``get_phi_diag`` / ``get_phi_mat`` / ``get_phi_mat_full`` /
+    ``get_phi_mat_CURN`` / ``get_phi_mat_inv`` all work at BASIS COLUMN
+    resolution (``2 * n_total_bins`` rows): IRN/DM/GWB bin values duplicated
+    across their two quadrature modes, one independent value per GTM column.
+    ``get_phi_mat_from_diag`` and ``_get_phi_diag_bins`` are the exceptions --
+    they are bin-resolution only.
+
+    Helper dictionaries
+    -------------------
+    ``gwb_helper_dictionary``:
+        * ``"gwb_psd_param_upper_lim"`` / ``"gwb_psd_param_lower_lim"``
+        * ``"ordered_gwb_psd_model_params"``  (optional, ordering cross-check)
+        * ``"fixed_gwb_psd_param_indices"`` / ``"fixed_gwb_psd_param_values"``
+          (optional)
+        * ``"ordered_orf_model_params"``      (optional; its PRESENCE is what
+          marks the ORF as free)
+        * ``"orf_param_upper_lim"`` / ``"orf_param_lower_lim"`` (required when
+          the ORF is free)
+
+    ``irn_helper_dictionary`` / ``dm_helper_dictionary`` /
+    ``gtm_helper_dictionary`` use the same keys with the ``"psd_"`` prefix, as
+    documented on ``PerPulsarRedNoise``.  Log-amplitude bounds are shifted by
+    ``0.5*log10(renorm_const)``; dimensionless ones are not.
 
     Authors
     -------
@@ -839,22 +1195,64 @@ class CorrelatedPulsarRedNoise:
         gtm_bins=None,
         f_gtm=None,
         gtm_psd=None,            # direct, mode-resolution GTM phi: (2*gtm_nfreqs, Npulsars)
+        gtm_mode_resolved=True,  # one PSD value per basis COLUMN (see _GTMModeMixin)
         # ---- shared ----
         renorm_const=1.0,
         pulsar_names=None
     ):
+        """
+        Parameters
+        ----------
+        psr_pos : array, shape (Npulsars, 3)
+            Unit position vectors; used only for the pair separations ``xi``.
+        Npulsars : int
+        signal_indices : dict[str, slice]
+            T-matrix column slices per signal (``'cor'`` required; ``'unc'`` /
+            ``'dm'`` / ``'gtm'`` as present), from ``SuperSignal.build_basis``.
+        linear_timing_model_size : int
+            Leading timing-model columns, subtracted before converting column
+            indices to frequency bins.
+        gwb_psd_func : callable
+            ``gwb_psd_func(f, df, *params) -> (crn_bins,)``.
+        orf_func : callable
+            ``orf_func(angle, *params) -> (n_pairs,)``.
+        gwb_helper_dictionary : dict
+            Bounds and fixed-parameter info for the GWB PSD and the ORF.
+        crn_bins : int
+            Number of common-process bins; must equal the width of
+            ``signal_indices['cor']``.
+        f_common : array, shape (crn_bins,)
+        irn_psd_func, dm_psd_func, gtm_psd_func, and their
+        ``*_helper_dictionary`` / ``*_bins`` / ``f_*`` companions : optional
+            Per-pulsar components, exactly as in ``PerPulsarRedNoise``.
+        gtm_psd : array, optional
+            Precomputed GTM phi, ``(2*gtm_bins, Npulsars)``.
+        gtm_mode_resolved : bool, default True
+            One PSD value per GTM basis column.  See ``_GTMModeMixin``.
+        renorm_const : float, default 1.0
+        pulsar_names : list of str, optional
+
+        Raises
+        ------
+        ValueError
+            If ``crn_bins`` or any component's size disagrees with
+            ``signal_indices``, or if the prior bounds do not cover exactly the
+            sampled parameters.
+        """
         self.Npulsars = Npulsars
         if pulsar_names is not None:
-            assert len(pulsar_names) == Npulsars, (
-                f"len(pulsar_names)={len(pulsar_names)} does not match "
-                f"Npulsars={Npulsars}."
-            )
+            if not (len(pulsar_names) == Npulsars):
+                raise ValueError((
+                    f"len(pulsar_names)={len(pulsar_names)} does not match "
+                    f"Npulsars={Npulsars}."
+                ))
         self.pulsar_names = pulsar_names
         
         self.signal_indices = signal_indices
         tm_offset = linear_timing_model_size
 
         def _fourier_slice(name):
+            """Column slice of `name` in the T-matrix -> its frequency-bin slice."""
             sl = self.signal_indices[name]
             start_col = sl.start - tm_offset
             stop_col  = sl.stop  - tm_offset
@@ -862,6 +1260,14 @@ class CorrelatedPulsarRedNoise:
 
         self.GWB_slice     = _fourier_slice('cor')
         self.GWB_fidxs     = jnp.arange(self.GWB_slice.start, self.GWB_slice.stop)
+        # `_eye` is built with crn_bins rows and is cho_solve'd against
+        # phi[GWB_fidxs]; if the two disagree the failure is a batch-shape error
+        # deep inside get_phi_mat_inv, so check it here.
+        n_gwb_slice = self.GWB_slice.stop - self.GWB_slice.start
+        if n_gwb_slice != crn_bins:
+            raise ValueError(
+                f"crn_bins={crn_bins} but signal_indices['cor'] spans "
+                f"{n_gwb_slice} frequency bins.")
         self.crn_bins      = crn_bins
 
         # ------------------------------------------------------------------ #
@@ -879,7 +1285,6 @@ class CorrelatedPulsarRedNoise:
         self.renorm_const = renorm_const
         self.logrenorm_offset = 0.5 * jnp.log10(renorm_const)
 
-        self.crn_bins = crn_bins
         self.f_common = f_common[..., None]
         self.df_gwb = jnp.diff(jnp.concatenate((jnp.zeros((1)), 
                                                 f_common), 
@@ -891,13 +1296,15 @@ class CorrelatedPulsarRedNoise:
         has_irn = irn_psd_func is not None
         self.has_irn = has_irn
         if has_irn:
-            assert irn_bins is not None and f_irn is not None, (
-                "irn_bins and f_irn must be supplied when irn_psd_func is given."
-            )
-            assert irn_helper_dictionary is not None, (
-                "irn_helper_dictionary must be supplied when irn_psd_func is given."
-            )
-            self.irn_bins = irn_bins if has_irn else crn_bins
+            if not (irn_bins is not None and f_irn is not None):
+                raise ValueError((
+                    "irn_bins and f_irn must be supplied when irn_psd_func is given."
+                ))
+            if not (irn_helper_dictionary is not None):
+                raise ValueError((
+                    "irn_helper_dictionary must be supplied when irn_psd_func is given."
+                ))
+            self.irn_bins = irn_bins   # (the old `if has_irn else crn_bins` was dead: guarded by `if has_irn`)
             self.f_irn = f_irn if f_irn.ndim == 2 else jnp.broadcast_to(f_irn, (self.Npulsars, self.irn_bins)) 
             self.df_irn = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_irn), axis = 1))
 
@@ -907,12 +1314,14 @@ class CorrelatedPulsarRedNoise:
         has_dm = dm_psd_func is not None
         self.has_dm = has_dm
         if has_dm:
-            assert dm_bins is not None and f_dm is not None, (
-                "dm_bins and f_dm must be supplied when dm_psd_func is given."
-            )
-            assert dm_helper_dictionary is not None, (
-                "dm_helper_dictionary must be supplied when dm_psd_func is given."
-            )
+            if not (dm_bins is not None and f_dm is not None):
+                raise ValueError((
+                    "dm_bins and f_dm must be supplied when dm_psd_func is given."
+                ))
+            if not (dm_helper_dictionary is not None):
+                raise ValueError((
+                    "dm_helper_dictionary must be supplied when dm_psd_func is given."
+                ))
             self.dm_bins = dm_bins
             self.f_dm = f_dm if f_dm.ndim == 2 else jnp.broadcast_to(f_dm, (self.Npulsars, self.dm_bins))
             self.df_dm = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_dm), axis = 1))
@@ -927,37 +1336,29 @@ class CorrelatedPulsarRedNoise:
         self.has_gtm = has_gtm
         self.has_gtm_direct = gtm_psd is not None
         self.gtm_psd_input = gtm_psd
-        if self.has_gtm_direct:
-            assert self.gtm_psd_input.shape[1] == Npulsars, (
-                f"gtm_psd second dimension ({self.gtm_psd_input.shape[1]}) "
-                f"must match Npulsars ({Npulsars})."
-            )
-            assert self.gtm_psd_input.shape[0] % 2 == 0, (
-                "gtm_psd first dimension must be even (2*gtm_nfreqs); "
-                f"got {self.gtm_psd_input.shape[0]}."
-            )
-            self.gtm_bins = self.gtm_psd_input.shape[0] // 2
-        elif has_gtm:
-            assert gtm_bins is not None and f_gtm is not None, (
-                "gtm_bins and f_gtm must be supplied when gtm_psd_func is given."
-            )
-            assert gtm_helper_dictionary is not None, (
-                "gtm_helper_dictionary must be supplied when gtm_psd_func is given."
-            )
-            self.gtm_bins = gtm_bins
-            self.f_gtm = f_gtm if f_gtm.ndim == 2 else jnp.broadcast_to(f_gtm, (self.Npulsars, self.gtm_bins))
-            self.df_gtm = jnp.diff(jnp.concatenate((jnp.zeros((self.Npulsars, 1)), self.f_gtm), axis = 1))
+        # A directly-supplied gtm_psd is mode-resolution by definition.  False
+        # when there is no GTM block at all, so every `if self.gtm_mode_resolved`
+        # below is also a "there is a GTM block" test.
+        self.gtm_mode_resolved = bool(
+            has_gtm and (gtm_mode_resolved or self.has_gtm_direct))
+        # Actual sizing happens in the frequency-index section below, once
+        # GTM_slice is known (_init_gtm_geometry).
 
         # ------------------------------------------------------------------ #
         #  Frequency index arrays                                              #
         # ------------------------------------------------------------------ #
         if has_irn:
             self.IRN_slice = _fourier_slice('unc')
+            _gwb_set = {int(i) for i in np.asarray(self.GWB_fidxs)}
             self.nonGWB_fidxs = jnp.array(
                 [i for i in range(int(self.IRN_slice.start), int(self.IRN_slice.stop))
-                if i not in self.GWB_fidxs]
+                 if i not in _gwb_set],
+                dtype=int,   # stays integer when empty; jnp.array([]) is float
             )
-            self.separate_inversion_strat = bool(self.nonGWB_fidxs.any())
+            # `.any()` asks whether any INDEX IS NON-ZERO, so a single IRN-only
+            # bin at index 0 disabled the separate inversion entirely: that bin's
+            # phiinv row stayed zero and its logdet term went missing.
+            self.separate_inversion_strat = bool(self.nonGWB_fidxs.size > 0)
 
         if has_dm:
             self.DM_slice  = _fourier_slice('dm')
@@ -966,14 +1367,8 @@ class CorrelatedPulsarRedNoise:
         if has_gtm:
             self.GTM_slice = _fourier_slice('gtm')
             self.GTM_fidxs = jnp.arange(self.GTM_slice.start, self.GTM_slice.stop)
-
-            if self.has_gtm_direct:
-                assert (self.GTM_slice.stop - self.GTM_slice.start) == self.gtm_bins, (
-                    f"gtm_psd implies {self.gtm_bins} frequency bins but "
-                    f"signal_indices['gtm'] spans "
-                    f"{self.GTM_slice.stop - self.GTM_slice.start} bins."
-                )
-                self.GTM_slice_modes = slice(2 * self.GTM_slice.start, 2 * self.GTM_slice.stop)
+            self._init_gtm_geometry(gtm_bins, f_gtm,
+                                    gtm_psd_func, gtm_helper_dictionary)
 
         # n_total_bins is now just the stop of the last signal slice
         all_stops = [self.GWB_slice.stop]
@@ -1004,7 +1399,7 @@ class CorrelatedPulsarRedNoise:
         self.J = jnp.repeat(b[None, :], crn_bins, axis=0)
         self.KGW = jnp.repeat(self.GWB_fidxs[:, None], len(a), axis=1)
 
-        if has_irn and self.nonGWB_fidxs.any():
+        if has_irn and self.separate_inversion_strat:
             self.DIR = jnp.repeat(self.diag_idx[None, :],
                                   len(self.nonGWB_fidxs), axis=0)
             self.KIR = jnp.repeat(self.nonGWB_fidxs[:, None], Npulsars, axis=1)
@@ -1014,11 +1409,14 @@ class CorrelatedPulsarRedNoise:
             self.KDM = jnp.repeat(self.DM_fidxs[:, None], Npulsars, axis=1)
 
         if has_gtm:
-            self.DIRGTM = jnp.repeat(self.diag_idx[None, :], gtm_bins if gtm_bins is not None else self.gtm_bins, axis=0)
+            # self.gtm_bins, not the raw `gtm_bins` argument: on the direct
+            # gtm_psd path the argument may be None or stale, and DIRGTM must
+            # match KGTM (which is built from the GTM slice).
+            self.DIRGTM = jnp.repeat(self.diag_idx[None, :], self.gtm_bins, axis=0)
             self.KGTM = jnp.repeat(self.GTM_fidxs[:, None], Npulsars, axis=1)
 
-        # ---- mode-resolution companions, only needed for direct gtm_psd ---- #
-        if self.has_gtm_direct:
+        # ---- mode-resolution companions, needed whenever phi is mode-resolved #
+        if self.has_gtm and self.gtm_mode_resolved:
             self.GWB_fidxs_modes = _bin_idx_to_mode_idx(self.GWB_fidxs)
             self._eye_modes = jnp.repeat(self._eye, 2, axis=0)
 
@@ -1085,8 +1483,10 @@ class CorrelatedPulsarRedNoise:
         #  Parse GTM PSD                                                        #
         # ------------------------------------------------------------------ #
         if has_gtm and not self.has_gtm_direct:
+            # n_gtm_eval, not gtm_bins: a mode-resolved free spectrum carries
+            # one parameter per basis column.
             self.gtm_param_container, self.gtm_varied_indxs = _parse_psd_func(
-                gtm_psd_func, gtm_helper_dictionary, gtm_bins
+                gtm_psd_func, gtm_helper_dictionary, self.n_gtm_eval
             )
             self.n_gtm_varied = int(len(self.gtm_varied_indxs))
             self.num_GTM_params = self.n_gtm_varied * Npulsars
@@ -1115,46 +1515,65 @@ class CorrelatedPulsarRedNoise:
         upper, lower = jnp.array([]), jnp.array([])
 
         if has_irn:
+            irn_shift = _renorm_shift(
+                _psd_signature_names(irn_psd_func, self.irn_bins)[
+                    np.asarray(self.irn_varied_indxs)],
+                self.logrenorm_offset)
             irn_upper = jnp.tile(
-                irn_helper_dictionary["psd_param_upper_lim"] + self.logrenorm_offset,
+                jnp.asarray(irn_helper_dictionary["psd_param_upper_lim"]) + irn_shift,
                 Npulsars
             )
             irn_lower = jnp.tile(
-                irn_helper_dictionary["psd_param_lower_lim"] + self.logrenorm_offset,
+                jnp.asarray(irn_helper_dictionary["psd_param_lower_lim"]) + irn_shift,
                 Npulsars
             )
             upper = jnp.concatenate([upper, irn_upper])
             lower = jnp.concatenate([lower, irn_lower])
 
         if has_dm:
+            dm_shift = _renorm_shift(
+                _psd_signature_names(dm_psd_func, self.dm_bins)[
+                    np.asarray(self.dm_varied_indxs)],
+                self.logrenorm_offset)
             dm_upper = jnp.tile(
-                dm_helper_dictionary["psd_param_upper_lim"] + self.logrenorm_offset,
+                jnp.asarray(dm_helper_dictionary["psd_param_upper_lim"]) + dm_shift,
                 Npulsars
             )
             dm_lower = jnp.tile(
-                dm_helper_dictionary["psd_param_lower_lim"] + self.logrenorm_offset,
+                jnp.asarray(dm_helper_dictionary["psd_param_lower_lim"]) + dm_shift,
                 Npulsars
             )
             upper = jnp.concatenate([upper, dm_upper])
             lower = jnp.concatenate([lower, dm_lower])
 
         if has_gtm and not self.has_gtm_direct:
+            gtm_shift = _renorm_shift(
+                _psd_signature_names(gtm_psd_func, self.n_gtm_eval)[
+                    np.asarray(self.gtm_varied_indxs)],
+                self.logrenorm_offset)
             gtm_upper = jnp.tile(
-                gtm_helper_dictionary["psd_param_upper_lim"] + self.logrenorm_offset,
+                jnp.asarray(gtm_helper_dictionary["psd_param_upper_lim"]) + gtm_shift,
                 Npulsars
             )
             gtm_lower = jnp.tile(
-                gtm_helper_dictionary["psd_param_lower_lim"] + self.logrenorm_offset,
+                jnp.asarray(gtm_helper_dictionary["psd_param_lower_lim"]) + gtm_shift,
                 Npulsars
             )
             upper = jnp.concatenate([upper, gtm_upper])
             lower = jnp.concatenate([lower, gtm_lower])
 
+        # The GWB bounds previously got NO renorm shift at all while the IRN/DM
+        # bounds got it on every parameter -- two different wrong conventions in
+        # one constructor.  Both now use the amplitude-only shift.
+        gwb_shift = _renorm_shift(
+            _psd_signature_names(gwb_psd_func, crn_bins)[
+                np.asarray(self.gwb_varied_indxs)],
+            self.logrenorm_offset)
         upper = jnp.concatenate(
-            [upper, jnp.array(gwb_helper_dictionary["gwb_psd_param_upper_lim"])]
+            [upper, jnp.asarray(gwb_helper_dictionary["gwb_psd_param_upper_lim"]) + gwb_shift]
         )
         lower = jnp.concatenate(
-            [lower, jnp.array(gwb_helper_dictionary["gwb_psd_param_lower_lim"])]
+            [lower, jnp.asarray(gwb_helper_dictionary["gwb_psd_param_lower_lim"]) + gwb_shift]
         )
 
         if not self.orf_fixed:
@@ -1164,6 +1583,21 @@ class CorrelatedPulsarRedNoise:
             lower = jnp.concatenate(
                 [lower, jnp.array(gwb_helper_dictionary["orf_param_lower_lim"])]
             )
+            self.n_orf_varied = int(
+                len(gwb_helper_dictionary["orf_param_upper_lim"]))
+        else:
+            self.n_orf_varied = 0
+
+        # See PerPulsarRedNoise for why this is checked: block sizes come from
+        # the PSD signatures, bounds come from the helper dictionaries, and
+        # nothing else ties the two together.
+        n_expected = self.gwb_psd_end_idx + self.n_orf_varied
+        if upper.shape[0] != n_expected:
+            raise ValueError(
+                f"Prior bounds have {upper.shape[0]} entries but the parameter "
+                f"layout needs {n_expected} (IRN {self.num_IR_params} + DM "
+                f"{self.num_DM_params} + GTM {self.num_GTM_params} + GWB "
+                f"{int(len(self.gwb_varied_indxs))} + ORF {self.n_orf_varied}).")
 
         self.upper_prior_lim_all = upper
         self.lower_prior_lim_all = lower
@@ -1180,7 +1614,15 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def _eval_gwb_psd(self, gwb_psd_params):
-        """Evaluate the GWB PSD on ``self.f_common``."""
+        """Evaluate the common-process PSD on ``self.f_common``.
+
+        Returns
+        -------
+        jnp.ndarray, shape (crn_bins, 1)
+            The trailing axis is kept so the result broadcasts against
+            ``(crn_bins, Npulsars)`` phi blocks and ``(crn_bins, n_pairs)``
+            ORF products.
+        """
         filled = self.gwb_param_container.at[self.gwb_varied_indxs].set(
             gwb_psd_params
         )
@@ -1188,6 +1630,7 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def _eval_irn_psd_all(self, irn_params_flat):
+        """Evaluate the IRN PSD for all pulsars. -> (irn_bins, Npulsars)"""
         per_psr = irn_params_flat.reshape(self.Npulsars, self.n_irn_varied)
 
         def _single(params, freqs_, df_):
@@ -1198,6 +1641,7 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def _eval_dm_psd_all(self, dm_params_flat):
+        """Evaluate the DM PSD for all pulsars. -> (dm_bins, Npulsars)"""
         per_psr = dm_params_flat.reshape(self.Npulsars, self.n_dm_varied)
 
         def _single(params, freqs_, df_):
@@ -1212,9 +1656,17 @@ class CorrelatedPulsarRedNoise:
         Evaluate the GTM PSD for *all* pulsars (function-based model only;
         not used when `gtm_psd` was supplied directly).
 
+        Parameters
+        ----------
+        gtm_params_flat : jnp.ndarray, shape (num_GTM_params,)
+            Flat array; reshaped to (Npulsars, n_gtm_varied) before vmapping.
+
         Returns
         -------
-        jnp.ndarray, shape (gtm_bins, Npulsars)
+        jnp.ndarray, shape (n_gtm_eval, Npulsars)
+            One row per basis column when the block is mode-resolved, else one
+            row per frequency bin.  Prefer ``_gtm_mode_values``, which always
+            returns column resolution.
         """
         per_psr = gtm_params_flat.reshape(self.Npulsars, self.n_gtm_varied)
 
@@ -1230,7 +1682,11 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def _unpack(self, xs):
-        """Return (irn_flat, dm_flat, gtm_flat, gwb_psd_params, orf_params) from ``xs``."""
+        """Split ``xs`` into (irn, dm, gtm, gwb_psd, orf) blocks.
+
+        Blocks belonging to absent components -- and ``orf`` when the ORF is
+        fixed -- come back empty.
+        """
         irn = xs[:self.irn_end_idx]
         dm  = xs[self.irn_end_idx:self.dm_end_idx]
         gtm = xs[self.dm_end_idx:self.gtm_end_idx]
@@ -1244,11 +1700,17 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def _get_phi_diag_bins(self, xs):
-        """
-        Bin-resolution phi diagonal (internal). GTM contributes here only
-        when it is *not* supplied directly (i.e. it comes from
-        ``gtm_psd_func``); the direct case is added at mode resolution by
-        the public ``get_phi_diag``.
+        """Bin-resolution phi diagonal, always ``(n_total_bins, Npulsars)``.
+
+        Internal: the GTM block contributes here only when it is bin-resolved.
+        A mode-resolved GTM block (the default, and always the case for a
+        direct ``gtm_psd``) is written in afterwards at column resolution by
+        the public builders.
+
+        Returns
+        -------
+        phi_diag : jnp.ndarray, (n_total_bins, Npulsars)
+        psd_common : jnp.ndarray, (crn_bins, 1)
         """
         irn_flat, dm_flat, gtm_flat, gwb_params, _ = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
@@ -1263,7 +1725,7 @@ class CorrelatedPulsarRedNoise:
             dm_psd = self._eval_dm_psd_all(dm_flat)             # (dm_bins, Npulsars)
             phi_diag = phi_diag.at[self.DM_slice].add(dm_psd)
 
-        if self.has_gtm and not self.has_gtm_direct:
+        if self.has_gtm and not self.gtm_mode_resolved:
             if not self._do_not_vary_gtm:
                 gtm_psd = self._eval_gtm_psd_all(gtm_flat)          # (gtm_bins, Npulsars)
             else:
@@ -1277,30 +1739,49 @@ class CorrelatedPulsarRedNoise:
     @jit_method
     def get_phi_diag(self, xs):
         """
-        Build the phi diagonal.
+        Build the phi diagonal, ignoring cross-pulsar correlations.
+
+        Parameters
+        ----------
+        xs : jnp.ndarray
+            Flat parameter vector; see the class docstring for its layout.
 
         Returns
         -------
         phi_diag : jnp.ndarray
-            Shape ``(n_total_bins, Npulsars)`` normally, or
-            ``(nmodes, Npulsars)`` with ``nmodes = 2 * n_total_bins`` when a
-            direct ``gtm_psd`` was supplied at construction — every non-GTM
-            bin's value is duplicated across its two quadrature modes, while
-            the GTM block is filled directly from ``gtm_psd``.
-        psd_common : jnp.ndarray
-            The common (GWB) PSD, shape ``(crn_bins,)`` — unaffected by
-            ``gtm_psd``.
+            ``(n_total_bins, Npulsars)`` when the GTM block is bin-resolved or
+            absent; ``(2 * n_total_bins, Npulsars)`` when it is mode-resolved
+            (non-GTM bins duplicated across their quadrature modes, one
+            independent value per GTM column).
+        psd_common : jnp.ndarray, (crn_bins, 1)
+            The common-process PSD, at bin resolution either way.
         """
         phi_diag, psd_common = self._get_phi_diag_bins(xs)
 
-        if self.has_gtm_direct:
+        if self.gtm_mode_resolved and self.has_gtm:
+            *_, gtm_flat, _, _ = self._unpack(xs)
             phi_diag = jnp.repeat(phi_diag, 2, axis=0)
-            phi_diag = phi_diag.at[self.GTM_slice_modes].set(self.gtm_psd_input)
+            phi_diag = phi_diag.at[self.GTM_slice_modes].set(
+                self._gtm_mode_values(gtm_flat))
 
         return phi_diag, psd_common
 
     @jit_method
     def get_phi_mat(self, xs):
+        """Full phi with the GWB cross terms in the LOWER triangle only.
+
+        Parameters
+        ----------
+        xs : jnp.ndarray            flat parameter vector
+
+        Returns
+        -------
+        phi : jnp.ndarray
+            ``(n_rows, Npulsars, Npulsars)`` -- ``n_rows`` is ``n_total_bins``,
+            or ``2 * n_total_bins`` when the GTM block is mode-resolved.  Only
+            the diagonal and the lower-triangular GWB entries are filled; use
+            ``get_phi_mat_full`` if you need an explicitly symmetric matrix.
+        """
         phi_diag, psd_common = self._get_phi_diag_bins(xs)
         n_total = phi_diag.shape[0]
 
@@ -1311,16 +1792,21 @@ class CorrelatedPulsarRedNoise:
         orf_val = self.orf_val if self.orf_fixed else self.orf_func(self.xi, *orf_params)
         phi = phi.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
 
-        if self.has_gtm_direct:
+        if self.gtm_mode_resolved and self.has_gtm:
+            *_, gtm_flat, _, _ = self._unpack(xs)
             phi = jnp.repeat(phi, 2, axis=0)
             phi = phi.at[self.KGTM_modes, self.DIRGTM_modes, self.DIRGTM_modes].set(
-                self.gtm_psd_input
+                self._gtm_mode_values(gtm_flat)
             )
 
         return phi
 
     @jit_method
     def get_phi_mat_full(self, xs):
+        """As ``get_phi_mat``, but with both triangles filled (symmetric).
+
+        This is the form the reparameterised likelihoods consume.
+        """
         phi_diag, psd_common = self._get_phi_diag_bins(xs)
         n_total = phi_diag.shape[0]
 
@@ -1332,24 +1818,43 @@ class CorrelatedPulsarRedNoise:
         phi = phi.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
         phi = phi.at[self.KGW, self.J, self.I].set(orf_val * psd_common)
 
-        if self.has_gtm_direct:
+        if self.gtm_mode_resolved and self.has_gtm:
+            *_, gtm_flat, _, _ = self._unpack(xs)
             phi = jnp.repeat(phi, 2, axis=0)
             phi = phi.at[self.KGTM_modes, self.DIRGTM_modes, self.DIRGTM_modes].set(
-                self.gtm_psd_input
+                self._gtm_mode_values(gtm_flat)
             )
 
         return phi
 
     @jit_method
     def get_phi_mat_CURN(self, xs):
+        """CURN view: ``(phi_diag, psd_common)`` with the ORF ignored.
+
+        Common Uncorrelated Red Noise -- the common process keeps its shared
+        PSD but contributes no cross-pulsar terms.  Identical to
+        ``get_phi_diag``; named separately for call-site clarity.
+        """
         return self.get_phi_diag(xs)
 
     @jit_method
     def get_phi_mat_from_diag(self, phi_diag, psd_common, orf_params=None):
-        """
-        Note: expects ``phi_diag`` at bin resolution (as produced by
-        ``_get_phi_diag_bins`` / the pre-``gtm_psd`` convention). If you are
-        working with a direct ``gtm_psd`` model, prefer ``get_phi_mat``.
+        """Rebuild phi from an already-computed diagonal plus the ORF terms.
+
+        Parameters
+        ----------
+        phi_diag : jnp.ndarray, (n_total_bins, Npulsars)
+            BIN resolution only, as produced by ``_get_phi_diag_bins``.  A
+            mode-resolved model must use ``get_phi_mat`` instead -- this method
+            has no GTM handling at all.
+        psd_common : jnp.ndarray, (crn_bins, 1)
+        orf_params : array, optional
+            Required when the ORF has free parameters.
+
+        Returns
+        -------
+        phi : jnp.ndarray, (n_total_bins, Npulsars, Npulsars)
+            Lower triangle only, as in ``get_phi_mat``.
         """
         n_total = phi_diag.shape[0]
         phi = jnp.zeros((n_total, self.Npulsars, self.Npulsars))
@@ -1358,9 +1863,10 @@ class CorrelatedPulsarRedNoise:
         if self.orf_fixed:
             orf_val = self.orf_val
         else:
-            assert orf_params is not None, (
-                "orf_params must be provided when the ORF has free parameters."
-            )
+            if not (orf_params is not None):
+                raise ValueError((
+                    "orf_params must be provided when the ORF has free parameters."
+                ))
             orf_val = self.orf_func(self.xi, *orf_params)
 
         return phi.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
@@ -1372,25 +1878,31 @@ class CorrelatedPulsarRedNoise:
     @jit_method
     def get_phi_mat_inv(self, phi):
         """
-        Invert the phi-matrix using mixed Cholesky + diagonal strategies.
+        Invert phi with a mixed Cholesky + diagonal strategy.
+
+        Only the GWB rows are dense (the ORF couples pulsars there), so those
+        are Cholesky-inverted as a batch while the IRN-only, DM and GTM rows --
+        which are diagonal in the pulsar index -- are inverted elementwise.
 
         Parameters
         ----------
         phi : jnp.ndarray
-            ``(n_total_bins, Npulsars, Npulsars)`` normally, or
-            ``(nmodes, Npulsars, Npulsars)`` when a direct ``gtm_psd`` was
-            supplied at construction (i.e. the output of ``get_phi_mat`` /
-            ``get_phi_mat_full`` in that mode).
+            Output of ``get_phi_mat`` / ``get_phi_mat_full``:
+            ``(n_total_bins, Npulsars, Npulsars)`` when bin-resolved,
+            ``(2*n_total_bins, Npulsars, Npulsars)`` when the GTM block is
+            mode-resolved.
 
         Returns
         -------
-        phiinv : jnp.ndarray
-            ``(2*n_total_bins, Npulsars, Npulsars)`` normally, or
-            ``(nmodes, Npulsars, Npulsars)`` in the direct-``gtm_psd`` case
-            (already at mode resolution — no further repetition applied).
+        phiinv : jnp.ndarray, (2*n_total_bins, Npulsars, Npulsars)
+            Bin-resolved input is repeated across the two quadrature modes;
+            mode-resolved input already has one row per basis column and is
+            returned as-is.
         logdet_phi : float
+            log|phi| summed over all modes (hence the doubling in the
+            bin-resolved branch).
         """
-        if self.has_gtm_direct:
+        if self.has_gtm and self.gtm_mode_resolved:
             phiinv = jnp.zeros_like(phi)
 
             # --- GWB modes: Cholesky, done directly at mode resolution ---
@@ -1428,7 +1940,6 @@ class CorrelatedPulsarRedNoise:
             # rows already accounts for both quadrature components.
             return phiinv, logdet_phi
 
-        n_total = phi.shape[0]
         phiinv = jnp.zeros_like(phi)
 
         # --- GWB bins: Cholesky ---
@@ -1460,6 +1971,37 @@ class CorrelatedPulsarRedNoise:
 
     @jit_method
     def partial_reparm_helper(self, xs, pad_mask):
+        """Split phi into a dense GWB block and a diagonal everything-else block.
+
+        Feeds ``SuperSignal.partial_marg_lnposterior``, which keeps the GWB
+        coefficients and marginalizes the rest analytically, so the two halves
+        are returned separately and both at MODE resolution.
+
+        Parameters
+        ----------
+        xs : jnp.ndarray
+            Flat parameter vector; see the class docstring.
+        pad_mask : jnp.ndarray, (Npulsars, linear_timing_model_size)
+            1 where a linear-timing column is padding, 0 where it is real.  The
+            padded slots get unit prior precision (so HMC sees curvature) and
+            the real ones ~0 (an effectively flat timing prior).
+
+        Returns
+        -------
+        phiinv_gwb : jnp.ndarray, (2*crn_bins, Npulsars, Npulsars)
+            Inverse of the dense GWB block, repeated across quadrature modes.
+        logdet_phi_gwb : float
+        phiinv_non_gwb : jnp.ndarray, (Npulsars, ltm_size + n_non_gwb_modes)
+            Diagonal precision of [timing | IRN | DM | GTM], transposed.
+        logdet_phi_non_gwb : float
+            Excludes the (constant) timing-model block.
+
+        Notes
+        -----
+        The non-GWB block is laid out IRN | DM | GTM and assumes those basis
+        columns are contiguous and in that order; ``_check_non_gwb_block_order``
+        enforces it at trace time.
+        """
         irn_flat, dm_flat, gtm_flat, gwb_params, orf_params = self._unpack(xs)
         psd_common = self._eval_gwb_psd(gwb_params)
         orf_val = self.orf_val if self.orf_fixed else self.orf_func(self.xi, *orf_params)
@@ -1476,6 +2018,13 @@ class CorrelatedPulsarRedNoise:
 
         phi_diag_non_gwb = jnp.zeros((n_non_gwb_modes, self.Npulsars))
 
+        # These local slices lay the non-GWB block out as IRN | DM | GTM.  That
+        # is only the right ordering if the T-matrix columns are in that order
+        # and contiguous -- the consumer slices TNT by column index, so a model
+        # string that puts, say, 'dm' before 'unc' would pair this phi with the
+        # wrong TNT rows.  Checked once, at trace time, where it is cheap.
+        self._check_non_gwb_block_order()
+
         irn_local = slice(0, n_irn_modes) if self.has_irn else None
         dm_local  = slice(irn_local.stop if irn_local else 0,
                         (irn_local.stop if irn_local else 0) + n_dm_modes) if self.has_dm else None
@@ -1491,13 +2040,10 @@ class CorrelatedPulsarRedNoise:
                 jnp.repeat(self._eval_dm_psd_all(dm_flat), 2, axis=0)
             )
         if self.has_gtm:
-            if self.has_gtm_direct:
-                gtm_modes_vals = self.gtm_psd_input
-            elif not self._do_not_vary_gtm:
-                gtm_modes_vals = jnp.repeat(self._eval_gtm_psd_all(gtm_flat), 2, axis=0)
-            else:
-                gtm_modes_vals = jnp.ones((n_gtm_modes, self.Npulsars))
-            phi_diag_non_gwb = phi_diag_non_gwb.at[gtm_local].set(gtm_modes_vals)
+            # One value per basis column when mode-resolved; the mixin handles
+            # the bin-resolved fallback (and the fixed gtm_psd case).
+            phi_diag_non_gwb = phi_diag_non_gwb.at[gtm_local].set(
+                self._gtm_mode_values(gtm_flat))
 
         phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         phi_gwb = phi_gwb.at[:, self.diag_idx, self.diag_idx].set(psd_common)
@@ -1525,24 +2071,54 @@ class CorrelatedPulsarRedNoise:
         
         return result
 
+    def _check_non_gwb_block_order(self):
+        """Verify the non-GWB basis blocks are contiguous and ordered IRN, DM, GTM.
+
+        Raises
+        ------
+        ValueError
+            If they are not: ``partial_reparm_helper`` builds its phi block in
+            that order, while the consumer slices TNT by column index, so any
+            other ordering silently pairs phi with the wrong rows.
+        """
+        present = [(name, sl) for name, sl in
+                   (('unc', getattr(self, 'IRN_slice', None)),
+                    ('dm',  getattr(self, 'DM_slice',  None)),
+                    ('gtm', getattr(self, 'GTM_slice', None)))
+                   if sl is not None]
+        for (n0, s0), (n1, s1) in zip(present, present[1:]):
+            if s0.stop != s1.start:
+                raise ValueError(
+                    "partial_reparm_helper lays the non-GWB phi block out as "
+                    "IRN | DM | GTM, so those basis columns must be contiguous "
+                    f"and in that order; got {n0}={s0} then {n1}={s1}.  Reorder "
+                    "the signal-combination string.")
+
     # ---------------------------------------------------------------------- #
     #  Prior                                                                  #
     # ---------------------------------------------------------------------- #
 
     @jit_method
     def get_lnprior(self, xs):
-        """Uniform log-prior: returns a small constant if in bounds, -inf otherwise."""
+        """UNNORMALISED uniform log-prior over ``xs``.
+
+        Returns an arbitrary constant (see ``_spit_neg_number``) when every
+        parameter is strictly inside its bounds and -inf otherwise; the
+        constant is not -log(prior volume), so this is usable for MCMC
+        acceptance ratios but not for evidence.
+        """
         in_bounds = jnp.logical_and(
             xs > self.lower_prior_lim_all, xs < self.upper_prior_lim_all
         ).all()
         return jax.lax.cond(in_bounds, self._spit_neg_number, self._spit_neg_infinity)
 
     def get_lnprior_numpy(self, xs):
+        """``get_lnprior`` as a host-side numpy scalar."""
         return self.get_lnprior(xs).__array__()
 
     @jit_method
     def make_initial_guess(self, key):
-        """Draw a uniform initial sample within the prior bounds."""
+        """Draw one uniform sample from inside the prior bounds. [n_params]"""
         return jr.uniform(
             key,
             shape=(self.upper_prior_lim_all.shape[0],),
@@ -1565,12 +2141,25 @@ class CorrelatedPulsarRedNoise:
                 gwb_psd_params,
                 orf_params (only if the ORF has free parameters)]
 
-        Note: if a direct ``gtm_psd`` was supplied at construction, the GTM
-        block contributes no names (it has no sampled parameters).
+        Names are ``f"{pulsar}_{component}_{param}"`` for the per-pulsar
+        blocks, ``f"gwb_{param}"`` and ``f"orf_{param}"`` for the shared ones.
+        A directly-supplied ``gtm_psd`` contributes no names (it has no sampled
+        parameters), and a mode-resolved GTM free spectrum contributes one name
+        per basis column.
+
+        Returns
+        -------
+        list of str, the same length as ``lower/upper_prior_lim_all``.
+
+        Raises
+        ------
+        ValueError
+            If ``pulsar_names`` was not supplied at construction.
         """
-        assert self.pulsar_names is not None, (
-            "pulsar_names must be supplied at construction to get param names."
-        )
+        if not (self.pulsar_names is not None):
+            raise ValueError((
+                "pulsar_names must be supplied at construction to get param names."
+            ))
 
         names = []
 
@@ -1589,7 +2178,7 @@ class CorrelatedPulsarRedNoise:
                 names += [f"{psr}_dm_{p}" for p in dm_names]
 
         if self.has_gtm and not self.has_gtm_direct:
-            gtm_names = _psd_signature_names(self.gtm_psd_func, self.gtm_bins)[
+            gtm_names = _psd_signature_names(self.gtm_psd_func, self.n_gtm_eval)[
                 np.asarray(self.gtm_varied_indxs)
             ]
             for psr in self.pulsar_names:
@@ -1607,6 +2196,7 @@ class CorrelatedPulsarRedNoise:
         return names
 
     def get_param_names_and_priors(self):
+        """``{param_name: (lower_bound, upper_bound)}`` in ``xs`` order."""
         return dict(
                 zip(
                 self.get_param_names(), 
@@ -1615,10 +2205,18 @@ class CorrelatedPulsarRedNoise:
                     )))
 
     def jax_to_numpy_CPU(self, jax_CPU_array):
+        """Zero-copy view of a CPU-resident JAX array as a numpy array."""
         return np.from_dlpack(jax_CPU_array)
 
     def _spit_neg_infinity(self):
+        """-inf branch of ``get_lnprior`` (lax.cond needs a callable)."""
         return -jnp.inf
 
     def _spit_neg_number(self):
+        """In-bounds branch of ``get_lnprior`` (lax.cond needs a callable).
+
+        An arbitrary constant, NOT -log(prior volume): the prior is
+        unnormalised, so this cancels in MCMC ratios but makes any evidence
+        or cross-model comparison built on ``get_lnprior`` meaningless.
+        """
         return -8.01

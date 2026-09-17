@@ -101,8 +101,8 @@ class PTA_Data:
         self.Mmat = [_timing_model_svd(psr.Mmat) for psr in psrs]
 
         # pulsar distances
-        # self.psr_dists_mean = jnp.array([psr.pdist[0] for psr in psrs])
-        # self.psr_dists_std = jnp.array([psr.pdist[1] for psr in psrs])
+        self.psr_dists_mean = jnp.array([psr.pdist[0] for psr in psrs])
+        self.psr_dists_std = jnp.array([psr.pdist[1] for psr in psrs])
         
         ######################PTA Data Analysis General Settings######################
         # Whether the white noise matrices are fixed (bool)
