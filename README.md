@@ -11,7 +11,7 @@ Standard PTA analyses proceed in stages: fix the timing solution, fit the white
 noise per pulsar, linearise the timing model and marginalise it analytically,
 then sample the red-noise and gravitational-wave-background parameters. The
 staging is a computational convenience, and it means timing and white-noise
-uncertainties never propagate into the background posterior. ATLAS samples
+uncertainties never propagate into the background posterior. Atlas samples
 everything jointly — non-linear timing parameters, EFAC/EQUAD/ECORR, per-pulsar
 intrinsic red noise, DM noise, deterministic sources and the correlated
 background — in a single NumPyro model, using NUTS or HMC-within-Gibbs.
@@ -331,7 +331,7 @@ currently at the `10⁻¹⁶`–`10⁻¹⁵` level for the likelihoods and `3×1
 gradients against central differences.
 
 Fixtures are duck-typed rather than `enterprise` objects: `tests/fixtures/`
-defines the eight attributes ATLAS reads from a pulsar and stores real MDC1 and
+defines the eight attributes Atlas reads from a pulsar and stores real MDC1 and
 NANOGrav data as small `.npz` files with provenance. Regenerating them
 (`tools/make_fixtures.py`) requires PINT or tempo2; using them does not.
 
