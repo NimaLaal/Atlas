@@ -4,7 +4,7 @@ Bayesian inference for pulsar timing arrays in JAX, with gradient-based sampling
 over the full parameter space.
 
 
-This package is a cutting edge project for Bayesian PTA analysis and is a work-in-progress. Most functions are verified but their behaviors in combination may give unexpected results. Use with caution and expect major functional or design changes while it is still a prototype.
+This package is a cutting edge project for Bayesian PTA analysis and is a work-in-progress. Most functions are verified but their behaviors in combination may give unexpected results. Use with caution and expect major functional or design changes while it is still early.
 
 
 Standard PTA analyses proceed in stages: fix the timing solution, fit the white
