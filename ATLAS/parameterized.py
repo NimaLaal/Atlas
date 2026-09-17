@@ -33,19 +33,21 @@ def _renorm_shift(param_names, logrenorm_offset):
 
 
 def _signature_param_names(func):
-    """Ordered names of `func`'s real (non-variadic) parameters.
+    """Ordered parameter names of `func`, excluding only ``**kwargs``.
 
-    Uses ``Parameter.name`` rather than ``str(Parameter)``.  ``str(p)`` renders
-    a defaulted argument as ``"gamma=4.33"``, which silently broke two things:
-    the ordering assertions below compared ``"gamma"`` against ``"gamma=4.33"``,
-    and ``get_param_names()`` emitted the default as part of the name.  The old
-    ``"args" not in str(p)`` filter also dropped any parameter whose name merely
-    contained the substring (``nargs``, ``target_args``); the kind check is exact.
+    ``VAR_POSITIONAL`` is KEPT.  A free-spectral PSD is written as
+    ``free_spectrum(f, df, *halflog10_rho)``, so the sentinel that marks it as
+    a free spectrum lives on the starred parameter; dropping variadics here
+    would return an empty name list and every free spectrum would be
+    misparsed as a zero-parameter model.
+
+    ``**kwargs`` is excluded by kind rather than by the old
+    ``"args" not in name`` substring test, which also dropped any parameter
+    whose name merely contained the substring (``nargs``, ``target_args``).
     """
     return np.array([
         p.name for p in inspect.signature(func).parameters.values()
-        if p.kind not in (inspect.Parameter.VAR_POSITIONAL,
-                          inspect.Parameter.VAR_KEYWORD)
+        if p.kind is not inspect.Parameter.VAR_KEYWORD
     ])
 
 # ---------------------------------------------------------------------------
@@ -137,13 +139,13 @@ def _parse_psd_func(psd_func, helper_dict, n_bins, free_spec_sentinel="halflog10
 
     Notes
     -----
-    On the free-spectral branch EVERY bin is varied: ``fixed_psd_param_indices``
+    On the free-spectral branch every bin is varied: ``fixed_psd_param_indices``
     is ignored there (a warning is emitted if it was supplied).
     """
     sigs = _signature_param_names(psd_func)[2:]  # skip leading `f` and `df`
 
     if free_spec_sentinel in sigs:
-        # NOTE: every bin is varied on this branch -- "fixed_psd_param_indices"
+        # On the free-spectral branch every bin is varied -- "fixed_psd_param_indices"
         # is NOT honoured for a free spectrum.  A caller that expects to hold
         # bins fixed gets the opposite, and its prior-bound arrays will then be
         # shorter than the parameter block this reports.  Say so loudly rather
@@ -187,7 +189,7 @@ def _parse_psd_func(psd_func, helper_dict, n_bins, free_spec_sentinel="halflog10
 
 def _parse_orf_func(orf_func, helper_dict):
     """
-    Inspect `orf_func` and decide whether it is fixed (no free parameters
+    Inspect `orf_func` and determine whether it has free parameters
     beyond the angular separation) or has free parameters to be sampled.
 
     The function signature is assumed to start with (angle, *params).
@@ -1780,7 +1782,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
             ``(n_rows, Npulsars, Npulsars)`` -- ``n_rows`` is ``n_total_bins``,
             or ``2 * n_total_bins`` when the GTM block is mode-resolved.  Only
             the diagonal and the lower-triangular GWB entries are filled; use
-            ``get_phi_mat_full`` if you need an explicitly symmetric matrix.
+            ``get_phi_mat_full`` builds an explicitly symmetric matrix.
         """
         phi_diag, psd_common = self._get_phi_diag_bins(xs)
         n_total = phi_diag.shape[0]
@@ -1974,7 +1976,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         """Split phi into a dense GWB block and a diagonal everything-else block.
 
         Feeds ``SuperSignal.partial_marg_lnposterior``, which keeps the GWB
-        coefficients and marginalizes the rest analytically, so the two halves
+        coefficients and marginalises the rest analytically, so the two halves
         are returned separately and both at MODE resolution.
 
         Parameters
@@ -2072,7 +2074,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         return result
 
     def _check_non_gwb_block_order(self):
-        """Verify the non-GWB basis blocks are contiguous and ordered IRN, DM, GTM.
+        """Raise if the non-GWB basis blocks are not contiguous and ordered IRN, DM, GTM.
 
         Raises
         ------

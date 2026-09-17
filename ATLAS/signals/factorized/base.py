@@ -847,6 +847,8 @@ class SuperSignal:
 
         self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
+        if self.signal_comb_idxs['dm'] is not None:
+            self.update_red_basis(chrom_index = jnp.ones(self.data.npsrs) * 2)
 
         # Total column count of the assembled T-matrix: timing + every Fourier
         # block + any deterministic block.  NOT 2*nfreqs of a single signal.
