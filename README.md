@@ -1,4 +1,4 @@
-# ATLAS
+# Atlas
 
 Bayesian inference for pulsar timing arrays in JAX, with gradient-based sampling
 over the full parameter space.
