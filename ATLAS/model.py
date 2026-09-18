@@ -31,6 +31,7 @@ def model_maker(raw_residuals,
                 fixed_white_noise_params=None,
                 red_noise_basis=None,
                 tm_direct_sampling_type='klam',
+                varied_chrom_index = False
                 ):
     """NumPyro model for the ATLAS global fit.
 
@@ -95,7 +96,9 @@ def model_maker(raw_residuals,
             Calls ``tm_model.sample_residuals()``, which samples each
             pulsar's physical timing parameters directly from their bounded
             priors (SINI, ECC from Uniform; affine params from a wide Normal).
-
+    varied_chrom_index : bool, default ``False``
+        Varying the chromatic index from 0 to 6
+        
     Notes
     -----
     The ``numpyro.factor`` cancellation:
@@ -129,6 +132,14 @@ def model_maker(raw_residuals,
             stochastic_res = tm_model.sample_residuals()
     else:
         stochastic_res = raw_residuals
+
+    # ------------------------------------------------------------------ #
+    #  Chromatic Noise (beyond DM)                                       #
+    # ------------------------------------------------------------------ #
+    if varied_chrom_index:
+        chrom_index = numpyro.sample('chromatic_index', 
+                                    dist.Uniform(0, 6).expand((super_sig.data.npsrs,)))        
+        red_noise_basis = super_sig.update_red_basis(chrom_index = chrom_index)
 
     # ------------------------------------------------------------------ #
     #  White-noise helper products                                          #
