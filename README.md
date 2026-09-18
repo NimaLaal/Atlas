@@ -404,12 +404,6 @@ The rows above account for 14,930 lines; the package is 16,561 across 34 modules
 - `linear_timing=True` combined with a model string lacking an `ltm|` prefix is
   an inconsistent configuration that fails as a raw broadcast error rather than
   a message.
-- The chromatic index is implemented but connected to nothing:
-  `SuperSignal.update_red_basis` has no callers.
-- `stabilize_TNT` (`signals/signals_utils.py:78`) is a no-op for any pulsar with
-  padded timing columns: the shift is `eps * min(diag(TNT))` and those columns
-  put an exact zero on the diagonal. A positive-only variant is commented out
-  directly below it.
 
 ## References
 
